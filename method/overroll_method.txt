@@ -1,0 +1,279 @@
+
+
+# 基于全局路径引导的局部曲线带前瞻式编队选择仿真框架
+
+本工程用于搭建一个轻量级二维 Python 数值仿真平台，验证“基于局部地图的曲线带前瞻式编队选择方法”。系统不依赖 ROS、Gazebo 或 Isaac，而是在二维
+ occupancy grid / distance field 地图中完成全局路径生成、局部前瞻曲线构造、曲线带生成、候选队形嵌入、队形评分、rolling guide 生成、轻量闭
+ 环控制以及指标评估。
+
+该工程不是完整复现 DEFORM，而是实现一个受 DEFORM 启发的前端替换方案。DEFORM-like baseline 可以保留“根据局部目标方向或局部截面宽度选择队形”
+的规则，但本方法的核心不再是单点宽度检测，而是判断候选队形能否在局部曲线带中通过整体横向偏移、整体朝向调整和必要的槽位过渡安全嵌入。
+
+整体流程如下：
+
+```text id="fazrhh"
+global map + start + goal
+→ global path
+→ formation reference point projection
+→ collision-checked local preview curve
+→ curve band construction
+→ candidate formation embedding
+→ distance-field safety verification
+→ assignment-aware formation scoring
+→ selected formation + rolling guide
+→ light controller / MPC
+→ simulation log + metrics + visualization
+```
+
+其中，全局路径负责提供通往全局目标点的拓扑引导；局部前瞻曲线是在全局路径当前窗口内生成的平滑参考骨架，并且必须经过碰撞或 clearance 检查；曲
+线带用于快速表达局部可通行空间；候选队形的最终安全性由实际槽位点的 distance-field 查询确认；guide 只是后端控制器使用的 rolling reference，
+不是硬性的机器人级轨迹规划结果。
+
+推荐项目结构如下：
+
+```text id="xbisg5"
+curveband_formation_sim/
+├── configs/
+│   ├── maps/
+│   │   ├── straight_corridor.yaml
+│   │   ├── s_curve_corridor.yaml
+│   │   ├── obstacle_cluster.yaml
+│   │   └── narrow_entrance.yaml
+│   ├── global_planner.yaml
+│   ├── preview_curve.yaml
+│   ├── formations.yaml
+│   ├── curve_band.yaml
+│   ├── controller.yaml
+│   ├── mpc.yaml
+│   └── experiment.yaml
+├── src/
+│   ├── map2d.py
+│   ├── global_planner.py
+│   ├── path_manager.py
+│   ├── preview_curve.py
+│   ├── curve_band.py
+│   ├── formation_library.py
+│   ├── assignment.py
+│   ├── embedding_qp.py
+│   ├── safety_verifier.py
+│   ├── formation_selector.py
+│   ├── guide_generator.py
+│   ├── robot_model.py
+│   ├── light_controller.py
+│   ├── mpc_controller.py
+│   ├── simulator.py
+│   ├── baselines.py
+│   ├── metrics.py
+│   └── visualize.py
+├── scripts/
+│   ├── run_frontend_eval.py
+│   ├── run_closed_loop_eval.py
+│   ├── run_ablation_eval.py
+│   ├── plot_results.py
+│   └── make_video.py
+├── results/
+└── README.md
+```
+
+工程采用配置驱动方式组织。地图、起点终点、机器人数量、机器人半径、安全裕度、全局路径规划方式、局部前瞻长度、曲线平滑方式、候选队形库、曲线带采
+样间隔、控制器类型、MPC 参数、baseline 类型和评价指标都通过 YAML 文件配置。
+
+## 核心模块说明
+
+`map2d.py` 负责地图表示，包括 occupancy grid、障碍几何、地图边界和 distance field。distance field 后续同时服务于曲线带构造和候选队形安全
+验证。
+
+`global_planner.py` 在全局地图上生成从起点到目标点的全局路径。第一版可以支持手工路径、A* 或 Dijkstra。全局路径只提供整体方向，不直接作为编
+队中心的硬跟踪轨迹。
+
+`path_manager.py`:保存 A* 生成的 global waypoints; 根据当前 formation reference point 找到最近 waypoint / segment;
+选择前方若干个 waypoints 作为 local preview window;输出 local subgoal 和 waypoint window.
+
+preview_curve.py:
+  - 输入当前 formation reference point
+  - 输入局部 waypoint window
+  - 构造 inflated-free-space safe corridor
+  - 在 safe corridor 内生成 piecewise Bézier preview curve
+  - 对生成曲线做局部弧长重采样
+  - 输出 gamma_0(s_m), tangent, normal, curvature
+
+`curve_band.py` 基于局部前瞻曲线，在每个采样点沿法向正反方向做 raycast 或 distance-field 查询，得到左右可用半宽 `r_plus(s_m)` 和 
+`r_minus(s_m)`。这些半宽用于构造曲线带，并作为候选队形嵌入的轻量约束或初筛条件。
+
+`formation_library.py` 管理候选队形库，例如 square、column、horizontal line、diamond、compact 等。每个队形只需要保存机器人在 formation 
+frame 中的槽位坐标。
+
+`embedding_qp.py` 对每个候选队形求解低维整体位姿嵌入问题，搜索编队整体横向偏移 `z_m` 和整体朝向偏移 `phi_m`。该模块利用曲线带半宽快速判断候
+选队形是否大致可嵌入，并输出候选的中心序列、朝向序列、偏移代价和平滑代价。
+
+`safety_verifier.py` 对嵌入结果做最终安全验证。对于候选队形 `P_f^k`，根据
+
+```text id="lcqm2s"
+c_m = gamma_0(s_m) + z_m n_0(s_m)
+theta_m = psi_0(s_m) + phi_m
+q_i,m^k = c_m + R(theta_m) p_f,i^k
+```
+
+计算每个机器人槽位点，并查询 distance field：
+
+```text id="fdtvza"
+d_O(q_i,m^k) >= R_robot + delta
+```
+
+最终安全余量定义为：
+
+```text id="db8jsu"
+C_k = min_{m,i} [d_O(q_i,m^k) - (R_robot + delta)]
+```
+
+只有通过该验证的候选队形才被视为真正可行。也就是说，曲线带半宽不是最终安全判据，distance-field 槽位检查才是最终安全验证。
+
+`assignment.py` 为每个候选队形估计当前机器人到新槽位的任务分配。由于切换代价依赖 assignment，因此 assignment 应该在候选评分前完成，而不是
+选完队形后再计算。
+
+`formation_selector.py` 整合候选嵌入、安全验证、任务分配、平滑代价、偏移代价、切换代价和任务收益，选择最终队形。评分形式可以保持为：
+
+```text id="n9y6vq"
+score(P_f^k)
+= λ_c C_k
+- λ_z J_z^k
+- λ_phi J_phi^k
+- λ_s SwitchCost(P_f^cur, P_f^k, sigma_k)
++ λ_u U(P_f^k)
+```
+
+`guide_generator.py` 将选中的 formation-level guide 转换为每个机器人短时域 rolling reference。如果正在队形切换，则根据 assignment 在
+旧槽位和新槽位之间插值：
+
+```text id="kj1frw"
+p_f,i^tr(alpha_h)
+= (1 - alpha_h) p_f,i^cur
++ alpha_h p_f,sigma(i)^*
+```
+
+再生成：
+
+```text id="ekfnxj"
+q_i,h^ref = c_h + R(theta_h) p_f,i^tr(alpha_h)
+theta_i,h^ref = theta_h
+```
+
+这些 reference 只用于引导控制器，控制器可以为了满足动力学、避障和机器人间安全约束而偏离它们。
+
+`robot_model.py` 定义二维 unicycle 或差速机器人运动学模型。第一版可以使用状态 `[p_x, p_y, theta]` 和控制 `[v, omega]`。
+
+`light_controller.py` 是第一阶段闭环验证的主控制器，可以实现 pure pursuit、局部目标跟踪或简单 unicycle tracking controller。它的作用是
+快速验证前端队形选择是否能被大致执行，而不是追求最优控制效果。
+
+`mpc_controller.py` 作为第二阶段增强模块。后续可以用 CasADi 实现单机器人 NMPC，加入参考跟踪、控制平滑、速度约束、机器人间距离约束和障碍距
+离软约束。但第一阶段不要把工程主线绑定在重型 NMPC 上，避免主要时间消耗在 NMPC 调参和求解稳定性上。
+
+`simulator.py` 按固定时间步推进闭环仿真。曲线带和队形选择低频更新，控制器高频执行，机器人状态按动力学模型推进，并记录中间结果。
+
+`baselines.py` 保存对比方法，包括 fixed formation、DEFORM-like width rule、centerline-only、without z、without phi、
+without switch cost、without early switching 等。
+
+`metrics.py` 和 `visualize.py` 负责实验记录和可视化。可视化需要显示全局路径、局部前瞻曲线、曲线带边界、候选队形嵌入、最终 guide、
+机器人轨迹、队形切换和安全余量变化。
+
+## 推荐实验运行方式
+
+第一阶段优先实现 `run_frontend_eval.py`。该脚本不运行闭环控制，只评估前端队形选择。它输入地图、全局路径、当前编队参考点、
+前瞻窗口和候选队形，输出每个候选队形的嵌入结果、安全余量、score、被选队形和计算时间。该阶段重点验证曲线带方法是否比 DEFORM-like width rule 
+更少误判，尤其是在 S 型弯道、障碍簇和窄入口场景中。
+
+第二阶段实现 `run_closed_loop_eval.py`，默认使用 `light_controller.py` 做闭环验证。该阶段检查前端选择出的队形和 rolling guide 
+是否大致可执行，记录成功率、碰撞率、最小障碍距离、最小机器人间距、队形误差、跟踪误差、控制平滑性和队形切换次数。
+
+第三阶段再接入 `mpc_controller.py`，用更完整的 MPC 验证动力学约束和安全约束下的执行效果。
+
+`run_ablation_eval.py` 用于统一运行消融实验，比较去掉 `z_m`、去掉 `phi_m`、去掉 switch cost、去掉 early switching、强制 centerline-only 
+等设置后的性能差异。
+
+## 实验场景
+
+建议至少保留四类地图。
+
+直窄通道用于验证基本通行能力和宽度检测逻辑。
+
+S 型弯道是主实验场景，用于验证“局部横向宽度可行不等于沿曲线路径扫掠可行”。长而窄的 column 队形在直通道中可能合适，但在高曲率弯道中可能因为
+纵向槽位造成额外扫掠风险。曲线带方法应能通过多采样点嵌入和 distance-field 验证捕捉这种风险。
+
+障碍簇地图用于验证横向偏移 `z_m` 的作用，即局部前瞻曲线只是参考骨架，编队中心可以在曲线带内偏移，而不是必须严格贴着中心线。
+
+窄入口地图用于验证前瞻切换机制，即系统能否在当前队形即将不可行前提前切换到更紧凑或更合适的队形。
+
+## 输出与保存
+
+每次实验在 `results/` 下创建独立目录，保存：
+
+```text id="7z0615"
+config snapshot
+summary.json
+metrics.csv
+trajectory.csv
+selected_formations.csv
+score_terms.csv
+figures
+animation
+```
+
+前端指标包括候选可行性、安全余量、score terms、QP 求解时间、安全验证时间和误判情况。闭环指标包括成功率、碰撞率、最小障碍距离、
+最小机器人间距、队形误差、reference tracking error、控制平滑性、切换次数和失败恢复次数。
+
+整个工程的第一版重点是形成一个可重复、可配置、可可视化的二维方法验证平台。优先证明曲线带前端的 formation-level 选择逻辑有效，再逐步增强控制器
+和动力学模型。局部前瞻曲线是经过碰撞检查的参考骨架，曲线带半宽是快速嵌入约束，distance-field 槽位检查是最终安全验证，guide 是 
+rolling reference，后端控制器先轻后重。
+
+
+以下是关于重规划的描述：
+局部重规划不应该成为主流程；第一版只需要轻量 fallback。
+
+正常情况下：
+
+```text
+global A* path
+→ extract local waypoint window
+→ collision-checked smoothing / preview curve
+→ curve band construction
+→ candidate formation embedding
+→ safety verification
+→ formation scoring
+→ guide generation
+→ controller execution
+```
+
+如果失败，先不要立即 local A*，而是按更轻的顺序处理：
+
+```text
+preview curve unsafe
+→ reduce smoothing / shorten lookahead / fallback to polyline-smoothed preview
+
+curve band too narrow or embedding infeasible
+→ select compact formation if feasible
+→ slow down and retry next cycle
+
+current formation will fail but switching distance insufficient
+→ slow down earlier
+→ force conservative formation if available
+
+controller deviates too much
+→ reduce speed / reset guide window / retry with shorter lookahead
+```
+
+只有当**最紧凑队形在当前局部窗口内也长期不可行**，或者局部地图显示全局 waypoint 段已经被障碍阻断时，才触发：
+
+```text
+local short-range A*
+```
+
+而全局 A* 重规划应该是最后手段，不应该频繁出现在闭环主循环里。
+第一版只实现两个功能：
+
+```text
+1. preview curve fallback:
+   shorter lookahead / less smoothing / polyline fallback
+
+2. local short A* fallback:
+   only when compact formation also infeasible for several cycles
+```
