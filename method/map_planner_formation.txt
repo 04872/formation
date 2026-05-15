@@ -1,0 +1,348 @@
+**二维地图环境、A* 全局 waypoint 路径、候选队形库**。
+
+# 1. 地图环境设计
+
+地图统一采用二维 occupancy grid。每个地图同时保留三种表示：
+
+```text
+occupancy grid:      用于 A* 和 raycast
+inflated grid:       用于全局 A* 规划
+distance field:      用于后续安全余量检查
+```
+
+坐标系采用世界坐标，单位为米。建议第一版使用：
+
+```text
+resolution = 0.05 m 或 0.10 m
+robot_radius = 0.18 m
+safety_margin = 0.05 ~ 0.08 m
+```
+
+障碍物先用简单几何生成，再栅格化成 occupancy grid。障碍类型可以包括矩形墙、圆形柱、通道外墙。不要一开始使用随机复杂地图，因为前期需要稳定复现实验现象。
+
+地图先设计四类。
+
+---
+
+## 1.1 直窄通道
+
+这个场景用于验证最基本的全局规划、宽度检测和队形可行性。
+
+地图可以是：
+
+```text
+map size: 10 m × 6 m
+start: (-4.5, 0.0)
+goal:  ( 4.5, 0.0)
+```
+
+自由空间是一条水平通道，两侧是墙。通道宽度可以设为：
+
+```text
+corridor_width = 1.2 ~ 1.5 m
+```
+
+这个场景里，全局 A* 路径基本是一条直线。它主要用于检查：A* 是否能正常生成 waypoint，候选队形的基本尺度是否合理，以及后续曲线带模块是否能得到稳定的左右半宽。
+
+---
+
+## 1.2 S 型弯曲通道
+
+这是主实验地图，用于验证“局部宽度可行不等于沿曲线路径扫掠可行”。
+
+地图可以设为：
+
+```text
+map size: 12 m × 8 m
+start: (-5.0, 0.0)
+goal:  ( 5.0, 0.0)
+```
+
+用一条 S 型中心线生成自由通道：
+
+```text
+x ∈ [-5, 5]
+y = A sin(2π(x + 5) / 10)
+```
+
+推荐第一版参数：
+
+```text
+A = 1.2 ~ 1.5 m
+corridor_width = 1.3 ~ 1.5 m
+```
+
+所有距离中心线小于 `corridor_width / 2` 的区域设为 free，其余区域设为 occupied。这样 A* 会在弯曲通道中生成一串离散 waypoint。
+
+这个地图的作用不是单纯制造障碍，而是让不同队形在弯道中的表现不同。长而窄的 column 队形在直通道里可能很好，但在 S 弯里会因为纵向长度产生更大的
+扫掠风险。后续曲线带模块应当能识别这种差异。
+
+---
+
+## 1.3 障碍簇地图
+
+这个场景用于验证后续局部曲线带中的横向偏移能力，也就是局部前瞻曲线只是参考骨架，编队中心不一定要严格贴着它走。
+
+地图可以设为：
+
+```text
+map size: 12 m × 8 m
+start: (-5.0, 0.0)
+goal:  ( 5.0, 0.0)
+```
+
+中间放置若干矩形障碍和圆形障碍，但不要形成长墙。目标是制造局部绕行和左右可用空间不对称。例如：
+
+```text
+obstacle cluster around x ∈ [-2, 2]
+rectangular blocks near upper/lower side
+small circular obstacles near path neighborhood
+```
+
+这个地图不要求通道形状规整，反而应该有一些局部凸凹边界。后续可以用它检查：只靠法向半宽会不会误判，distance field 的实际槽位验证是否必要。
+
+---
+
+## 1.4 窄入口地图
+
+这个场景用于验证前瞻失败检测和未来的队形提前切换逻辑。
+
+地图结构可以是：
+
+```text
+wide region → narrow neck → wide region
+```
+
+例如：
+
+```text
+map size: 12 m × 8 m
+start: (-5.0, 0.0)
+goal:  ( 5.0, 0.0)
+
+left room width:  4.0 m
+neck width:       1.0 ~ 1.2 m
+right room width: 4.0 m
+```
+
+这个地图里，某些宽队形在入口前看起来可行，但进入 narrow neck 前必须切换为更紧凑的队形。第一阶段只需要让 A* 生成穿过窄入口的 waypoint，
+后续再用曲线带模块判断不同队形在入口前的失效位置。
+
+---
+
+# 2. 全局路径规划设计
+
+全局路径规划第一版只使用 A*。它的任务不是生成平滑轨迹，而是提供一串通向全局目标点的 waypoint。
+
+全局规划流程如下：
+
+```text
+occupancy grid
+→ obstacle inflation
+→ A* on inflated grid
+→ raw grid path
+→ waypoint simplification
+→ global waypoint sequence
+```
+
+这里的 inflation 不是按整个编队 footprint 膨胀，而是按单机器人或参考点安全半径进行：
+
+```text
+inflation_radius = robot_radius + global_planner_margin
+```
+
+A* 使用 8-connected grid：
+
+```text
+horizontal / vertical cost = 1
+diagonal cost = sqrt(2)
+heuristic = Euclidean distance
+```
+
+A* 输出的是一串栅格路径点。之后做一个简单 waypoint simplification：
+
+```text
+1. 删除连续共线点；
+2. 如果两点之间在 inflated grid 上有 line-of-sight，则可以跳过中间点；
+3. 保留关键转折点和必要中间点。
+```把 A* 的密集 grid path 变成稀疏 global waypoint sequence：
+
+```text
+global_waypoints = [w_0, w_1, ..., w_M]
+```
+
+全局路径层只维护：
+
+```text
+global_waypoints
+current_waypoint_index
+lookahead waypoint window
+global goal
+```
+
+
+当前阶段可以让 `path_manager` 做很轻的事情：
+
+```text
+输入:
+  current formation reference point
+  global_waypoints
+  current_waypoint_index
+
+输出:
+  local waypoint window
+  local subgoal
+```
+
+formation reference point 推荐先用当前机器人质心，而不是某个 physical leader。这样后续 leader remapping 不会导致路径进度跳变。
+
+---
+
+# 3. 候选队形设计
+队形坐标系定义为：
+```text
+x-axis: 沿 guide 前进方向，表示纵向偏移
+y-axis: 垂直 guide 前进方向，表示横向偏移
+```
+每个候选队形只保存 formation frame 下的槽位坐标：
+
+```text
+p_f,i = [xi_i, eta_i]^T
+```
+ 4 个机器人。
+
+---
+## 3.1 compact square
+
+```text
+square:
+  p0 = [-0.30, -0.30]
+  p1 = [-0.30,  0.30]
+  p2 = [ 0.30, -0.30]
+  p3 = [ 0.30,  0.30]
+```
+
+---
+
+## 3.2 column
+
+```text
+column:
+  p0 = [-0.90, 0.00]
+  p1 = [-0.30, 0.00]
+  p2 = [ 0.30, 0.00]
+  p3 = [ 0.90, 0.00]
+```
+
+它在直窄通道中通常有优势，但在 S 型弯道中可能因为纵向长度带来更大的扫掠风险。适合用来测试曲线带方法是否真的考虑了曲率和连续扫掠。
+
+---
+
+## 3.3 horizontal line
+
+横向展开队形，宽度最大。
+
+```text
+horizontal_line:
+  p0 = [0.00, -0.90]
+  p1 = [0.00, -0.30]
+  p2 = [0.00,  0.30]
+  p3 = [0.00,  0.90]
+```
+
+这个队形在宽阔区域可能有任务收益，但在窄通道中应当很容易被判定不可行。它主要用于检验宽度约束是否正常工作。
+
+---
+
+## 3.4 diamond
+
+菱形队形，兼顾紧凑和方向性。
+
+```text
+diamond:
+  p0 = [ 0.45,  0.00]
+  p1 = [-0.45,  0.00]
+  p2 = [ 0.00,  0.45]
+  p3 = [ 0.00, -0.45]
+```
+
+这个队形比 square 更具有方向性，比 column 更紧凑，比 horizontal line 更窄。它适合作为 S 型弯道中的重要候选。
+
+---
+
+# 4. 候选队形的基本检查
+
+在进入后续曲线带模块之前，每个候选队形应该先做静态几何检查，避免队形本身不合理。
+
+至少检查：
+
+```text
+1. pairwise slot distance >= d_safe
+2. formation lateral half-width
+3. formation longitudinal half-length
+4. formation bounding radius
+```
+
+其中：
+
+```text
+d_safe = 2 * robot_radius + inter_robot_margin
+```
+
+推荐：
+
+```text
+robot_radius = 0.18 m
+inter_robot_margin = 0.08 ~ 0.12 m
+d_safe ≈ 0.44 ~ 0.48 m
+```
+
+上面给出的四种队形槽位间距基本满足这个条件。
+
+每个队形可以保存一些元信息：
+
+```text
+name
+slots
+lateral_half_width
+longitudinal_half_length
+bounding_radius
+task_utility
+```
+
+`task_utility` 第一版可以先固定为 0，或者简单设置为：
+
+```text
+wide formation utility higher in open space
+compact formation utility higher in narrow space
+```
+
+但第一阶段不建议把任务收益做复杂，否则会干扰对曲线带可行性本身的判断。
+
+---
+
+# 5. 第一阶段的最小闭环输入关系
+
+第一阶段完成后，后续模块应该能拿到：
+
+```text
+Map2D:
+  occupancy grid
+  inflated grid
+  distance field
+
+GlobalPath:
+  global_waypoints
+  start
+  goal
+
+PathManager:
+  current waypoint index
+  local waypoint window
+  local subgoal
+
+FormationLibrary:
+  candidate formations
+  slot positions
+  basic footprint info
+```
