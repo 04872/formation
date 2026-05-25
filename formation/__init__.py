@@ -1,6 +1,11 @@
 from formation.astar import AStarPlanner
+from formation.controller_reference import ControllerReferenceBuilder
+from formation.curve_band import CurveBandBuilder
+from formation.embedding_qp import EmbeddingQPSolver
 from formation.formation_library import FormationLibrary
+from formation.formation_selector import FormationSelector, SelectedFormationResult, SelectorConfig, SelectorWeights, select_target_formation
 from formation.global_planner import GlobalPlanner
+from formation.guide_generator import GuideGenerator
 from formation.map_builder import MapBuilder
 from formation.map_config import (
     BaseMapConfig,
@@ -12,28 +17,72 @@ from formation.map_config import (
     SCurveCorridorConfig,
     ScenarioConfig,
 )
+from formation.mpc_controller import DistributedFormationMPC
+from formation.mpc_consensus import ConsensusFormationMPC
 from formation.path_manager import PathManager
 from formation.preview_curve import PreviewCurvePlanner
+from formation.simulator import MultiRobotSimulator, trace_summary
 from formation.types import (
+    AssignmentResult,
+    ControlCommand,
+    CurveBand,
+    CurveBandSample,
+    CurveBandStripCell,
+    EmbeddingQPResult,
+    FormationCandidateEvaluation,
+    FormationControllerReference,
+    FormationGuide,
+    FormationScoreBreakdown,
     FormationSpec,
     GlobalPath,
+    GuideSample,
     LocalPathWindow,
     LocalPreviewPath,
     MapData,
+    MPCConfig,
+    MPCWeights,
     PreviewCurveConfig,
+    RobotPrediction,
+    RobotReferenceSample,
+    RobotReferenceTrajectory,
+    RobotState,
+    SimulationTrace,
+    wrap_to_pi,
 )
 
 __all__ = [
     "AStarPlanner",
+    "AssignmentResult",
     "BaseMapConfig",
+    "ControlCommand",
+    "ControllerReferenceBuilder",
+    "CurveBand",
+    "CurveBandBuilder",
+    "CurveBandSample",
+    "CurveBandStripCell",
+    "DistributedFormationMPC",
+    "ConsensusFormationMPC",
+    "EmbeddingQPResult",
+    "EmbeddingQPSolver",
+    "FormationCandidateEvaluation",
+    "FormationControllerReference",
+    "FormationGuide",
     "FormationLibrary",
+    "FormationScoreBreakdown",
+    "FormationSelector",
     "FormationSpec",
     "GlobalPath",
     "GlobalPlanner",
+    "GuideGenerator",
+    "GuideSample",
     "LocalPathWindow",
     "LocalPreviewPath",
     "MapBuilder",
     "MapData",
+    "MPCConfig",
+    "MPCWeights",
+    "MultiRobotSimulator",
+    "trace_summary",
     "NarrowEntranceConfig",
     "NarrowingCorridorConfig",
     "ObstacleClusterConfig",
@@ -42,6 +91,16 @@ __all__ = [
     "PreviewCurveConfig",
     "PreviewCurvePlanner",
     "RightAngleCorridorConfig",
+    "RobotPrediction",
+    "RobotReferenceSample",
+    "RobotReferenceTrajectory",
+    "RobotState",
     "SCurveCorridorConfig",
     "ScenarioConfig",
+    "SelectedFormationResult",
+    "SelectorConfig",
+    "SelectorWeights",
+    "SimulationTrace",
+    "select_target_formation",
+    "wrap_to_pi",
 ]

@@ -37,11 +37,17 @@ class FormationLibrary:
                 [0.00, 0.30],
                 [0.00, 0.90],
             ],
-            "diamond": [
+            "t_shape": [
                 [0.45, 0.00],
-                [-0.45, 0.00],
-                [0.00, 0.45],
-                [0.00, -0.45],
+                [-0.15, -0.50],
+                [-0.15, 0.00],
+                [-0.15, 0.50],
+            ],
+            "compact": [
+                [-0.25, -0.25],
+                [-0.25, 0.25],
+                [0.25, -0.25],
+                [0.25, 0.25],
             ],
         }
         formations: dict[str, FormationSpec] = {}
@@ -65,7 +71,7 @@ class FormationLibrary:
             longitudinal_half_length=longitudinal_half_length,
             bounding_radius=bounding_radius,
             min_pairwise_distance=min_pairwise_distance,
-            task_utility=0.0,
+            task_utility=lateral_half_width + (1.0 if name == "square" else 0.0),
         )
 
     @staticmethod

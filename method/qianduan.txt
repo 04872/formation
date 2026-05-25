@@ -1,0 +1,520 @@
+### 1. 输入
+
+前端输入包括：
+
+[
+D(x)
+]
+
+二维局部地图的 distance field；
+
+[
+\rho=R_{\text{robot}}+\delta
+]
+
+机器人半径加安全裕度；
+
+[
+\gamma_0(s)
+]
+
+局部规划器给出的 preview 曲线；
+
+[
+\mathcal P={P^{square},P^{compact},P^{column},\ldots}
+]
+
+候选队形库。
+
+其中每个候选队形写成：
+
+[
+P^k={p_i^k}_{i=1}^N,
+\qquad
+p_i^k=(\xi_i^k,\eta_i^k).
+]
+
+(\xi_i^k) 是队形纵向偏移，(\eta_i^k) 是横向偏移。
+
+---
+
+### 2. 采样 preview 曲线
+
+先对 preview 曲线采样：
+
+[
+\gamma_m=\gamma_0(s_m),
+\qquad m=1,\ldots,M.
+]
+
+每个采样点有切向和法向：
+
+[
+t_m,\quad n_m.
+]
+
+这里的 (\gamma_m) 只提供前进顺序和局部参考位置，不再直接作为最终曲线带中心线。
+
+---
+
+### 3. 每个采样点生成多个候选 chord
+
+在每个 (\gamma_m) 附近生成若干候选横截面 chord。
+
+例如每个采样点取 (A=15) 个 chord，来源可以是：
+
+[
+\alpha_a\in{-20^\circ,-10^\circ,0,10^\circ,20^\circ}
+]
+
+的方向扰动，再配合少量中心偏移。
+
+第 (m) 个采样点的第 (a) 个候选 chord 记为：
+
+[
+e_{m,a}=(L_{m,a},R_{m,a}).
+]
+
+其中 (L_{m,a})、(R_{m,a}) 是该安全横截面的两个端点。
+
+这条 chord 必须满足：
+
+[
+[L_{m,a},R_{m,a}]\subset \mathcal F_\rho,
+]
+
+其中：
+
+[
+\mathcal F_\rho={x\mid D(x)\ge \rho}.
+]
+
+也就是说，chord 本身要完全位于安全自由空间中。
+
+每条 chord 有中点：
+
+[
+b_{m,a}=\frac{L_{m,a}+R_{m,a}}{2},
+]
+
+半宽：
+
+[
+h_{m,a}=\frac{|L_{m,a}-R_{m,a}|}{2},
+]
+
+以及方向偏差：
+
+[
+\alpha_{m,a}.
+]
+
+---
+
+### 4. 用 DP 选择一串连续 chord
+
+不能每个点独立选最宽 chord。否则相邻截面可能跳变，甚至围出来的走廊穿过障碍。
+
+所以把每个候选 chord 看成一个节点：
+
+[
+(m,a).
+]
+
+从第 (m) 层的 chord (a) 转移到第 (m+1) 层的 chord (b)，形成一个局部 strip cell：
+
+[
+\mathcal C_{m,a,b}
+==================
+
+\operatorname{conv}
+{L_{m,a},R_{m,a},R_{m+1,b},L_{m+1,b}}.
+]
+
+只有当这个 strip cell 也安全时，才允许该转移：
+
+[
+\mathcal C_{m,a,b}\subset \mathcal F_\rho.
+]
+
+工程上可以用栅格采样或 rasterization 检查这个四边形区域是否都在安全自由空间中。
+
+DP 的目标是选出一串 chord：
+
+[
+a_1^\star,\ldots,a_M^\star
+]
+
+使得它们足够宽、贴近 preview、方向不过度偏离、相邻截面变化平滑。
+
+可以写成：
+
+[
+\min_{a_1,\ldots,a_M}
+\sum_{m=1}^{M}
+J_{\text{node}}(m,a_m)
++
+\sum_{m=1}^{M-1}
+J_{\text{edge}}(m,a_m,a_{m+1}).
+]
+
+节点代价：
+
+[
+J_{\text{node}}(m,a)
+====================
+
+-w_h h_{m,a}
++
+w_d|b_{m,a}-\gamma_m|^2
++
+w_\alpha \alpha_{m,a}^2.
+]
+
+边代价：
+
+[
+J_{\text{edge}}(m,a,b)
+======================
+
+w_s|b_{m+1,b}-b_{m,a}|^2
++
+w_{\Delta\alpha}(\alpha_{m+1,b}-\alpha_{m,a})^2
++
+J_{\text{strip}}.
+]
+
+其中 (J_{\text{strip}}) 在 strip 不安全时取极大值或直接禁止该转移。
+
+---
+
+### 5. 得到安全曲线带
+
+DP 选出：
+
+[
+e_m^\star=(L_m^\star,R_m^\star).
+]
+
+相邻 chord 形成的 strip cell 为：
+
+[
+\mathcal C_m^\star
+==================
+
+\operatorname{conv}
+{L_m^\star,R_m^\star,R_{m+1}^\star,L_{m+1}^\star}.
+]
+
+最终曲线带定义为这些安全 strip cell 的并：
+
+[
+\mathcal B
+==========
+
+\bigcup_{m=1}^{M-1}
+\mathcal C_m^\star.
+]
+
+这时曲线带不是“中心线 + 左右半宽”，而是一条由安全横截面拼成的局部安全走廊。
+
+它的中心线可以取 chord 中点序列：
+
+[
+\gamma_b(s_m)=b_m^\star
+=======================
+
+\frac{L_m^\star+R_m^\star}{2}.
+]
+
+这条 (\gamma_b) 就是 refined band centerline。
+
+---
+
+### 6. 在安全走廊中做候选队形嵌入
+
+对每个候选队形 (P^k)，搜索一串编队整体位姿：
+
+[
+g_m^k=(c_m^k,\theta_m^k).
+]
+
+其中：
+
+[
+c_m^k
+]
+
+是编队中心，
+
+[
+\theta_m^k
+]
+
+是编队整体朝向。
+
+第 (i) 个机器人槽位的世界坐标为：
+
+[
+q_{i,m}^k
+=========
+
+c_m^k
++
+R(\theta_m^k)p_i^k.
+]
+
+队形嵌入约束不再使用法向半宽，而是要求槽位点落在安全走廊里：
+
+[
+q_{i,m}^k\in \mathcal B,
+\qquad \forall i,m.
+]
+
+更具体地，可以要求第 (m) 个前瞻位置的槽位点落入对应或相邻 strip cell：
+
+[
+q_{i,m}^k\in \mathcal C_m^\star
+\quad
+\text{or}
+\quad
+q_{i,m}^k\in \mathcal C_{m-1}^\star\cup \mathcal C_m^\star.
+]
+
+这样就不再依赖“某个采样点法向宽度够不够”，而是看真实槽位点是否处在安全走廊区域内。
+
+---
+
+### 7. 队形嵌入优化
+
+可以让编队中心和朝向在 band centerline 附近小范围变化：
+
+[
+c_m^k
+=====
+
+\gamma_b(s_m)
++
+z_m^k n_b(s_m),
+]
+
+[
+\theta_m^k
+==========
+
+\psi_b(s_m)
++
+\phi_m^k.
+]
+
+这里：
+
+* (z_m^k)：候选队形整体横向偏移；
+* (\phi_m^k)：候选队形整体朝向偏移；
+* (n_b,\psi_b)：由 refined band centerline 得到的法向和切向角。
+
+嵌入代价可以写成：
+
+[
+J_k
+===
+
+\sum_m
+\left[
+w_z(z_m^k)^2
++
+w_\phi(\phi_m^k)^2
++
+w_{\Delta z}(z_{m+1}^k-z_m^k)^2
++
+w_{\Delta \phi}(\phi_{m+1}^k-\phi_m^k)^2
+\right].
+]
+
+如果某个候选队形完全无法嵌入安全走廊，可以引入 slack：
+
+[
+\sigma_{i,m}^k\ge 0,
+]
+
+记录它违反 corridor 约束的程度：
+
+[
+V_k=\sum_{i,m}(\sigma_{i,m}^k)^2.
+]
+
+这样 selector 不会因为一个 hard infeasible 直接崩掉，而是知道该队形“差多少”。
+
+---
+
+### 8. 队形评分与选择
+
+对每个队形 (P^k)，得到：
+
+[
+M_k
+]
+
+最小 corridor margin；
+
+[
+J_k
+]
+
+嵌入平滑代价；
+
+[
+V_k
+]
+
+违反量；
+
+[
+C_{\text{switch}}(P^k,P^{cur})
+]
+
+切换代价；
+
+[
+U(P^k)
+]
+
+队形默认偏好。
+
+评分可以写成：
+
+[
+S_k
+===
+
+## w_M M_k
+
+## w_J J_k
+
+## w_V V_k
+
+w_C C_{\text{switch}}(P^k,P^{cur})
++
+w_U U(P^k).
+]
+
+默认偏好可以设为：
+
+[
+U(square)>U(compact)>U(column).
+]
+
+这样 column 不会因为最容易嵌入就总是被选中。只有当 square 在安全走廊中确实无法嵌入，或者代价明显更差时，才切到 compact / column。
+
+最终选择：
+
+[
+P^{next}
+========
+
+\arg\max_k S_k.
+]
+
+并加入 hysteresis：
+
+[
+S_{new}>S_{cur}+\Delta_{\text{switch}}
+]
+
+才允许切换。
+
+---
+
+### 9. 前端输出
+
+前端输出：
+
+```text
+selected_formation
+refined_band_centerline
+safe_strip_cells
+formation_pose_sequence
+per-agent slot references
+frontend_status
+```
+
+其中：
+
+[
+(c_m^{next},\theta_m^{next})
+]
+
+是选中队形的编队级 guide。
+
+每个机器人参考槽位是：
+
+[
+q_{i,m}^{next}
+==============
+
+c_m^{next}
++
+R(\theta_m^{next})p_i^{next}.
+]
+
+后端控制器可以跟踪这些局部槽位参考，或者只取近端 guide 作为局部目标。
+
+---
+
+### 10. 完整伪代码
+
+```text
+Input:
+  distance field D
+  safety radius rho
+  preview curve gamma_0
+  formation library {P^k}
+  current formation P_cur
+
+1. Sample preview curve:
+     gamma_m, tangent t_m, normal n_m
+
+2. For each sample m:
+     generate A candidate chords e_m,a = (L_m,a, R_m,a)
+     each chord must lie in safe free space
+
+3. For each adjacent pair of samples:
+     for each chord pair (a,b):
+         construct strip cell C_m,a,b 【】
+         check whether C_m,a,b is safe
+         compute transition cost
+
+4. Run DP:
+     choose chord sequence a_1*,...,a_M*
+     balancing:
+        width
+        closeness to preview
+        direction deviation
+        center smoothness
+        strip safety
+
+5. Build safe corridor:
+     selected chords e_m*
+     selected strip cells C_m*
+     refined centerline gamma_b from chord midpoints
+
+6. For each candidate formation P^k:
+     search z_m^k, phi_m^k
+     compute slot positions q_i,m^k
+     check whether q_i,m^k lies in safe strip cells
+     compute margin M_k, violation V_k, embedding cost J_k
+
+7. Score formations:
+     S_k = margin - embedding cost - violation - switch cost + formation preference
+
+8. Apply hysteresis:
+     choose selected formation P_next
+
+9. Output:
+     selected formation
+     safe corridor
+     formation guide
+     per-agent slot references
+```
+
+这个新前端里，preview 曲线只负责提供局部方向和采样顺序；真正的曲线带由 DP 选出的一串安全 chord 和它们之间的安全 strip cells 构成。队形选择也不再依据法向左右宽度，而是依据候选队形的真实槽位点能否嵌入这条安全走廊。

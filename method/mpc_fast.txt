@@ -1,0 +1,479 @@
+下面这段可以作为 **DEFORM-style per-robot MPC** 的实现说明。它是每台机器人 (i) 分别求解自己的 MPC，不做全队 centralized MPC；
+其他机器人状态只作为参考状态和避碰约束里的已知量。DEFORM 原文对应的是 VI-C 节的式 (6)–(8)。
+
+---
+
+设机器人 (i) 的状态为
+
+[
+x_i=
+\begin{bmatrix}
+p_{ix}\
+p_{iy}\
+\theta_i
+\end{bmatrix},
+\qquad
+u_i=
+\begin{bmatrix}
+v_i\
+\omega_i
+\end{bmatrix}.
+]
+
+离散 unicycle 动力学为
+
+[
+x_{i,h+1}=f_d(x_{i,h},u_{i,h}),
+]
+
+其中可用 Euler 离散：
+
+[
+p_{ix,h+1}
+==========
+
+p_{ix,h}
++
+\Delta t, v_{i,h}\cos\theta_{i,h},
+]
+
+[
+p_{iy,h+1}
+==========
+
+p_{iy,h}
++
+\Delta t, v_{i,h}\sin\theta_{i,h},
+]
+
+[
+\theta_{i,h+1}
+==============
+
+\theta_{i,h}
++
+\Delta t, \omega_{i,h}.
+]
+
+---
+
+当前曲线带前端输出目标队形 (P_f^*) 和局部 guide 目标 (p_g^*)。其中 (p_g^*) 可以是曲线带 guide 中的一个近端前视点，或者当前前瞻窗口
+内的 selected local goal。
+
+对机器人 (i)，根据当前其他机器人状态和目标队形构造 DEFORM-style reference state：
+
+[
+x_{ir}
+======
+
+\frac{1}{N_i+1}
+\left(
+\sum_{j\in\mathcal N_i}
+\left(x_{j,c}+p_{f,ij}^*\right)
++
+x_g^*
+\right),
+]
+
+其中
+
+[
+p_{f,ij}^*=p_{f,i}^*-p_{f,j}^*
+]
+
+是目标队形中机器人 (i) 和机器人 (j) 的期望相对位移，(x_{j,c}) 是机器人 (j) 当前状态，(x_g^*) 是由局部目标点构造的状态，例如
+
+[
+x_g^*=
+\begin{bmatrix}
+p_{g,x}^*\
+p_{g,y}^*\
+\theta_g^*
+\end{bmatrix}.
+]
+
+如果不想使用局部目标朝向，也可以只在位置维度使用 (p_g^*)，航向参考由当前位置到 (p_g^*) 的方向计算。
+
+定义误差
+
+[
+x_{ie}=x_{ir}-x_{i,c},
+]
+
+[
+p_{ie}=Q_b x_{ie},
+\qquad
+Q_b=\mathrm{diag}(1,1,0).
+]
+
+参考输入按 DEFORM 的形式构造：
+
+[
+v_{ir}
+======
+
+\begin{cases}
+\dfrac{|p_{ie}|}{x_{th}}v_{\max},
+& |p_{ie}|\le x_{th},[6pt]
+v_{\max},
+& |p_{ie}|>x_{th},
+\end{cases}
+]
+
+[
+\omega_{ir}
+===========
+
+\frac{1}{\pi}\omega_{\max}
+\arccos
+\left(
+\frac{v_r^\top p_{ie}}
+{|v_r||p_{ie}|}
+\right),
+]
+
+其中
+
+[
+v_r=
+\begin{bmatrix}
+\cos\theta_{i,c}\
+\sin\theta_{i,c}\
+0
+\end{bmatrix}.
+]
+
+工程实现中需要对 arccos 输入做 clamp，避免数值越界：
+
+[
+\mathrm{clip}\left(
+\frac{v_r^\top p_{ie}}{|v_r||p_{ie}|},
+-1,1
+\right).
+]
+
+---
+
+对每个机器人 (i)，求解如下 MPC：
+
+[
+\begin{aligned}
+\min_{{v_{i,h},\omega_{i,h}}*{h=0}^{H-1},\epsilon_i}
+\quad
+&
+\sum*{h=0}^{H-1}
+\Big(
+|x_{i,h}-x_{ir}|*{Q}^{2}
++
+|u*{i,h}-u_{ir}|*{R}^{2}
++
+w*{\epsilon}\epsilon_i^2
+\Big)
+\end{aligned}
+]
+
+subject to
+
+[
+x_{i,0}=x_{i,c},
+]
+
+[
+x_{i,h+1}=f_d(x_{i,h},u_{i,h}),
+\qquad h=0,\ldots,H-1,
+]
+
+[
+u_{i,h}
+=======
+
+\begin{bmatrix}
+v_{i,h}\
+\omega_{i,h}
+\end{bmatrix},
+]
+
+[
+0\le v_{i,h}\le v_{\max},
+]
+
+[
+|\omega_{i,h}|\le \omega_{\max},
+]
+
+[
+\epsilon_{\min}\le \epsilon_i\le 0,
+]
+
+[
+\left|
+Q_b
+\left(
+x_{i,h}-x_{j,c}
+\right)
+\right|
+\ge
+d_{\mathrm{safe}}+\epsilon_i,
+\qquad
+\forall j\in\mathcal N_i,\quad h=0,\ldots,H.
+]
+
+这里 (x_{j,c}) 是其他机器人当前状态，作为已知量使用；第一版可以不预测其他机器人未来轨迹，直接照 DEFORM 的简化写法。
+
+求解后只执行第一步控制：
+
+[
+u_i(t)=u_{i,0}^*.
+]
+
+下一控制周期重新计算 (x_{ir})、(u_{ir})，重新求解 MPC。
+
+---
+
+第一版建议不要在这个 MPC 里加入 obstacle distance-field 约束。障碍相关安全主要由曲线带前端的队形选择、局部 guide 和必要的 
+fallback/停止逻辑处理；MPC 内部只保留机器人动力学、速度约束和机器人间安全距离约束。
+
+
+你的理解可以成立：**第一版不必把“切换过程是否完全嵌入曲线带”作为前端硬检查**。因为一开始我们就没有把曲线带前端设计成完整多机器人轨迹规划器；前端主要负责选择目标队形和给出编队级 guide，真实切换过程由 MPC 在动力学、速度、机器人间距约束下完成。这样更符合轻量工程实现，也避免把方法变成过重的 transition swept-volume planner。
+
+完整关系可以这样整理。
+
+---
+
+## 1. 前端输出的参考是什么
+
+曲线带前端输出的是**编队整体级别的参考**，不是每个机器人的最终控制轨迹：
+
+[
+P_f^*,\quad {c_h,\theta_h}_{h=0}^{H_g},\quad C_k.
+]
+
+其中：
+
+[
+P_f^*
+]
+
+是选择出的目标队形；
+
+[
+c_h
+]
+
+是编队整体 guide 中心；
+
+[
+\theta_h
+]
+
+是编队整体朝向；
+
+[
+C_k
+]
+
+是该候选队形在曲线带中的嵌入安全余量。
+
+这个 guide 表达的是：
+
+[
+\text{编队整体大致沿哪里走、朝哪个方向走、采用什么队形。}
+]
+
+它不直接等价于每个机器人必须严格跟踪的轨迹。
+
+---
+
+## 2. (\alpha) 平滑过渡是什么
+
+(\alpha) 处理的是**队形槽位从旧队形到新队形的连续变化**。
+
+当前队形为：
+
+[
+P_f^{cur},
+]
+
+目标队形为：
+
+[
+P_f^*.
+]
+
+任务分配给出机器人 (i) 到新槽位的映射：
+
+[
+\sigma(i).
+]
+
+不要直接让机器人槽位从
+
+[
+p_{f,i}^{cur}
+]
+
+跳到
+
+[
+p_{f,\sigma(i)}^*.
+]
+
+而是定义过渡槽位：
+
+[
+p_{f,i}^{tr}(\alpha)
+====================
+
+(1-\alpha)p_{f,i}^{cur}
++
+\alpha p_{f,\sigma(i)}^*,
+\quad \alpha\in[0,1].
+]
+
+其中：
+
+[
+\alpha=0
+]
+
+表示旧队形；
+
+[
+\alpha=1
+]
+
+表示新队形。
+
+控制过程中让 (\alpha) 随时间增加：
+
+[
+\alpha_{t+\Delta t}
+===================
+
+\min(1,\alpha_t+\Delta \alpha).
+]
+
+所以 (\alpha) 平滑的是：
+
+[
+\text{机器人在队形中的相对槽位。}
+]
+
+---
+
+## 3. 前端 guide 和 (\alpha) 不是二选一
+
+二者应该组合使用。
+
+前端 guide 给出整体运动：
+
+[
+c_h,\theta_h.
+]
+
+(\alpha) 给出当前时刻的过渡槽位：
+
+[
+p_{f,i}^{tr}(\alpha_h).
+]
+
+于是机器人 (i) 在 MPC horizon 中的参考可以写成：
+
+[
+q_{i,h}^{ref}
+=============
+
+c_h
++
+R(\theta_h)p_{f,i}^{tr}(\alpha_h).
+]
+
+也就是说：
+
+[
+\text{前端 guide 决定整体走向，}
+]
+
+[
+\alpha\text{ 决定队形如何从旧形状变到新形状。}
+]
+
+如果当前没有切换队形，就令：
+
+[
+\alpha=1
+]
+
+或者直接使用当前槽位。
+
+如果正在切换，就让 (\alpha) 从 0 到 1 平滑变化。
+
+---
+
+## 4. 要不要检查过渡过程是否在曲线带内
+
+第一版可以**不做完整过渡曲线带检查**。因为这会把前端从 formation selector 变成 transition planner，工程量和计算都会明显上升。
+
+但要承认这个取舍的含义：前端只保证目标队形在曲线带中合理可嵌入，不严格保证从旧队形到新队形的所有中间形态都完全安全。真实切换过程由 MPC 处理。
+
+所以前端可以只做三件轻量约束：
+
+第一，目标队形 (P_f^*) 在曲线带里可行：
+
+[
+C(P_f^*)\ge 0.
+]
+
+第二，切换不要太晚：
+
+[
+s_{\text{fail}}-s_{\text{now}}
+\ge
+L_{\text{switch}}.
+]
+
+第三，切换速度不要太激进：
+
+[
+\Delta \alpha
+]
+
+不能太大，也不能太小。太大则轨迹跳；太小则切换拖太久。
+
+---
+
+## 5. MPC 在这里负责什么
+
+MPC 负责把机器人从当前状态实际带到过渡槽位附近，同时处理动力学、速度限制和机器人间避碰。
+
+如果采用轨迹跟踪式 MPC，可以用：
+
+[
+q_{i,h}^{ref}
+=============
+
+c_h+R(\theta_h)p_{f,i}^{tr}(\alpha_h)
+]
+
+作为 soft reference，而不是硬约束。
+
+如果采用更接近 DEFORM 的控制器，也可以只把过渡槽位放进相对队形项：
+
+[
+p_{f,ij}^{tr}(\alpha)
+=====================
+
+## p_{f,i}^{tr}(\alpha)
+
+p_{f,j}^{tr}(\alpha),
+]
+
+再构造参考状态。DEFORM 原文也是通过队形相对关系、局部目标和逐机器人 MPC 完成重构，而不是显式规划完整切换轨迹。
+
+---
+
+最终可以把这部分总结成一句：
+
+**前端曲线带模块负责选择目标队形和生成编队级 guide；(\alpha) 负责把旧队形槽位平滑过渡到新队形槽位；MPC 负责实际执行这个过渡。
+第一版不强制检查所有过渡中间队形是否完全嵌入曲线带，只要求目标队形可行、切换有足够前瞻距离，并通过 MPC 的内部避碰和控制约束保
+证执行过程尽量安全。**

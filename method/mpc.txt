@@ -1,0 +1,130 @@
+设曲线带模块在当前时刻给出短前瞻 guide：
+
+[
+\mathcal G_k={(c_h,\theta_h)}_{h=0}^{H},
+]
+
+其中 (c_h) 是编队级引导中心，(\theta_h) 是编队整体朝向。若当前正在从旧队形 (P_f^{cur}) 切换到新队形 (P_f^*)，则定义机器人 (i)
+的过渡槽位为：
+
+[
+p_{f,i}^{tr}(\alpha_h)
+======================
+
+(1-\alpha_h)p_{f,i}^{cur}
++
+\alpha_h p_{f,\sigma(i)}^*,
+\quad \alpha_h\in[0,1],
+]
+
+其中 (\sigma(i)) 来自任务分配。于是机器人 (i) 在第 (h) 个预测步的 rolling reference 为：
+
+[
+q_{i,h}^{ref}
+=============
+
+c_h+R(\theta_h)p_{f,i}^{tr}(\alpha_h),
+]
+
+[
+\theta_{i,h}^{ref}=\theta_h.
+]
+
+参考输入可以由相邻 reference 差分得到：
+
+[
+v_{i,h}^{ref}
+=============
+
+\frac{|q_{i,h+1}^{ref}-q_{i,h}^{ref}|}{\Delta t},
+]
+
+[
+\omega_{i,h}^{ref}
+==================
+
+\frac{\mathrm{wrap}(\theta_{i,h+1}^{ref}-\theta_{i,h}^{ref})}{\Delta t}.
+]
+
+对每个机器人 (i)，MPC 可以写成：
+
+[
+\begin{aligned}
+\min_{{u_{i,h}},{\epsilon_{ij,h}},{\epsilon_{o,h}}}
+\quad
+&
+\sum_{h=0}^{H-1}
+\Big(
+|p(x_{i,h})-q_{i,h}^{ref}|*{Q_p}^2
++
+q*\theta
+|\mathrm{wrap}(\theta_{i,h}-\theta_{i,h}^{ref})|^2
+\
+&\qquad
++
+|u_{i,h}-u_{i,h}^{ref}|*{R}^2
++
+|u*{i,h}-u_{i,h-1}|*{S}^2
++
+w_o\epsilon*{o,h}^2
++
+\sum_{j\in \mathcal N_i} w_s\epsilon_{ij,h}^2
+\Big)
+\
+&+
+|p(x_{i,H})-q_{i,H}^{ref}|_{Q_f}^2
+\end{aligned}
+]
+
+subject to
+
+[
+x_{i,0}=x_i(t),
+]
+
+[
+x_{i,h+1}=f_d(x_{i,h},u_{i,h}),
+]
+
+[
+u_{i,h}=
+\begin{bmatrix}
+v_{i,h}\
+\omega_{i,h}
+\end{bmatrix},
+\quad
+0\le v_{i,h}\le v_{\max},
+\quad
+|\omega_{i,h}|\le \omega_{\max},
+]
+
+[
+|p(x_{i,h})-\hat p_{j,h}|
+\ge
+d_{\mathrm{safe}}-\epsilon_{ij,h},
+\quad
+\forall j\in\mathcal N_i,
+]
+
+[
+d_O(p(x_{i,h}))
+\ge
+R_{\mathrm{robot}}+\delta-\epsilon_{o,h},
+]
+
+[
+\epsilon_{ij,h}\ge 0,\quad \epsilon_{o,h}\ge 0.
+]
+
+这里 (f_d) 是差速/独轮车离散动力学，(p(x_{i,h})) 取状态中的二维位置，(\hat p_{j,h}) 可以用邻居上一轮预测轨迹、当前状态外推，
+或者其 reference 槽位近似。DEFORM 原文的 MPC 也是在非完整机器人动力学、速度约束和机器人间安全距离约束下跟踪参考状态；这里的主
+要变化是 reference 不再只来自单个局部目标点，而是来自曲线带模块给出的短前瞻编队 guide。
+
+解释如下：曲线带模块负责低频给出“队形整体应该大致沿哪里走、朝向怎么变”，MPC 高频负责把每个机器人实际控制到对应槽位附近。
+(q_{i,h}^{ref}) 不是硬轨迹，而是 rolling reference，MPC 可以在动力学和安全约束下偏离它。
+(|p(x_{i,h})-q_{i,h}^{ref}|*{Q_p}^2) 负责让机器人靠近自己的编队槽位。
+(\theta*{i,h}^{ref}) 和 (u_{i,h}^{ref}) 让运动方向、速度更接近曲线带 guide，从而减少抖动。
+(|u_{i,h}-u_{i,h-1}|_S^2) 用来惩罚控制突变，使轨迹更平滑。
+机器人间距离约束保证重构过程中不会互撞。
+障碍距离约束可以作为软约束使用，因为曲线带选择阶段已经预留了安全裕度，MPC 这里只做局部修正。
+这样前端不用生成每个机器人的完整动力学轨迹，MPC 也不需要从零决定全局方向，只做短时域跟踪和约束修正。

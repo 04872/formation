@@ -1,0 +1,295 @@
+是的，**11s / planning 仍然太慢**。现在已经把 `_corridor_margin()` 的单次查询从多边形边遍历降到 O(1)，也把 31×31 改成粗到细，但主结构里还保留了一个很贵的模式：
+
+```text
+先有一个初始 z, phi 序列
+→ 再用 repair_trajectory 对若干 active step 做局部网格修补
+→ 每个候选队形都重复这个过程
+```
+
+这类“修补式搜索”很容易慢。下一步不应该继续微调 `_corridor_margin()`，而是把 embedding 从 **repair-based** 改成 **one-shot lattice DP**。
+
+---
+
+### 1. 当前慢点已经不是 corridor margin，而是 repair 结构
+
+你现在优化后：
+
+```text
+单个队形 embedding: ~1.7s
+5 队形 planning: ~11s
+```
+
+这说明 `_corridor_margin()` 已经不是绝对瓶颈，但 `embedding_solver.solve()` 仍然在做大量重复评估。
+
+尤其是 `_repair_trajectory` 这种结构，本质是：
+
+```text
+对若干时间步逐个修
+每个时间步局部搜索很多 z/phi 候选
+每轮再重复
+每个队形再重复
+```
+
+它不是一次性求整条平滑轨迹，而是在局部不断补洞。这个结构很难压到实时。
+
+---
+
+### 2. 更合适的是 formation embedding 也用 DP
+
+前面 chord-DP 是为了选安全 corridor。
+后面队形嵌入也可以用 DP，直接选一串：
+
+[
+(z_m,\phi_m),\quad m=1,\ldots,M.
+]
+
+不要先求一个轨迹再 repair。
+
+对每个采样点 (m)，枚举一个小的状态集合：
+
+[
+z \in \mathcal Z,\qquad \phi\in\Phi.
+]
+
+例如：
+
+```text
+z:   11 个候选
+phi: 7 个候选
+```
+
+每个时刻状态数：
+
+[
+S=|\mathcal Z||\Phi|=77.
+]
+
+对每个候选队形 (P^k)，每个时刻 (m)，每个状态 (s=(z,\phi))，计算编队位姿：
+
+[
+c_{m,s}=\gamma_b(s_m)+z,n_b(s_m),
+]
+
+[
+\theta_{m,s}=\psi_b(s_m)+\phi.
+]
+
+每个槽位点：
+
+[
+q_{i,m,s}^k
+===========
+
+c_{m,s}+R(\theta_{m,s})p_i^k.
+]
+
+然后直接查 corridor SDF：
+
+[
+M_{m,s}^k
+=========
+
+\min_i \operatorname{CorridorSDF}(q_{i,m,s}^k).
+]
+
+这个可以完全 batch 化，得到一个数组：
+
+```text
+margin[k, m, s]
+```
+
+接下来用 DP 选一条平滑状态序列：
+
+[
+s_1,\ldots,s_M.
+]
+
+节点代价：
+
+[
+J_{\text{node}}(m,s)
+====================
+
+-w_M M_{m,s}^k
++
+w_z z_s^2
++
+w_\phi \phi_s^2
++
+w_V \operatorname{ReLU}(-M_{m,s}^k)^2.
+]
+
+转移代价：
+
+[
+J_{\text{trans}}(s,s')
+======================
+
+w_{\Delta z}(z_{s'}-z_s)^2
++
+w_{\Delta\phi}(\phi_{s'}-\phi_s)^2.
+]
+
+最终：
+
+[
+J_k
+===
+
+\min_{s_1,\ldots,s_M}
+\sum_m J_{\text{node}}(m,s_m)
++
+\sum_m J_{\text{trans}}(s_m,s_{m+1}).
+]
+
+这个 DP 直接给出整条最优 embedding，不需要 repair。
+
+---
+
+### 3. 复杂度会低很多
+
+假设：
+
+```text
+M = 10
+S = 77
+N = 4 robots
+K = 5 formations
+```
+
+margin 查询量大约是：
+
+[
+K \times M \times S \times N
+============================
+
+# 5\times10\times77\times4
+
+15400
+]
+
+这是很小的，而且可以一次性向量化。
+
+DP 转移量是：
+
+[
+K \times (M-1)\times S^2
+========================
+
+5\times9\times77^2
+\approx 266000.
+]
+
+这个量对 numpy / torch 都很轻。相比现在 repair 里成千上万次 `_evaluate_step()`，结构上会干净很多。
+
+---
+
+### 4. 这个改法仍然保留 chord-DP corridor 思想
+
+这不是退回“局部自由空间直接搜位姿”。
+流程仍然是：
+
+```text
+preview curve
+→ chord-DP 生成 safe strip corridor
+→ corridor rasterize 成 SDF
+→ formation lattice-DP 在 corridor 内找 z, phi 序列
+→ score formation
+```
+
+也就是说，安全几何仍然来自 chord-DP corridor。只是队形嵌入从“QP/repair 混合搜索”改成“离散状态 DP”。
+
+这样和你的方法线是一致的：
+
+* chord-DP 解决 curve band 建模；
+* formation-DP 解决队形如何沿 corridor 平滑嵌入；
+* selector 只比较不同队形的 corridor margin、平滑代价、切换代价和队形偏好。
+
+---
+
+### 5. repair 可以降级成可选 refine
+
+如果担心 DP 粒度太粗，可以只对最终选中的 top-1 队形做一次很小的 refine：
+
+```text
+DP 得到 z_m, phi_m
+→ 对 top-1 或 top-2 做 3×3 或 5×5 局部微调
+```
+
+不要对所有队形都跑 repair。
+也不要让 repair 决定基本可行性。基本可行性应该由 DP 先给出。
+
+---
+
+### 6. 评分可以直接基于 DP 输出
+
+DP 对每个队形输出：
+
+```text
+best_state_sequence: s_1 ... s_M
+min_margin: M_k
+violation: V_k
+embedding_cost: J_k
+```
+
+然后 selector 还是用：
+
+[
+S_k
+===
+
+## w_M M_k
+
+## w_J J_k
+
+## w_V V_k
+
+w_C C_{\text{switch}}
++
+w_U U(P^k).
+]
+
+这里 (M_k) 可以取 DP 轨迹上的最小 corridor margin：
+
+[
+M_k=\min_m M_{m,s_m}^k.
+]
+
+违反量：
+
+[
+V_k=
+\sum_m \operatorname{ReLU}(-M_{m,s_m}^k)^2.
+]
+
+这样不需要 `_repair_trajectory` 再重新定义一套可行性。
+
+---
+
+### 7. 进一步加速顺序
+
+我建议按这个优先级继续做：
+
+```text
+1. 保留 chord-DP corridor 和 corridor SDF
+
+2. 删除或绕过 repair_trajectory 的主流程
+
+3. 实现 z/phi lattice-DP:
+   - z_grid: 9~13 个
+   - phi_grid: 5~9 个
+   - batch 计算所有 slot 点 corridor margin
+   - DP 选整条状态序列
+
+4. repair 只作为 top-1 optional refine
+
+5. formation 也 batch 化：
+   一次性算 K 个 formation 的 margin[k,m,s]
+
+6. 若仍慢，再做 early accept:
+   如果当前队形 / square 的 margin 足够大，直接保留，不评估所有 fallback
+```
+
+---
+
+你现在的 11s 说明单点 margin 已经优化成功，但 **embedding 搜索结构还没改干净**。下一步最有效的不是继续压 `_corridor_margin()`，而是把 “repair 搜索” 换成 “formation lattice-DP”。这一步做完，planning 应该有机会从 11s 降到 1s 以内，甚至更低。
