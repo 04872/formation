@@ -2,6 +2,7 @@ from formation.astar import AStarPlanner
 from formation.controller_reference import ControllerReferenceBuilder
 from formation.curve_band import CurveBandBuilder
 from formation.embedding_qp import EmbeddingQPSolver
+from formation.formation_feasibility import FeasibilityConfig, FormationFeasibility, FormationFeasibilityResult
 from formation.formation_library import FormationLibrary
 from formation.formation_selector import FormationSelector, SelectedFormationResult, SelectorConfig, SelectorWeights, select_target_formation
 from formation.global_planner import GlobalPlanner
@@ -22,6 +23,7 @@ from formation.mpc_consensus import ConsensusFormationMPC
 from formation.path_manager import PathManager
 from formation.preview_curve import PreviewCurvePlanner
 from formation.simulator import MultiRobotSimulator, trace_summary
+from formation.swept_band import SweptBand, SweptBandBuilder
 from formation.types import (
     AssignmentResult,
     ControlCommand,

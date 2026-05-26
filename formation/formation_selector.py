@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
-from formation.assignment import compute_best_assignment
 from formation.curve_band import CurveBandBuilder
-from formation.embedding_qp import EmbeddingQPSolver
+from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
 from formation.guide_generator import GuideGenerator
-from formation.mpc_controller import query_distance_field
 from formation.types import (
     AssignmentResult,
     CurveBand,
@@ -18,7 +15,6 @@ from formation.types import (
     FormationSpec,
     LocalPreviewPath,
     MapData,
-    Point2D,
     RobotState,
 )
 
@@ -57,10 +53,12 @@ class FormationSelector:
         self.config = config or SelectorConfig()
         self.band_builder = CurveBandBuilder()
         self.guide_generator = GuideGenerator()
-        self.embedding_solver = EmbeddingQPSolver(
-            max_heading_offset_rad=self.config.max_heading_offset_rad,
-            heading_grid_size=max(11, 2 * self.config.heading_offset_samples + 1),
-            lateral_grid_size=max(11, 2 * self.config.lateral_offset_samples + 1),
+        self.feasibility = FormationFeasibility(
+            FeasibilityConfig(
+                max_heading_offset_rad=self.config.max_heading_offset_rad,
+                heading_grid_size=max(11, 2 * self.config.heading_offset_samples + 1),
+                lateral_grid_size=max(11, 2 * self.config.lateral_offset_samples + 1),
+            )
         )
         self._hysteresis_counter: dict[str, int] = {}
         self._preference_rank: dict[str, int] = {name: idx for idx, name in enumerate(self.config.formation_preference)}
@@ -85,114 +83,65 @@ class FormationSelector:
         current_formation: FormationSpec | None = None,
         current_states: "list[RobotState] | None" = None,
     ) -> FormationCandidateEvaluation:
-        if not preview_path.points_xy or not curve_band.samples:
-            return self._build_infeasible_evaluation(formation, "empty_preview_or_band")
-
-        embedding_result = self.embedding_solver.solve(preview_path, curve_band, formation)
-        if not embedding_result.is_feasible:
-            return self._build_infeasible_evaluation(
-                formation,
-                embedding_result.failure_reason or "embedding_infeasible",
-                embedding_result=embedding_result,
-            )
-
-        min_slot_clearance_m, mean_clearance_m = self._compute_slot_clearance_stats(
-            map_data,
-            embedding_result.slot_points_by_step_xy,
+        """Evaluate one formation candidate.  Delegates embedding+clearance to
+        FormationFeasibility; keeps scoring, assignment, and metadata packaging."""
+        feas = self.feasibility.check(
+            map_data, preview_path, curve_band, formation,
+            robot_radius, safety_margin,
+            current_formation=current_formation,
+            current_states=current_states,
         )
-        required_clearance_m = robot_radius + safety_margin
-        safety_margin_m = min_slot_clearance_m - required_clearance_m
-        # Corridor margin already verifies slots against the distance-field-validated
-        # strip cells. The polygon-margin check and distance-field check use the same
-        # required_clearance (robot_radius + safety_margin). A positive corridor margin
-        # means all slots sit inside verified free space.
-        is_safe = (
-            embedding_result.min_corridor_margin_m >= -1e-9
-            and embedding_result.corridor_violation_cost <= 1e-9
-        )
-
-        # Only reassign when formation name changes; otherwise identity.
-        if current_formation is None or current_formation.name == formation.name:
-            n = len(embedding_result.slot_points_by_step_xy[0])
-            assignment = AssignmentResult(
-                assignment=tuple(range(n)), total_cost=0.0, max_cost=0.0,
-                per_robot_costs=[0.0] * n,
-            )
-        else:
-            if current_states:
-                current_slots_xy = [(s.x, s.y) for s in current_states]
-            else:
-                current_slots_xy = self._current_slots_xy(
-                    current_formation,
-                    embedding_result.center_points_xy[0],
-                    embedding_result.heading_rads[0],
-                    formation,
-                )
-            assignment = compute_best_assignment(
-                current_slots_xy, embedding_result.slot_points_by_step_xy[0],
-            )
-        score_breakdown = self._score_candidate(
+        required = robot_radius + safety_margin
+        score = self._score_candidate(
             formation,
-            min_slot_clearance_m,
-            safety_margin_m,
-            mean_clearance_m,
-            assignment.total_cost,
-            embedding_result,
+            feas.min_slot_clearance_m,
+            feas.safety_margin_m,
+            feas.mean_clearance_m,
+            feas.assignment.total_cost if feas.assignment else 0.0,
+            feas.embedding_qp_result,
         )
 
-        mean_lateral_offset_m = (
-            sum(embedding_result.lateral_offsets_m) / len(embedding_result.lateral_offsets_m)
-            if embedding_result.lateral_offsets_m
-            else 0.0
-        )
-        mean_heading_offset_rad = (
-            sum(embedding_result.heading_offsets_rad) / len(embedding_result.heading_offsets_rad)
-            if embedding_result.heading_offsets_rad
-            else 0.0
-        )
-        corridor_feasible = embedding_result.min_corridor_margin_m >= -1e-9
+        mean_lat = (sum(feas.lateral_offsets_m) / len(feas.lateral_offsets_m)
+                    if feas.lateral_offsets_m else 0.0)
+        mean_hdg = (sum(feas.heading_offsets_rad) / len(feas.heading_offsets_rad)
+                    if feas.heading_offsets_rad else 0.0)
         frontend_status = {
             "curve_band_built": bool(curve_band.samples),
-            "embedding_feasible": embedding_result.is_feasible,
-            "corridor_feasible": corridor_feasible,
-            "is_safe": is_safe,
-            "failure_reason": "" if is_safe else self._failure_reason(corridor_feasible, safety_margin_m),
+            "embedding_feasible": feas.embedding_qp_result is not None and feas.embedding_qp_result.is_feasible,
+            "corridor_feasible": feas.min_corridor_margin_m >= -1e-9,
+            "is_safe": feas.is_feasible,
+            "failure_reason": feas.failure_reason,
         }
-        refined_band_centerline = list(
-            curve_band.metadata.get(
-                "refined_band_centerline",
-                [sample.center_xy for sample in curve_band.samples],
-            )
-        )
-        safe_strip_cells = list(
-            curve_band.metadata.get(
-                "safe_strip_cells",
-                [cell.vertices_xy for cell in curve_band.strip_cells],
-            )
-        )
+        refined_centerline = list(
+            curve_band.metadata.get("refined_band_centerline",
+                                    [s.center_xy for s in curve_band.samples]))
+        safe_strip = list(
+            curve_band.metadata.get("safe_strip_cells",
+                                    [c.vertices_xy for c in curve_band.strip_cells]))
 
         return FormationCandidateEvaluation(
             formation_name=formation.name,
-            band_feasible=corridor_feasible,
-            is_safe=is_safe,
-            score_breakdown=score_breakdown,
-            center_points_xy=embedding_result.center_points_xy,
-            heading_rads=embedding_result.heading_rads,
-            slot_points_by_step_xy=embedding_result.slot_points_by_step_xy,
-            assignment=assignment,
-            embedding_qp_result=embedding_result,
-            lateral_offset_m=mean_lateral_offset_m,
-            heading_offset_rad=mean_heading_offset_rad,
-            min_slot_clearance_m=min_slot_clearance_m,
-            failure_reason=frontend_status["failure_reason"],
+            band_feasible=feas.min_corridor_margin_m >= -1e-9,
+            is_safe=feas.is_feasible,
+            score_breakdown=score,
+            center_points_xy=feas.center_points_xy,
+            heading_rads=feas.heading_rads,
+            slot_points_by_step_xy=feas.slot_points_by_step_xy,
+            assignment=feas.assignment or AssignmentResult(
+                assignment=(), total_cost=0.0, max_cost=0.0, per_robot_costs=[]),
+            embedding_qp_result=feas.embedding_qp_result,
+            lateral_offset_m=mean_lat,
+            heading_offset_rad=mean_hdg,
+            min_slot_clearance_m=feas.min_slot_clearance_m,
+            failure_reason=feas.failure_reason,
             metadata={
-                "mean_lateral_offset_m": mean_lateral_offset_m,
-                "mean_heading_offset_rad": mean_heading_offset_rad,
-                "mean_clearance_m": mean_clearance_m,
-                "required_clearance_m": required_clearance_m,
+                "mean_lateral_offset_m": mean_lat,
+                "mean_heading_offset_rad": mean_hdg,
+                "mean_clearance_m": feas.mean_clearance_m,
+                "required_clearance_m": required,
                 "curve_band_source_mode": curve_band.source_mode,
-                "refined_band_centerline": refined_band_centerline,
-                "safe_strip_cells": safe_strip_cells,
+                "refined_band_centerline": refined_centerline,
+                "safe_strip_cells": safe_strip,
                 "frontend_status": frontend_status,
                 "curve_band_metadata": dict(curve_band.metadata),
             },
@@ -239,36 +188,6 @@ class FormationSelector:
             selected_evaluation=selected_eval,
             selected_formation=selected_formation,
             guide=guide,
-        )
-
-    def _build_infeasible_evaluation(
-        self,
-        formation: FormationSpec,
-        failure_reason: str,
-        embedding_result: EmbeddingQPResult | None = None,
-    ) -> FormationCandidateEvaluation:
-        preview_alignment_cost = 0.0
-        if embedding_result is not None:
-            preview_alignment_cost = float(embedding_result.metadata.get("preview_alignment_cost", 0.0))
-        return FormationCandidateEvaluation(
-            formation_name=formation.name,
-            band_feasible=False,
-            is_safe=False,
-            score_breakdown=FormationScoreBreakdown(
-                min_corridor_margin_m=(0.0 if embedding_result is None else embedding_result.min_corridor_margin_m),
-                embedding_cost=(0.0 if embedding_result is None else embedding_result.offset_cost + embedding_result.heading_cost),
-                corridor_violation_cost=(0.0 if embedding_result is None else embedding_result.corridor_violation_cost),
-                switch_cost=0.0,
-                task_utility=formation.task_utility,
-                total_score=-1_000_000.0,
-                offset_cost=0.0 if embedding_result is None else embedding_result.offset_cost,
-                heading_cost=0.0 if embedding_result is None else embedding_result.heading_cost,
-                preview_alignment_cost=preview_alignment_cost,
-                metadata={"failure_reason": failure_reason},
-            ),
-            embedding_qp_result=embedding_result,
-            failure_reason=failure_reason,
-            metadata={"frontend_status": {"is_safe": False, "failure_reason": failure_reason}},
         )
 
     def _select_best_evaluation(
@@ -320,44 +239,6 @@ class FormationSelector:
         current_eval = next(ev for ev in evaluations if ev.formation_name == current_name)
         return current_eval
 
-    def _compute_slot_clearance_stats(
-        self,
-        map_data: MapData,
-        slot_points_by_step_xy: list[list[Point2D]],
-    ) -> tuple[float, float]:
-        clearances = [
-            self._query_clearance(map_data, slot_xy)
-            for slot_points_xy in slot_points_by_step_xy
-            for slot_xy in slot_points_xy
-        ]
-        if not clearances:
-            return 0.0, 0.0
-        return min(clearances), sum(clearances) / len(clearances)
-
-    def _current_slots_xy(
-        self,
-        current_formation: FormationSpec | None,
-        center_xy: Point2D,
-        heading_rad: float,
-        fallback_formation: FormationSpec,
-    ) -> list[Point2D]:
-        formation = current_formation or fallback_formation
-        return self._transform_slots(formation, center_xy, heading_rad)
-
-    def _transform_slots(self, formation: FormationSpec, center_xy: Point2D, heading_rad: float) -> list[Point2D]:
-        cos_heading = math.cos(heading_rad)
-        sin_heading = math.sin(heading_rad)
-        return [
-            (
-                center_xy[0] + cos_heading * float(slot[0]) - sin_heading * float(slot[1]),
-                center_xy[1] + sin_heading * float(slot[0]) + cos_heading * float(slot[1]),
-            )
-            for slot in formation.slots
-        ]
-
-    def _query_clearance(self, map_data: MapData, point_xy: Point2D) -> float:
-        return float(query_distance_field(map_data, point_xy))
-
     def _score_candidate(
         self,
         formation: FormationSpec,
@@ -365,9 +246,18 @@ class FormationSelector:
         safety_margin_m: float,
         mean_clearance_m: float,
         switch_cost: float,
-        embedding_result: EmbeddingQPResult,
+        embedding_result: "EmbeddingQPResult | None",
     ) -> FormationScoreBreakdown:
         weights = self.config.weights
+        if embedding_result is None:
+            return FormationScoreBreakdown(
+                min_corridor_margin_m=0.0, embedding_cost=0.0,
+                corridor_violation_cost=0.0, switch_cost=switch_cost,
+                task_utility=formation.task_utility,
+                offset_cost=0.0, heading_cost=0.0,
+                total_score=-1_000_000.0,
+                metadata={"failure_reason": "embedding_infeasible"},
+            )
         embedding_cost = embedding_result.offset_cost + embedding_result.heading_cost
         score_breakdown = FormationScoreBreakdown(
             min_corridor_margin_m=embedding_result.min_corridor_margin_m,
@@ -385,9 +275,6 @@ class FormationSelector:
                 "inside_slot_count": int(embedding_result.metadata.get("inside_slot_count", 0)),
                 "total_slot_count": int(embedding_result.metadata.get("total_slot_count", 0)),
                 "inside_slot_ratio": float(embedding_result.metadata.get("inside_slot_ratio", 0.0)),
-                "terminal_heading_error_rad": float(embedding_result.metadata.get("terminal_heading_error_rad", 0.0)),
-                "terminal_heading_offset_rad": float(embedding_result.metadata.get("terminal_heading_offset_rad", 0.0)),
-                "phi_reference_terminal_rad": float(embedding_result.metadata.get("phi_reference_terminal_rad", 0.0)),
             },
         )
         score_breakdown.total_score = (
@@ -398,14 +285,6 @@ class FormationSelector:
             + weights.task_utility * score_breakdown.task_utility
         )
         return score_breakdown
-
-    @staticmethod
-    def _failure_reason(band_feasible: bool, safety_margin_m: float) -> str:
-        if not band_feasible:
-            return "slot_outside_safe_corridor"
-        if safety_margin_m < -1e-9:
-            return "slot_clearance_below_threshold"
-        return ""
 
 
 def select_target_formation(

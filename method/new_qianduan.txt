@@ -1,0 +1,552 @@
+可以把现在的方案整理成三层：**曲线自身条件 → 局部路径规划约束 → 队形可行性与最优中心轨迹输出**。这里先把目标总宽记为：
+
+[
+W_0=2.4\text{m}.
+]
+
+这个 (2.4m) 不是说任何环境下都要留出 (2.4m) 通道，而是说：**在环境足够空旷时，这条局部参考曲线本身应当能够作为一个宽度至少 (2.4m) 
+的法向曲线带骨架。**
+
+---
+
+## 1. 曲线自身要满足什么条件
+
+设局部路径曲线为：
+
+[
+\gamma(s),\qquad s\in[0,S].
+]
+
+它的单位法向为：
+
+[
+n(s).
+]
+
+曲线带坐标定义为：
+
+[
+F(s,\eta)=\gamma(s)+\eta n(s).
+]
+
+如果这个法向坐标在某个区域内不折叠、不自交，那么这条曲线才能稳定表达一条二维带状区域。
+
+对每个位置 (s)，定义由曲线自身决定的两侧 one-sided reach：
+
+[
+\rho_+(s),\qquad \rho_-(s).
+]
+
+它们分别表示：在环境完全空旷时，从 (\gamma(s)) 沿正法向、负法向最多可以偏移多远，而不出现 offset 曲线局部尖点、折返，或者全局 normal map 自交。
+
+那么“这条曲线在空旷环境下至少能表达 (2.4m) 总宽度”的条件是：
+
+[
+\boxed{
+\rho_+(s)+\rho_-(s)\ge W_0=2.4m,\qquad \forall s\in[0,S].
+}
+]
+
+注意，这不是要求：
+
+[
+\rho_+(s)\ge1.2m,\qquad \rho_-(s)\ge1.2m.
+]
+
+那是对称曲线带的强条件。你现在只要求两侧总宽不少于 (2.4m)，所以允许一侧窄、一侧宽。真正必要的表达能力条件是两侧 one-sided reach 的
+和足够大。
+
+局部曲率只限制曲率中心那一侧。比如 (\kappa(s)>0) 时，正法向侧有局部焦点限制：
+
+[
+\rho_+^{curv}(s)\le \frac{1}{\kappa(s)}.
+]
+
+负法向侧局部上不受这个曲率焦点限制，但仍然可能受全局自交限制。所以总宽条件不能只靠最小曲率半径描述，尤其是 S 形曲线时，曲率变号，全局 normal map 自交才是关键。
+
+---
+
+## 2. 这个条件怎么约束局部路径规划
+
+局部路径规划不是只输出一条短路径 (\gamma(s))，而应该输出一条**适合作为宽曲线带骨架的曲线**。因此局部路径优化里要多一个曲线质量约束：
+
+[
+C_{\rm band}(\gamma)
+====================
+
+\min_{s\in[0,S]}
+\left[
+\rho_+^\gamma(s)+\rho_-^\gamma(s)
+\right].
+]
+
+要求：
+
+[
+C_{\rm band}(\gamma)\ge W_0.
+]
+
+也就是：
+
+[
+\min_s
+\left[
+\rho_+^\gamma(s)+\rho_-^\gamma(s)
+\right]
+\ge 2.4m.
+]
+
+如果局部曲线用 Bézier 或 B-spline 控制点 (Q) 表示：
+
+[
+\gamma(s)=\gamma(s;Q),
+]
+
+那么局部路径规划可以写成：
+
+[
+\min_Q J_{\rm path}(Q)
+]
+
+subject to：
+
+[
+\gamma(0)=x_{\rm start},\qquad \gamma(S)=x_{\rm goal/local},
+]
+
+[
+|\gamma'(s)|>0,
+]
+
+[
+C_{\rm band}(\gamma_Q)\ge 2.4m.
+]
+
+实际中 (\rho_+(s),\rho_-(s)) 的精确计算不简单，因为它包含全局 normal map 是否自交。工程上可以用下面的近似约束：
+
+[
+J_{\rm band}(Q)
+===============
+
+\int_0^S
+\left[
+W_0-
+\left(
+\hat\rho_+^\gamma(s)+\hat\rho_-^\gamma(s)
+\right)
+\right]_+^2 ds.
+]
+
+然后在路径优化中加入：
+
+[
+J_{\rm path}(Q)
++
+\lambda_{\rm band}J_{\rm band}(Q)
++
+\lambda_\kappa J_\kappa(Q)
++
+\lambda_s J_{\rm smooth}(Q).
+]
+
+其中 (J_\kappa) 不是为了强行要求两侧各 (1.2m)，而是防止局部曲率过大导致法向坐标退化。曲率约束可以作为稳定性条件，例如：
+
+[
+|\kappa(s)|\le \kappa_{\max}.
+]
+
+但要注意：
+
+[
+R_{\min}>1.2m
+]
+
+只是对称 (2.4m) 曲线带的充分条件，不是你这个“左右总和 (2.4m)”的必要条件。因此更准确的约束还是：
+
+[
+\rho_+(s)+\rho_-(s)\ge 2.4m.
+]
+
+实现时可以在一组 (s_j) 上估计：
+
+[
+\hat\rho_+(s_j),\quad \hat\rho_-(s_j),
+]
+
+然后检查：
+
+[
+\hat\rho_+(s_j)+\hat\rho_-(s_j)\ge 2.4m.
+]
+
+如果不满足，就说明这条局部曲线虽然能连接起点和局部目标，但不适合作为宽队形曲线带的骨架，需要重新平滑、增大转弯半径、调整局部目标，
+或者缩短/改变局部窗口。
+
+---
+
+## 3. 实际环境中如何构造连续 offset band
+
+曲线自身给出的是表达能力上界：
+
+[
+\rho_+(s),\qquad \rho_-(s).
+]
+
+实际地图会进一步裁剪这个上界。沿曲线法向在 distance field 中 raycast，得到地图允许距离：
+
+[
+d_+^{map}(s),\qquad d_-^{map}(s).
+]
+
+于是每侧可用偏移上界是：
+
+[
+\bar r_+(s)
+===========
+
+\min
+\left(
+\rho_+(s),d_+^{map}(s)
+\right),
+]
+
+[
+\bar r_-(s)
+===========
+
+\min
+\left(
+\rho_-(s),d_-^{map}(s)
+\right).
+]
+
+如果考虑机器人半径和安全裕度，可以把 raycast 的安全边界写成：
+
+[
+D(x)\ge \rho_{\rm robot}+\delta.
+]
+
+然后构造连续 offset band 对象：
+
+[
+\boxed{
+\mathcal B
+==========
+
+\left{
+\gamma(s)+\eta n(s)
+\mid
+s\in[0,S],
+-\bar r_-(s)\le \eta\le \bar r_+(s)
+\right}.
+}
+]
+
+这个 (\mathcal B) 是二维对象，不是“只存左右宽度标量”。它由：
+
+[
+\gamma(s),\quad n(s),\quad \bar r_+(s),\quad \bar r_-(s)
+]
+
+共同定义。后续判断点是否在带内，要通过这个连续 offset-band 对象的 membership / margin，而不是只比较某个离散截面的宽度。
+
+---
+
+## 4. 队形是否可行：泛函可行性问题
+
+候选队形为：
+
+[
+P^k={p_i^k}_{i=1}^N.
+]
+
+编队中心曲线不直接等于 (\gamma(s))，而允许在曲线带内做法向偏移：
+
+[
+c_\mu(s)=\gamma(s)+\mu(s)n(s).
+]
+
+队形朝向不额外优化，而由中心曲线切向决定：
+
+[
+\theta_\mu(s)=\operatorname{atan2}(c_\mu'(s)).
+]
+
+于是第 (i) 个机器人槽位轨迹为：
+
+[
+q_i^k(s;\mu)
+============
+
+c_\mu(s)
++
+R(\theta_\mu(s))p_i^k.
+]
+
+定义连续曲线带的 margin：
+
+[
+m_{\mathcal B}(x).
+]
+
+若：
+
+[
+m_{\mathcal B}(x)\ge0,
+]
+
+表示点 (x) 在曲线带内；若小于 0，则表示超出曲线带。
+
+对一个候选队形 (P^k)，定义 violation functional：
+
+[
+\mathcal V_k[\mu]
+=================
+
+\sup_{s\in[0,S]}
+\max_i
+\left[
+\delta_{\rm emb}
+----------------
+
+m_{\mathcal B}
+\left(
+q_i^k(s;\mu)
+\right)
+\right]_+.
+]
+
+如果：
+
+[
+\mathcal V_k[\mu]=0,
+]
+
+说明在这条中心偏移函数 (\mu(s)) 下，整个队形沿中心曲线运动时所有槽位都在曲线带内。
+
+因此队形可行性定义为：
+
+[
+\boxed{
+P^k\text{ feasible}
+\Longleftrightarrow
+\inf_{\mu\in\mathcal A}
+\mathcal V_k[\mu]=0.
+}
+]
+
+其中 (\mathcal A) 是允许的中心偏移函数集合，例如：
+
+[
+-\bar r_-(s)\le \mu(s)\le \bar r_+(s),
+]
+
+[
+|c_\mu'(s)|>0,
+]
+
+并且 (\mu(s)) 足够光滑。
+
+这一步本质是一个连续可行性判断，不是先天的离散 DP。
+
+---
+
+## 5. 如果可行，如何输出有最优性的中心轨迹
+
+如果某个队形 (P^k) 可行，那么还需要从所有可行中心曲线里选一条最好的中心轨迹。这个时候才自然变成约束泛函优化问题：
+
+[
+\mu_k^\star
+===========
+
+\arg\min_{\mu\in\mathcal A}
+\mathcal J[\mu]
+]
+
+subject to：
+
+[
+m_{\mathcal B}
+\left(
+q_i^k(s;\mu)
+\right)
+\ge
+\delta_{\rm emb},
+\qquad
+\forall i,\forall s\in[0,S].
+]
+
+一个合理的目标函数是：
+
+[
+\mathcal J[\mu]
+===============
+
+\int_0^S
+\left[
+w_0\mu(s)^2
++
+w_1(\mu'(s))^2
++
+w_2(\mu''(s))^2
+\right]ds.
+]
+
+含义是：
+
+[
+\int \mu^2 ds
+]
+
+让中心轨迹尽量接近原始局部路径；
+
+[
+\int (\mu')^2 ds
+]
+
+避免中心轨迹左右摆动太快；
+
+[
+\int (\mu'')^2 ds
+]
+
+让中心轨迹更加平滑。
+
+如果还希望留出额外裕度，可以加一个弱的 clearance 项：
+
+[
+-w_m
+\int_0^S
+\min_i m_{\mathcal B}(q_i^k(s;\mu))ds.
+]
+
+但这个项不应该太强，否则中心轨迹可能为了追求 margin 偏到曲线带一侧，反而不自然。
+
+最终输出：
+
+[
+c_k^\star(s)
+============
+
+\gamma(s)+\mu_k^\star(s)n(s),
+]
+
+[
+\theta_k^\star(s)
+=================
+
+\operatorname{atan2}\left((c_k^\star)'(s)\right),
+]
+
+[
+q_{i,k}^\star(s)
+================
+
+c_k^\star(s)
++
+R(\theta_k^\star(s))p_i^k.
+]
+
+这些就是后端跟踪的编队中心 guide 和各机器人槽位 guide。
+
+---
+
+## 6. 数值上怎么解
+
+这个优化不是凸问题，但规模很小。因为自变量只有一个一维函数 (\mu(s))。
+
+工程上可以用 B-spline 参数化：
+
+[
+\mu(s)=\sum_{j=1}^{K}a_jB_j(s).
+]
+
+一般局部曲线很短，(K=5\sim10) 个控制量就够。于是问题变成小规模非线性约束优化：
+
+[
+\min_a \mathcal J(a)
+]
+
+subject to：
+
+[
+m_{\mathcal B}
+\left(
+q_i^k(s;a)
+\right)
+\ge
+\delta_{\rm emb},
+\qquad \forall i,s.
+]
+
+连续约束可以用 exchange / adaptive verification 处理：
+
+```text
+1. 先用少量 s 位置解一个有限约束 NLP
+2. 得到候选 μ(s)
+3. 在连续区间上搜索最小 margin 的位置
+4. 如果所有位置都满足 margin ≥ δ_emb，接受
+5. 如果发现违反点 s*，把 s* 加入约束集合，重新求解
+6. 重复直到通过验证或判定不可行
+```
+
+这里的采样不是方法定义，而是求解连续约束问题的数值手段。
+
+---
+
+## 7. 最终队形选择逻辑
+
+对每个候选队形 (P^k)：
+
+[
+J_{\rm feas}(P^k)
+=================
+
+\inf_{\mu\in\mathcal A}
+\mathcal V_k[\mu].
+]
+
+可行集合是：
+
+[
+\mathcal F
+==========
+
+{P^k\mid J_{\rm feas}(P^k)=0}.
+]
+
+如果：
+
+[
+\mathcal F\neq\emptyset,
+]
+
+就在可行集合中选优先级最高、尺寸最大的队形，例如：
+
+[
+square \succ horizontal \succ t_shape \succ compact \succ column.
+]
+
+被选中的队形再求：
+
+[
+\mu_k^\star
+===========
+
+\arg\min_{\mu}
+\mathcal J[\mu]
+]
+
+输出最优中心轨迹。
+
+如果：
+
+[
+\mathcal F=\emptyset,
+]
+
+说明当前曲线带无法容纳候选库中的任何队形。此时不应该强行输出最高分队形，而应该触发：
+
+```text
+缩短 horizon / 重新生成局部曲线 / 换更保守队形库 / 停止等待重规划
+``
