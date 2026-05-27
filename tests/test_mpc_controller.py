@@ -16,13 +16,13 @@ from formation import (
 
 class DistributedFormationMPCTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.map_data = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.18))
+        self.map_data = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.09))
         self.config = MPCConfig(
             dt=0.2,
             horizon_steps=4,
             v_max=0.6,
             omega_max=1.0,
-            robot_radius=0.18,
+            robot_radius=0.09,
             safety_margin=0.06,
             inter_robot_margin=0.10,
         )
@@ -125,11 +125,11 @@ class DistributedFormationMPCTest(unittest.TestCase):
 
     def test_all_controls_respect_bounds(self) -> None:
         from formation import FormationSelector, GlobalPlanner, PathManager, PreviewCurvePlanner, FormationLibrary
-        lib = FormationLibrary.build_default(robot_radius=0.18, inter_robot_margin=0.10)
-        mp = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.18))
+        lib = FormationLibrary.build_default(robot_radius=0.09, inter_robot_margin=0.10)
+        mp = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.09))
         gp = GlobalPlanner().plan(mp)
         preview = PreviewCurvePlanner().plan(mp, mp.start_xy, PathManager(gp).get_local_path_window(mp.start_xy, preview_distance_m=3.5))
-        selection = FormationSelector().select_target_formation(mp, preview, lib.list(), 0.18, 0.06)
+        selection = FormationSelector().select_target_formation(mp, preview, lib.list(), 0.09, 0.06)
         ref = self.reference_builder.build(selection.guide).window(0, self.config.horizon_steps)
 
         states = [
@@ -147,11 +147,11 @@ class DistributedFormationMPCTest(unittest.TestCase):
 
     def test_parallel_and_serial_solve_shapes_match(self) -> None:
         from formation import FormationSelector, GlobalPlanner, PathManager, PreviewCurvePlanner, FormationLibrary
-        lib = FormationLibrary.build_default(robot_radius=0.18, inter_robot_margin=0.10)
-        mp = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.18))
+        lib = FormationLibrary.build_default(robot_radius=0.09, inter_robot_margin=0.10)
+        mp = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.09))
         gp = GlobalPlanner().plan(mp)
         preview = PreviewCurvePlanner().plan(mp, mp.start_xy, PathManager(gp).get_local_path_window(mp.start_xy, preview_distance_m=3.5))
-        selection = FormationSelector().select_target_formation(mp, preview, lib.list(), 0.18, 0.06)
+        selection = FormationSelector().select_target_formation(mp, preview, lib.list(), 0.09, 0.06)
         ref = self.reference_builder.build(selection.guide).window(0, self.config.horizon_steps)
         states = [
             RobotState(x=s.position_xy[0], y=s.position_xy[1], yaw=s.yaw)

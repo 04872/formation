@@ -56,8 +56,9 @@ class FeasibilityConfig:
     mode: str = "legacy"          # "legacy" | "swept_band"
 
     # ── swept‑band ────────────────────────────────────────────────
+    feasibility_tol_m: float = 0.06      # SDF discretisation tolerance (~1 cell)
     bspline_control_count: int = 6
-    collocation_points: int = 10
+    collocation_points: int = 15
     verification_points: int = 60
     embed_margin_m: float = 0.0           # δ_emb
     ref_weight: float = 1.0               # w_ref
@@ -168,7 +169,7 @@ class FormationFeasibility:
         δ = self.config.embed_margin_m
 
         # 1 ── quick check:  c(τ) = γ_ref(τ) ────────────────────────
-        ok, worst = self._eval_slots(band, ref_curve, formation, δ)
+        ok, worst = self._eval_slots(band, ref_curve, formation, δ - self.config.feasibility_tol_m)
         if ok:
             return self._build_swept_result(
                 map_data, formation.name, band, ref_curve, formation,
@@ -177,31 +178,138 @@ class FormationFeasibility:
                 metadata={"check": "quick_pass", "worst_margin": worst},
             )
 
-        # 2 ── min‑violation:  inf_Q  V_k[Q] ─────────────────────────
+        # 2 ── quick-reject: centreline can shift ≤ ~0.5 m in a
+        # 1.6‑m corridor.  If the worst slot is further out than
+        # that, no optimisation can save it.
+        if worst < -0.50:
+            return self._build_swept_result(
+                map_data, formation.name, band, ref_curve, formation,
+                robot_radius, safety_margin,
+                current_formation, current_states,
+                metadata={"check": "quick_reject", "worst_margin": worst},
+            )
+
+        # 3 ── min‑violation SLSQP: determine feasibility ──────────
         bezier = _CenterlineBezier.from_reference(
             ref_curve,
             control_count=self.config.bspline_control_count,
             bezier_tension=0.35,
         )
-        Q_feas, z_star = self._min_violation(band, bezier, formation, δ)
-        # z_star is the residual violation from SLSQP (0 = feasible)
-        if z_star <= 1e-6:
-            curve_feas = bezier.evaluate(Q_feas, self.config.collocation_points)
+        Q_feas, _ = self._min_violation(band, bezier, formation, δ)
+        curve_feas = bezier.evaluate(Q_feas, self.config.collocation_points)
+        ok_feas, worst_feas = self._eval_slots(band, curve_feas, formation, δ - self.config.feasibility_tol_m)
+        if ok_feas:
             return self._build_swept_result(
                 map_data, formation.name, band, curve_feas, formation,
                 robot_radius, safety_margin,
                 current_formation, current_states,
-                metadata={"check": "min_violation_pass", "z_star": z_star},
+                metadata={"check": "min_violation_pass", "worst_margin": worst_feas},
             )
 
-        # 3 ── infeasible: return best effort ──────────────────────
-        curve_best = bezier.evaluate(Q_feas, self.config.collocation_points)
+        # 3 ── infeasible ──────────────────────────────────────────
         return self._build_swept_result(
-            map_data, formation.name, band, curve_best, formation,
+            map_data, formation.name, band, curve_feas, formation,
             robot_radius, safety_margin,
             current_formation, current_states,
-            metadata={"check": "min_violation_fail", "z_star": z_star},
+            metadata={"check": "infeasible", "worst_margin": worst_feas},
         )
+
+    def optimize_centerline(
+        self, map_data: MapData, preview_path: LocalPreviewPath,
+        formation: FormationSpec, robot_radius: float, safety_margin: float,
+    ) -> FormationFeasibilityResult:
+        """Hard-constrained SLSQP centreline opt for the SELECTED formation.
+
+        Objective:  J_end + J_sm + J_feas   (endpoint pull, jerk, feasibility)
+        Constraint: all formation slots must stay inside the swept band.
+        """
+        clearance_threshold = robot_radius + safety_margin
+        band = self._swept_builder.build(map_data, preview_path, clearance_threshold)
+        ref_curve = np.asarray(preview_path.points_xy, dtype=float)
+        bezier = _CenterlineBezier.from_reference(
+            ref_curve, control_count=self.config.bspline_control_count, bezier_tension=0.35,
+        )
+        Q_opt, feasible = self._optimal_centerline_hard(
+            band, bezier, formation, self.config.embed_margin_m,
+            subgoal_xy=tuple(bezier._ref[-1]),
+        )
+        curve_opt = bezier.evaluate(Q_opt, self.config.collocation_points)
+        return self._build_swept_result(
+            map_data, formation.name, band, curve_opt, formation,
+            robot_radius, safety_margin, None, None,
+            metadata={"check": "optimal_centerline" if feasible else "optimal_centerline_infeasible"},
+        )
+
+    def _optimal_centerline_hard(
+        self,
+        band: SweptBand,
+        bezier: "_CenterlineBezier",
+        formation: FormationSpec,
+        margin_req: float,
+        subgoal_xy: tuple[float, float],
+    ) -> tuple[np.ndarray, bool]:
+        r"""Solve min_Q J_end+J_sm+J_feas s.t. all slots embeddable in band.
+
+        J_end = |c(1)-subgoal|^2
+        J_sm  = sum |q_k-3q_{k+1}+3q_{k+2}-q_{k+3}|^2   (jerk smoothness)
+        J_feas= spacing(>0.3m) + turning(>0.5rad) hinge penalties
+        """
+        try:
+            from scipy.optimize import minimize
+        except ImportError:
+            return bezier.initial_controls().copy(), False
+
+        Q0 = bezier.initial_controls().copy()
+        K = self.config.collocation_points
+        bbox = bezier.bounding_box()
+        sg = np.asarray(subgoal_xy, dtype=float)
+
+        def objective(x):
+            Q = Q0.copy()
+            Q[bezier.free_indices] = x.reshape(-1, 2)
+            curve = bezier.evaluate(Q, K)
+            J_end = 5.0 * float(np.sum((curve[-1] - sg) ** 2))
+            J_sm = 0.0
+            for ci in range(bezier.control_count - 3):
+                j = Q[ci] - 3*Q[ci+1] + 3*Q[ci+2] - Q[ci+3]
+                J_sm += float(np.sum(j**2))
+            J_feas = 0.0
+            for ci in range(bezier.control_count - 1):
+                d = float(np.linalg.norm(Q[ci+1] - Q[ci]))
+                if d > 0.3: J_feas += (d - 0.3)**2
+            for ci in range(1, bezier.control_count - 1):
+                v0 = Q[ci] - Q[ci-1]; v1 = Q[ci+1] - Q[ci]
+                d0=float(np.linalg.norm(v0)); d1=float(np.linalg.norm(v1))
+                if d0<1e-6 or d1<1e-6: continue
+                cos_th = float(np.dot(v0,v1))/(d0*d1)
+                cos_th = max(-1.0, min(1.0, cos_th))
+                th = math.acos(cos_th)
+                if th > 0.5: J_feas += (th - 0.5)**2
+            # Arc‑length penalty — prefer direct paths over detours
+            J_len = float(sum(
+                np.linalg.norm(Q[ci+1] - Q[ci]) for ci in range(bezier.control_count - 1)
+            ))
+            return float(J_end + 0.05*J_len + 2.0*J_sm + 0.5*J_feas)
+
+        def constraint(x):
+            Q = Q0.copy()
+            Q[bezier.free_indices] = x.reshape(-1, 2)
+            curve = bezier.evaluate(Q, K)
+            _, worst = self._eval_slots(band, curve, formation, margin_req)
+            return float(worst)  # must be >= margin_req
+
+        x0 = Q0[bezier.free_indices].ravel()
+        bounds = [(bbox[0], bbox[1]), (bbox[2], bbox[3])] * len(bezier.free_indices)
+
+        res = minimize(
+            objective, x0, method="SLSQP", bounds=bounds,
+            constraints={"type": "ineq", "fun": lambda x: constraint(x) - margin_req},
+            options={"maxiter": 50, "ftol": 1e-6},
+        )
+        Q_opt = Q0.copy()
+        Q_opt[bezier.free_indices] = res.x.reshape(-1, 2)
+        feasible = constraint(res.x) >= margin_req - 1e-4
+        return Q_opt, feasible
 
     # ── violation functional ──────────────────────────────────────
 
@@ -212,23 +320,21 @@ class FormationFeasibility:
         formation: FormationSpec,
         margin_req: float,
     ) -> tuple[bool, float]:
-        """Evaluate max_i [δ − m_B(q_i)]_+ along the centreline.
+        r"""Check whether all formation slots stay inside the band.
 
-        Only checks slots whose effective curve parameter τ' = τ + px/L
-        falls within [0, 1].  Slots that extend beyond the curve domain
-        longitudinally are not penalised.
+        Each slot is evaluated at its true longitudinal position
+        τ_eff = τ + px/L, using the curve tangent at τ_eff (not at τ).
         """
-        worst = float("inf")
         n = len(centre_curve)
-        # Approximate total curve length
+        if n < 2:
+            return False, float("-inf")
         total_len = float(sum(
             np.linalg.norm(centre_curve[i+1] - centre_curve[i])
             for i in range(n - 1)
-        ))
-        if total_len < 1e-6:
-            total_len = 1.0
+        )) or 1.0
+        # Pre‑compute tangents (unit) at each curve point
+        tangents = np.zeros((n, 2), dtype=float)
         for j in range(n):
-            c = centre_curve[j]
             if j == 0:
                 d = centre_curve[1] - centre_curve[0]
             elif j == n - 1:
@@ -236,22 +342,30 @@ class FormationFeasibility:
             else:
                 d = centre_curve[j + 1] - centre_curve[j - 1]
             dn = float(np.linalg.norm(d))
-            if dn < 1e-9:
-                continue
-            t = d / dn
-            theta = math.atan2(t[1], t[0])
-            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+
+        positions: list[np.ndarray] = []
+        for j in range(n):
             tau = j / max(n - 1, 1)
             for slot in formation.slots:
-                # Effective parameter: τ' = τ + px / total_len
                 tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
-                    continue  # slot has not entered / has left the band
-                sx = c[0] + cos_t * slot[0] - sin_t * slot[1]
-                sy = c[1] + sin_t * slot[0] + cos_t * slot[1]
-                m = band.margin((sx, sy))
-                if m < worst:
-                    worst = m
+                    continue
+                # Interpolate curve pos & tangent at τ_eff
+                j_float = tau_eff * (n - 1)
+                j0 = max(0, min(int(j_float), n - 2))
+                j1 = j0 + 1
+                frac = j_float - j0
+                c_eff = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
+                t_eff = tangents[j0] + frac * (tangents[j1] - tangents[j0])
+                tn = float(np.linalg.norm(t_eff))
+                if tn < 1e-9:
+                    continue
+                t_eff /= tn
+                n_eff = np.array([-t_eff[1], t_eff[0]])
+                slot_xy = c_eff + slot[1] * n_eff
+                positions.append(slot_xy)
+        worst = float(np.min(band.margin_batch(np.asarray(positions, dtype=float)))) if positions else float("inf")
         return worst >= margin_req, float(worst)
 
     @staticmethod
@@ -261,18 +375,18 @@ class FormationFeasibility:
         formation: FormationSpec,
         margin_req: float,
     ) -> float:
-        """Sum of squared hinge violations.
-
-        Only evaluates slots whose τ' = τ + px/L ∈ [0, 1].
-        """
+        """Sum of squared hinge violations, with tangent at τ_eff interpolation."""
         total = 0.0
         n = len(centre_curve)
+        if n < 2:
+            return 0.0
         total_len = float(sum(
             np.linalg.norm(centre_curve[i+1] - centre_curve[i])
             for i in range(n - 1)
-        )) if n > 1 else 1.0
+        )) or 1.0
+        # Pre‑compute tangents
+        tangents = np.zeros((n, 2), dtype=float)
         for j in range(n):
-            c = centre_curve[j]
             if j == 0:
                 d = centre_curve[1] - centre_curve[0]
             elif j == n - 1:
@@ -280,20 +394,31 @@ class FormationFeasibility:
             else:
                 d = centre_curve[j + 1] - centre_curve[j - 1]
             dn = float(np.linalg.norm(d))
-            if dn < 1e-9:
-                continue
-            t = d / dn
-            theta = math.atan2(t[1], t[0])
-            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+
+        positions = []
+        for j in range(n):
             tau = j / max(n - 1, 1)
             for slot in formation.slots:
-                tau_eff = tau + slot[0] / max(total_len, 1e-6)
+                tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
                     continue
-                sx = c[0] + cos_t * slot[0] - sin_t * slot[1]
-                sy = c[1] + sin_t * slot[0] + cos_t * slot[1]
-                m = band.margin((sx, sy))
-                deficit = margin_req - m
+                j_float = tau_eff * (n - 1)
+                j0 = max(0, min(int(j_float), n - 2))
+                j1 = j0 + 1
+                frac = j_float - j0
+                c_eff = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
+                t_eff = tangents[j0] + frac * (tangents[j1] - tangents[j0])
+                tn = float(np.linalg.norm(t_eff))
+                if tn < 1e-9:
+                    continue
+                t_eff /= tn
+                n_eff = np.array([-t_eff[1], t_eff[0]])
+                positions.append(c_eff + slot[1] * n_eff)
+        if positions:
+            margins = band.margin_batch(np.asarray(positions, dtype=float))
+            for m in margins:
+                deficit = margin_req - float(m)
                 if deficit > 0:
                     total += deficit * deficit
         return total
@@ -323,20 +448,39 @@ class FormationFeasibility:
         free_flat = Q0[bezier.free_indices].ravel()
         bbox = bezier.bounding_box()
 
+        ref_curve = bezier.evaluate(Q0, K)
+        sg = bezier._ref[-1]  # subgoal = last reference point
+
         def objective(x: np.ndarray) -> float:
             Q = Q0.copy()
             Q[bezier.free_indices] = x.reshape(-1, 2)
             curve = bezier.evaluate(Q, K)
-            # Use worst margin directly (not sum of squares) so SLSQP
-            # minimises what the feasibility check actually tests.
-            _, worst = FormationFeasibility._eval_slots(band, curve, formation, margin_req)
-            # SLSQP minimises — return negative margin (lower = worse)
-            return float(-worst) if worst < margin_req else 0.0
+            viol = FormationFeasibility._violation(band, curve, formation, margin_req)
+            end_err = float(np.sum((curve[-1] - sg) ** 2))
+            # Jerk smoothness (same as preview planner)
+            J_sm = 0.0
+            for ci in range(bezier.control_count - 3):
+                j = Q[ci] - 3*Q[ci+1] + 3*Q[ci+2] - Q[ci+3]
+                J_sm += float(np.sum(j**2))
+            # Feasibility: spacing + turning
+            J_feas = 0.0
+            for ci in range(bezier.control_count - 1):
+                d = float(np.linalg.norm(Q[ci+1] - Q[ci]))
+                if d > 0.3: J_feas += (d - 0.3)**2
+            for ci in range(1, bezier.control_count - 1):
+                v0 = Q[ci] - Q[ci-1]; v1 = Q[ci+1] - Q[ci]
+                d0=float(np.linalg.norm(v0)); d1=float(np.linalg.norm(v1))
+                if d0<1e-6 or d1<1e-6: continue
+                cos_th = float(np.dot(v0,v1))/(d0*d1)
+                cos_th = max(-1.0, min(1.0, cos_th))
+                th = math.acos(cos_th)
+                if th > 0.5: J_feas += (th - 0.5)**2
+            return 10.0 * viol + 0.5*end_err + 0.5*J_sm + 0.3*J_feas
 
         res = minimize(
             objective, free_flat, method="SLSQP",
             bounds=[(bbox[0], bbox[1]), (bbox[2], bbox[3])] * len(bezier.free_indices),
-            options={"maxiter": 30, "ftol": 1e-6},
+            options={"maxiter": 80, "ftol": 1e-6},
         )
         Q_opt = Q0.copy()
         Q_opt[bezier.free_indices] = res.x.reshape(-1, 2)
@@ -429,7 +573,7 @@ class FormationFeasibility:
         required = robot_radius + safety_margin
         headings, slot_pts_by_step = self._compute_slots(centre_curve, formation)
         # Use the same longitudinal check for feasibility
-        ok_swept, worst_m = self._eval_slots(band, centre_curve, formation, 0.0)
+        ok_swept, worst_m = self._eval_slots(band, centre_curve, formation, -self.config.feasibility_tol_m)
         min_margin = worst_m
         # Fallback mean margin from all sampled slots (for metadata)
         margin_samples = [
@@ -654,7 +798,7 @@ class _CenterlineBezier:
         self.end = end_xy.copy()
         self._ref = ref_curve
         self.tension = bezier_tension
-        self.free_indices = list(range(0, self.control_count))
+        self.free_indices = list(range(1, self.control_count))
 
     @classmethod
     def from_reference(
@@ -734,7 +878,7 @@ class _CenterlineBezier:
 
     def bounding_box(self) -> tuple[float, float, float, float]:
         """Return (x_min, x_max, y_min, y_max) for control clamping."""
-        margin = 3.0
+        margin = 0.50
         return (
             float(min(self.start[0], self.end[0]) - margin),
             float(max(self.start[0], self.end[0]) + margin),

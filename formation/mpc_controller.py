@@ -35,6 +35,7 @@ class _RobotSolveInput:
     state: RobotState
     own_reference: RobotReferenceTrajectory
     neighbor_predictions: list[RobotPrediction]
+    neighbor_reference_positions: np.ndarray
     neighbor_indices: list[int]
     map_data: MapData
 
@@ -63,17 +64,29 @@ class DistributedFormationMPC:
         robot_count = len(states)
         solve_inputs = []
         for robot_index, state in enumerate(states):
-            neighbor_predictions = [
-                self._reference_to_prediction(controller_reference.robot_trajectories[j].window(0, horizon))
-                for j in range(robot_count) if j != robot_index
-            ]
             neighbor_indices = [j for j in range(robot_count) if j != robot_index]
+            neighbor_ref_predictions = [
+                self._reference_to_prediction(controller_reference.robot_trajectories[j].window(0, horizon))
+                for j in neighbor_indices
+            ]
+            use_previous = (
+                previous_predictions is not None
+                and len(previous_predictions) == robot_count
+                and self.config.neighbor_prediction_mode == "previous_prediction"
+            )
+            neighbor_predictions = (
+                [previous_predictions[j] for j in neighbor_indices]
+                if use_previous
+                else neighbor_ref_predictions
+            )
+            neighbor_reference_positions = self._build_neighbor_position_matrix(neighbor_ref_predictions)
             solve_inputs.append(_RobotSolveInput(
                 robot_index=robot_index,
                 solver_slot=robot_index,
                 state=state,
                 own_reference=controller_reference.robot_trajectories[robot_index].window(0, horizon),
                 neighbor_predictions=neighbor_predictions,
+                neighbor_reference_positions=neighbor_reference_positions,
                 neighbor_indices=neighbor_indices,
                 map_data=map_data,
             ))
@@ -100,6 +113,7 @@ class DistributedFormationMPC:
             solve_input.map_data,
             solver_slot=solve_input.solver_slot,
             neighbor_indices=solve_input.neighbor_indices,
+            neighbor_reference_positions=solve_input.neighbor_reference_positions,
         )
 
     def solve_robot(
@@ -111,6 +125,7 @@ class DistributedFormationMPC:
         *,
         solver_slot: int = 0,
         neighbor_indices: list[int] | None = None,
+        neighbor_reference_positions: np.ndarray | None = None,
     ) -> tuple[ControlCommand, RobotPrediction]:
         if own_reference.sample_count <= 0:
             raise ValueError("Robot reference trajectory is empty.")
@@ -119,6 +134,8 @@ class DistributedFormationMPC:
         padded_ref = own_reference.window(0, self.config.horizon_steps)
         reference_matrix = self._build_reference_matrix(state, padded_ref)
         neighbor_positions = self._build_neighbor_position_matrix(neighbor_predictions)
+        if neighbor_reference_positions is None:
+            neighbor_reference_positions = neighbor_positions
 
         H = self.config.horizon_steps
         safe_dist = 2.0 * self.config.robot_radius + self.config.inter_robot_margin
@@ -138,7 +155,15 @@ class DistributedFormationMPC:
                 spd = self._prediction_speed(pred, k)
                 n_vx[n, k] = spd * math.cos(yaw)
                 n_vy[n, k] = spd * math.sin(yaw)
-        self._set_parameter_values(solver, state, reference_matrix, neighbor_positions, n_vx, n_vy)
+        self._set_parameter_values(
+            solver,
+            state,
+            reference_matrix,
+            neighbor_positions,
+            neighbor_reference_positions,
+            n_vx,
+            n_vy,
+        )
         self._set_initial_guess(solver, state, reference_matrix)
         with DistributedFormationMPC._stdout_lock:
             old_fd = os.dup(1)
@@ -300,6 +325,7 @@ class DistributedFormationMPC:
         dx0 = opti.parameter(3)
         reference = opti.parameter(5, H + 1)
         neighbor_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
+        neighbor_reference_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
 
         objective = 0
         opti.subject_to(dx[0, 0] == dx0[0])
@@ -328,6 +354,22 @@ class DistributedFormationMPC:
             )
             if k > 0:
                 objective += w.input_smooth * ca.sumsqr(du[:, k] - du[:, k - 1])
+            if (
+                neighbor_positions is not None
+                and neighbor_reference_positions is not None
+                and neighbor_count > 0
+                and w.relative_position > 0.0
+            ):
+                sx = reference[0, k] + dx[0, k]
+                sy = reference[1, k] + dx[1, k]
+                for n in range(neighbor_count):
+                    nx = neighbor_positions[2 * n, k]
+                    ny = neighbor_positions[2 * n + 1, k]
+                    ref_dx = reference[0, k] - neighbor_reference_positions[2 * n, k]
+                    ref_dy = reference[1, k] - neighbor_reference_positions[2 * n + 1, k]
+                    err_x = (sx - nx) - ref_dx
+                    err_y = (sy - ny) - ref_dy
+                    objective += w.relative_position * (err_x**2 + err_y**2)
 
         objective += w.terminal_position * (dx[0, H]**2 + dx[1, H]**2)
 
@@ -337,29 +379,60 @@ class DistributedFormationMPC:
         cbf_n_vy = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
         R_sq = safe_dist ** 2
 
+        # Replace VO sqrt-based CBF with discrete linearized disk-center CBF per-step.
+        # Linearize at reference point (dx=0, du=0) so constraints are affine in dx,du.
         if neighbor_positions is not None and neighbor_count > 0 and cbf_n_vx is not None:
             eps_cbf = opti.variable(neighbor_count, H)
+            # hyperparameters: gamma for class-K term, eps_max upper bound for slack
+            gamma = 1.0
+            eps_max = 0.5
             for k in range(H):
                 for n in range(neighbor_count):
                     opti.subject_to(eps_cbf[n, k] >= 0.0)
-                    sx = reference[0, k] + dx[0, k]
-                    sy = reference[1, k] + dx[1, k]
-                    sth = reference[2, k] + dx[2, k]
-                    sv = reference[3, k] + du[0, k]
-                    svx = sv * ca.cos(sth)
-                    svy = sv * ca.sin(sth)
-                    nx = neighbor_positions[2*n, k]
-                    ny = neighbor_positions[2*n+1, k]
+                    opti.subject_to(eps_cbf[n, k] <= eps_max)
+                    # parameters at linearization point (reference)
+                    nx = neighbor_positions[2 * n, k]
+                    ny = neighbor_positions[2 * n + 1, k]
                     nvx = cbf_n_vx[n, k]
                     nvy = cbf_n_vy[n, k]
-                    rx = nx - sx; ry = ny - sy
-                    rvx = nvx - svx; rvy = nvy - svy
-                    d_sq = rx*rx + ry*ry + 1e-9
-                    vr_sq = rvx*rvx + rvy*rvy + 1e-9
-                    margin_sq = ca.fmax(0.0, d_sq - R_sq)
-                    h = rx*rvx + ry*rvy + ca.sqrt(vr_sq * margin_sq + 1e-9)
-                    opti.subject_to(h + eps_cbf[n, k] >= 0.0)
-                    objective += 0.2 * eps_cbf[n, k]**2
+                    ref_x = reference[0, k]
+                    ref_y = reference[1, k]
+                    ref_th = reference[2, k]
+                    ref_v = reference[3, k]
+
+                    # r = self - neighbor (use consistent sign)
+                    r0x = ref_x - nx
+                    r0y = ref_y - ny
+
+                    # self velocity at linearization point and its partials
+                    vix0 = ref_v * ca.cos(ref_th)
+                    viy0 = ref_v * ca.sin(ref_th)
+                    a_vx_du = ca.cos(ref_th)
+                    a_vx_th = -ref_v * ca.sin(ref_th)
+                    a_vy_du = ca.sin(ref_th)
+                    a_vy_th = ref_v * ca.cos(ref_th)
+
+                    # base scalar value f0 (CBF evaluated at reference)
+                    f0 = 2 * (r0x * (vix0 - nvx) + r0y * (viy0 - nvy)) + gamma * (r0x**2 + r0y**2 - R_sq)
+
+                    # linear coefficients for decision variables
+                    A_dx0 = 2 * (vix0 - nvx) + 2 * gamma * r0x
+                    A_dx1 = 2 * (viy0 - nvy) + 2 * gamma * r0y
+                    A_dx2 = 2 * r0x * a_vx_th + 2 * r0y * a_vy_th
+                    A_du0 = 2 * r0x * a_vx_du + 2 * r0y * a_vy_du
+
+                    # affine (linearized) CBF constraint: f0 + grad^T * delta + eps >= 0
+                    opti.subject_to(
+                        f0
+                        + A_dx0 * dx[0, k]
+                        + A_dx1 * dx[1, k]
+                        + A_dx2 * dx[2, k]
+                        + A_du0 * du[0, k]
+                        + eps_cbf[n, k]
+                        >= 0
+                    )
+            # penalize slack with configured neighbor_slack weight (squared)
+            objective += w.neighbor_slack * ca.sumsqr(eps_cbf)
         eps_n = None
         eps_cbf_out = eps_cbf if (neighbor_count > 0 and cbf_n_vx is not None) else None
 
@@ -382,6 +455,7 @@ class DistributedFormationMPC:
                 "dx0": dx0,
                 "reference": reference,
                 "neighbor_positions": neighbor_positions,
+                "neighbor_reference_positions": neighbor_reference_positions,
                 "cbf_n_vx": cbf_n_vx, "cbf_n_vy": cbf_n_vy,
             },
         )
@@ -389,6 +463,7 @@ class DistributedFormationMPC:
     def _set_parameter_values(
         self, solver: _SolverCacheEntry, state: RobotState,
         reference_matrix: np.ndarray, neighbor_positions: np.ndarray,
+        neighbor_reference_positions: np.ndarray,
         n_vx: np.ndarray | None = None, n_vy: np.ndarray | None = None,
     ) -> None:
         dx0 = np.array([
@@ -399,6 +474,8 @@ class DistributedFormationMPC:
         solver.opti.set_value(solver.parameters["reference"], reference_matrix)
         if solver.parameters.get("neighbor_positions") is not None:
             solver.opti.set_value(solver.parameters["neighbor_positions"], neighbor_positions)
+        if solver.parameters.get("neighbor_reference_positions") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_reference_positions"], neighbor_reference_positions)
         if n_vx is not None and solver.parameters.get("cbf_n_vx") is not None:
             solver.opti.set_value(solver.parameters["cbf_n_vx"], n_vx)
             solver.opti.set_value(solver.parameters["cbf_n_vy"], n_vy)

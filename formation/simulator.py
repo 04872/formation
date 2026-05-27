@@ -113,6 +113,7 @@ class MultiRobotSimulator:
         per_cycle_strip_cells: list[list[tuple]] = []
         per_cycle_chord_centers: list[list[tuple[float, float]]] = []
         per_cycle_chord_endpoints: list[list[tuple[tuple[float, float], tuple[float, float]]]] = []
+        per_cycle_centerline: list[list[tuple[float, float]]] = []
         total_polyline_length = self._polyline_length(global_path.waypoints_xy)
         total_steps_needed = int(math.ceil(total_polyline_length / (self.controller.config.v_max * self.controller.config.dt * 0.6)))
         default_replans = max(1, int(math.ceil(total_steps_needed / max(replan_interval, 1))))
@@ -139,16 +140,66 @@ class MultiRobotSimulator:
             if not preview.points_xy:
                 stop_reason = "empty_preview"
                 break
-            selection = selector.select_target_formation(
-                map_data,
-                preview,
-                formations,
-                robot_radius,
-                safety_margin,
-                current_formation=current_formation,
-                current_states=current_states,
-                current_assignment=current_assignment,
-            )
+            # Use swept‑band feasibility when a feasibility module is injected
+            feasibility = getattr(self, "_feasibility", None)
+            if feasibility is not None:
+                from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
+                from formation.types import FormationCandidateEvaluation, FormationScoreBreakdown
+                # Build swept band + check formations
+                cb = selector.build_curve_band(map_data, preview, robot_radius, safety_margin)
+                feas_results = feasibility.check_multi(
+                    map_data, preview, cb, formations, robot_radius, safety_margin,
+                    current_formation=current_formation, current_states=current_states,
+                )
+                # Pick best (first feasible, width‑descending)
+                feasible = [r for r in feas_results if r.is_feasible]
+                if feasible:
+                    best_feas = feasible[0]
+                    sel_fm = next(f for f in formations if f.name == best_feas.formation_name)
+                    # Run full SLSQP centreline optimisation for the selected formation
+                    best = feasibility.optimize_centerline(
+                        map_data, preview, sel_fm, robot_radius, safety_margin)
+                else:
+                    # All infeasible — fall back to column (narrowest, safest)
+                    col_result = next((r for r in feas_results if r.formation_name == "column"), feas_results[-1])
+                    best = col_result
+                    sel_fm = next(f for f in formations if f.name == best.formation_name)
+                # Build a FormationCandidateEvaluation bridge
+                eval_ev = FormationCandidateEvaluation(
+                    formation_name=best.formation_name,
+                    band_feasible=best.is_feasible, is_safe=best.is_feasible,
+                    score_breakdown=FormationScoreBreakdown(
+                        min_corridor_margin_m=best.min_corridor_margin_m,
+                        embedding_cost=0, corridor_violation_cost=0,
+                        switch_cost=0, task_utility=sel_fm.task_utility,
+                        total_score=0, offset_cost=0, heading_cost=0, metadata={},
+                    ),
+                    center_points_xy=best.center_points_xy,
+                    heading_rads=best.heading_rads,
+                    slot_points_by_step_xy=best.slot_points_by_step_xy,
+                    assignment=best.assignment,
+                    embedding_qp_result=best.embedding_qp_result,
+                    lateral_offset_m=0, heading_offset_rad=0,
+                    min_slot_clearance_m=best.min_slot_clearance_m,
+                    failure_reason=best.failure_reason, metadata=best.metadata,
+                )
+                guide = selector.guide_generator.build(eval_ev, sel_fm,
+                    current_formation=current_formation, current_assignment=current_assignment)
+                selection = type('obj', (object,), {
+                    'curve_band': cb, 'evaluations': [],
+                    'selected_evaluation': eval_ev,
+                    'selected_formation': sel_fm, 'guide': guide,
+                })()
+                # Store centerline for visualization
+                per_cycle_centerline.append(list(best.center_points_xy) if best.center_points_xy else [])
+            else:
+                selection = selector.select_target_formation(
+                    map_data, preview, formations, robot_radius, safety_margin,
+                    current_formation=current_formation,
+                    current_states=current_states,
+                    current_assignment=current_assignment,
+                )
+                per_cycle_centerline.append([])
             per_cycle_preview_points.append(list(preview.points_xy))
             cb = selection.curve_band
             per_cycle_strip_cells.append([cell.vertices_xy for cell in cb.strip_cells])
@@ -158,8 +209,8 @@ class MultiRobotSimulator:
             plan_wall_time_s += time.perf_counter() - plan_start
             ev_lines = ", ".join(
                 f"{ev.formation_name[:6]}={'S' if ev.is_safe else 'I'}:m={ev.score_breakdown.min_corridor_margin_m:+.3f}"
-                for ev in selection.evaluations
-            )
+                for ev in (selection.evaluations or [])
+            ) if hasattr(selection, 'evaluations') and selection.evaluations else "swept_band"
             print(f"  [{cycle_idx+1}/{max_replans}] plan {plan_wall_time_s:.1f}s | "
                   f"selected {selection.selected_formation.name} "
                   f"({'SAFE' if selection.selected_evaluation.is_safe else 'INFEA'}) | "
@@ -248,6 +299,7 @@ class MultiRobotSimulator:
                 "per_cycle_strip_cells": per_cycle_strip_cells,
                 "per_cycle_chord_centers": per_cycle_chord_centers,
                 "per_cycle_chord_endpoints": per_cycle_chord_endpoints,
+                "per_cycle_centerline": per_cycle_centerline,
             },
         )
 

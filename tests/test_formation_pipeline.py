@@ -26,7 +26,7 @@ class FormationPipelineSmokeTest(unittest.TestCase):
         self.global_planner = GlobalPlanner()
         self.preview_planner = PreviewCurvePlanner()
         self.selector = FormationSelector()
-        self.robot_radius = 0.18
+        self.robot_radius = 0.09
         self.safety_margin = 0.06
         self.inter_robot_margin = 0.10
         self.library = FormationLibrary.build_default(

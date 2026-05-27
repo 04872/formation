@@ -24,13 +24,13 @@ from formation import (
 
 class MultiRobotSimulatorTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.map_data = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.18))
+        self.map_data = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=0.09))
         self.config = MPCConfig(
             dt=0.2,
             horizon_steps=10,
             v_max=0.6,
             omega_max=1.0,
-            robot_radius=0.18,
+            robot_radius=0.09,
             safety_margin=0.06,
             inter_robot_margin=0.10,
         )
@@ -111,7 +111,7 @@ class MultiRobotSimulatorTest(unittest.TestCase):
         self.assertIn("solver_status", first_predictions[1].metadata)
 
     def test_simulate_full_path_tracks_to_goal(self) -> None:
-        robot_radius = 0.18
+        robot_radius = 0.09
         safety_margin = 0.06
         inter_robot_margin = 0.10
         map_data = MapBuilder().build("right_angle_corridor", RightAngleCorridorConfig(robot_radius=robot_radius))

@@ -93,7 +93,7 @@ def build_pipeline(
     map_type: str, preview_distance: float, *,
     goal_tolerance: float | None, max_replans: int | None, replan_interval: int,
 ):
-    robot_radius = 0.18
+    robot_radius = 0.09
     safety_margin = 0.06
     inter_robot_margin = 0.10
     config = build_map_config(map_type, robot_radius)
@@ -140,6 +140,9 @@ def build_pipeline(
     selection.selected_evaluation = square_eval
     selection.guide = square_guide
 
+    # Inject swept‑band feasibility
+    from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
+    simulator._feasibility = FormationFeasibility(FeasibilityConfig(mode="swept_band"))
     trace = simulator.simulate_full_path(
         initial_states, map_data, global_path, formations,
         preview_planner, selector, reference_builder,
@@ -215,7 +218,21 @@ def draw_preview(context: dict, output: Path):
         ax.plot([p[0] for p in pts], [p[1] for p in pts], color=colors[i], linewidth=2.0,
                 label=f"cycle {i+1} [{sel}]")
         ax.scatter(*ref, color=colors[i], s=40, marker="s", zorder=4)
-    ax.set_title(f"Preview Curves ({len(pts_list)} cycles) — {map_data.name}")
+    # Draw centreline (swept‑band optimised or controller reference)
+    cl_list = trace.metadata.get("per_cycle_centerline", [])
+    if cl_list and any(cl_list):
+        for i, ct_pts in enumerate(cl_list):
+            if ct_pts:
+                ax.plot([p[0] for p in ct_pts], [p[1] for p in ct_pts],
+                        linestyle="--", color=colors[i], linewidth=1.5, alpha=0.8)
+    else:
+        refs_list = [ref.center_points_xy for ref in trace.reference_history]
+        for i, ct_pts in enumerate(refs_list):
+            if ct_pts:
+                ax.plot([p[0] for p in ct_pts], [p[1] for p in ct_pts],
+                        linestyle=":", color=colors[i], linewidth=1.0, alpha=0.7)
+
+    ax.set_title(f"Preview Curves + Centreline ({len(pts_list)} cycles) — {map_data.name}")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -279,19 +296,20 @@ def draw_swept_band(context: dict, output: Path):
     for i, (pts, sel) in enumerate(zip(pts_list, sels)):
         color = colors[i]
         tmp = _make_temp_preview_path(pts, map_data)
-        band = band_builder.build(map_data, tmp, clearance)
-        # Overlay positive-margin cells as semi-transparent blue
-        mask = (band._grid > 0).astype(float)
-        mask[mask == 0] = np.nan
-        ax.imshow(mask, origin="lower",
-                  extent=[ox, ox + band._w * res, oy, oy + band._h * res],
-                  cmap=plt.cm.Blues, alpha=0.12 + 0.05 * i, vmin=0, vmax=1)
+        # Only draw band for cycle 3
+        if i == 2:
+            band = band_builder.build(map_data, tmp, clearance)
+            mask = (band._grid > 0).astype(float)
+            mask[mask == 0] = np.nan
+            ax.imshow(mask, origin="lower",
+                      extent=[ox, ox + band._w * res, oy, oy + band._h * res],
+                      cmap=plt.cm.Blues, alpha=0.30, vmin=0, vmax=1)
         # Centreline
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
                 color=color, linewidth=2.0, alpha=0.85,
                 label=f"cycle {i+1} [{sel}]")
 
-    ax.set_title(f"Swept Band ({len(pts_list)} cycles) — {map_data.name}")
+    ax.set_title(f"Swept Band — cycle 3 only — {map_data.name}")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)

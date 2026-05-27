@@ -86,7 +86,7 @@ def build_pipeline(
     max_replans: int | None,
     replan_interval: int,
 ):
-    robot_radius = 0.18
+    robot_radius = 0.09
     safety_margin = 0.06
     inter_robot_margin = 0.10
     config = build_map_config(map_type, robot_radius)

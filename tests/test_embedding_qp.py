@@ -22,9 +22,9 @@ class EmbeddingQPSolverTest(unittest.TestCase):
         self.global_planner = GlobalPlanner()
         self.preview_planner = PreviewCurvePlanner()
         self.band_builder = CurveBandBuilder()
-        self.library = FormationLibrary.build_default(robot_radius=0.18, inter_robot_margin=0.10)
+        self.library = FormationLibrary.build_default(robot_radius=0.09, inter_robot_margin=0.10)
         self.solver = EmbeddingQPSolver()
-        self.robot_radius = 0.18
+        self.robot_radius = 0.09
         self.safety_margin = 0.06
 
     def _build_right_angle_inputs(self):

@@ -12,7 +12,7 @@ class CurveBandTest(unittest.TestCase):
         self.global_planner = GlobalPlanner()
         self.preview_planner = PreviewCurvePlanner()
         self.band_builder = CurveBandBuilder()
-        self.robot_radius = 0.18
+        self.robot_radius = 0.09
         self.safety_margin = 0.06
 
     def _build_preview(self, map_name: str, config, preview_distance_m: float):

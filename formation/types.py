@@ -250,7 +250,8 @@ class MPCWeights:
     input: float = 2.0
     input_smooth: float = 1.0
     obstacle_slack: float = 800.0
-    neighbor_slack: float = 2000.0
+    neighbor_slack: float = 50.0
+    relative_position: float = 10.0
     terminal_position: float = 80.0
 
 
@@ -260,7 +261,7 @@ class MPCConfig:
     horizon_steps: int = 10
     v_max: float = 0.80
     omega_max: float = 1.20
-    robot_radius: float = 0.18
+    robot_radius: float = 0.09
     safety_margin: float = 0.06
     inter_robot_margin: float = 0.10
     neighbor_prediction_mode: str = "previous_prediction"

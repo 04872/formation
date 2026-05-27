@@ -11,7 +11,7 @@ from formation.types import AssignmentResult, FormationCandidateEvaluation, Form
 
 class GuideGeneratorTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.library = FormationLibrary.build_default(robot_radius=0.18, inter_robot_margin=0.10)
+        self.library = FormationLibrary.build_default(robot_radius=0.09, inter_robot_margin=0.10)
         self.generator = GuideGenerator()
 
     def test_guide_matches_preview_samples_without_switch(self) -> None:

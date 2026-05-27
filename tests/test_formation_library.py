@@ -9,7 +9,7 @@ from formation import FormationLibrary
 
 class FormationLibraryTest(unittest.TestCase):
     def test_default_library_contains_expected_formations(self) -> None:
-        library = FormationLibrary.build_default(robot_radius=0.18, inter_robot_margin=0.10)
+        library = FormationLibrary.build_default(robot_radius=0.09, inter_robot_margin=0.10)
         self.assertEqual(library.names(), ["column", "compact", "horizontal_line", "square", "t_shape"])
 
         formations = {spec.name: spec for spec in library.list()}
@@ -45,7 +45,7 @@ class FormationLibraryTest(unittest.TestCase):
         )
 
     def test_metadata_matches_expected_geometry(self) -> None:
-        library = FormationLibrary.build_default(robot_radius=0.18, inter_robot_margin=0.10)
+        library = FormationLibrary.build_default(robot_radius=0.09, inter_robot_margin=0.10)
         square = library.get("square")
         t_shape = library.get("t_shape")
 

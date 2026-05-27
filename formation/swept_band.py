@@ -81,46 +81,50 @@ class SweptBandBuilder:
             r_minus[i] = self._raycast(map_data, pts[i], -norms[i], clearance_threshold, step, ms)
             r_plus[i] = self._raycast(map_data, pts[i], norms[i], clearance_threshold, step, ms)
 
-        # ── tangents (unit) ───────────────────────────────────────
-        tangents = np.zeros_like(norms)
-        for i in range(n_pts):
-            if i == 0: d = pts[1] - pts[0]
-            elif i == n_pts - 1: d = pts[-1] - pts[-2]
-            else: d = pts[i + 1] - pts[i - 1]
-            dn = float(np.linalg.norm(d))
-            tangents[i] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+        # ── 2. rasterise swept band as a single polygon ───────────────
+        # Right boundary: R_j = γ_j + r₊_j · n_j,  j = 0 … N-1
+        # Left boundary:  L_j = γ_j − r₋_j · n_j,  j = N-1 … 0  (reversed)
+        right_xy = np.column_stack([
+            pts[:, 0] + r_plus * norms[:, 0],
+            pts[:, 1] + r_plus * norms[:, 1],
+        ])
+        left_xy = np.column_stack([
+            pts[:, 0] - r_minus * norms[:, 0],
+            pts[:, 1] - r_minus * norms[:, 1],
+        ])
+        poly_xy = np.vstack([right_xy, left_xy[::-1]])  # [2N, 2]
 
-        # ── 2. per‑segment d_B with generous tolerance → mask ──────
+        # Convert to pixel coordinates for scanline fill
+        poly_px = np.column_stack([
+            (poly_xy[:, 0] - ox) / res,
+            (poly_xy[:, 1] - oy) / res,
+        ])
+
+        ymin = max(0, int(math.floor(np.min(poly_px[:, 1]))))
+        ymax = min(h - 1, int(math.ceil(np.max(poly_px[:, 1]))))
         mask = np.zeros((h, w), dtype=np.uint8)
-        tol = res  # 1‑cell tolerance for both tangential and normal
-        for j in range(n_pts - 1):
-            corners = np.asarray([
-                pts[j] - r_minus[j] * norms[j],
-                pts[j] + r_plus[j] * norms[j],
-                pts[j + 1] - r_minus[j + 1] * norms[j + 1],
-                pts[j + 1] + r_plus[j + 1] * norms[j + 1],
-            ])
-            cmin = np.min(corners, axis=0) - res
-            cmax = np.max(corners, axis=0) + res
-            ix0 = max(0, int(math.floor((cmin[0] - ox) / res)))
-            ix1 = min(w - 1, int(math.ceil((cmax[0] - ox) / res)))
-            iy0 = max(0, int(math.floor((cmin[1] - oy) / res)))
-            iy1 = min(h - 1, int(math.ceil((cmax[1] - oy) / res)))
-            for iy in range(iy0, iy1 + 1):
-                cy = oy + (iy + 0.5) * res
-                for ix in range(ix0, ix1 + 1):
-                    cx = ox + (ix + 0.5) * res
-                    if _db_segment(
-                        np.array([cx, cy]),
-                        pts[j], pts[j + 1],
-                        tangents[j], tangents[j + 1],
-                        norms[j], norms[j + 1],
-                        r_minus[j], r_minus[j + 1],
-                        r_plus[j], r_plus[j + 1],
-                    ) <= tol:
-                        mask[iy, ix] = 1
 
-        # ── 3. signed distance transform ──────────────────────────
+        n_poly = len(poly_px)
+        for iy in range(ymin, ymax + 1):
+            yy = iy + 0.5  # cell centre in pixel coords
+            xs = []
+            for k in range(n_poly):
+                y0 = poly_px[k, 1]; y1 = poly_px[(k + 1) % n_poly, 1]
+                if (y0 <= yy < y1) or (y1 <= yy < y0):
+                    x0 = poly_px[k, 0]; x1 = poly_px[(k + 1) % n_poly, 0]
+                    xs.append(x0 + (yy - y0) * (x1 - x0) / (y1 - y0))
+            xs.sort()
+            for p in range(0, len(xs) - 1, 2):
+                x0 = max(0, int(math.floor(xs[p])))
+                x1 = min(w - 1, int(math.ceil(xs[p + 1])))
+                if x0 <= x1:
+                    mask[iy, x0:x1 + 1] = 1
+
+        # ── 3. 1‑cell dilation for discretisation tolerance ──────────
+        from scipy.ndimage import binary_dilation
+        mask = binary_dilation(mask, iterations=1).astype(np.uint8)
+
+        # ── 4. signed distance transform ──────────────────────────
         grid = _signed_distance_transform(mask, res)
         return SweptBand(grid, map_data.origin_xy, res)
 
@@ -140,34 +144,6 @@ class SweptBandBuilder:
                 return max(prev_d, 0.0)
             prev_d = safe; prev_df = df
         return safe
-
-
-def _db_segment(
-    x: np.ndarray,
-    p0: np.ndarray, p1: np.ndarray,
-    t0: np.ndarray, t1: np.ndarray,
-    n0: np.ndarray, n1: np.ndarray,
-    l0: float, l1: float,
-    r0: float, r1: float,
-) -> float:
-    r"""d_t(x) for a single segment:  min_{t∈[0,1]}  √( a² + (b−clip(b))² )."""
-    seg = p1 - p0
-    seg_len_sq = float(np.dot(seg, seg))
-    if seg_len_sq < 1e-12:
-        return float("inf")
-    t = max(0.0, min(1.0, float(np.dot(x - p0, seg)) / seg_len_sq))
-    centre = p0 + t * seg
-    tj = t0 + t * (t1 - t0)
-    tn = float(np.linalg.norm(tj))
-    if tn < 1e-9: return float("inf")
-    tj = tj / tn
-    nj = np.array([-tj[1], tj[0]])
-    a = float(np.dot(x - centre, tj))
-    b = float(np.dot(x - centre, nj))
-    lt = l0 + t * (l1 - l0)
-    rt = r0 + t * (r1 - r0)
-    bc = max(-lt, min(rt, b))
-    return float(math.sqrt(a * a + (b - bc) * (b - bc)))
 
 
 # ── signed distance transform ─────────────────────────────────────
