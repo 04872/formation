@@ -58,7 +58,7 @@ class FeasibilityConfig:
     # ── swept‑band ────────────────────────────────────────────────
     feasibility_tol_m: float = 0.05      # SDF discretisation tolerance (~0.4 cell at 5cm resolution)
     bspline_control_count: int = 6
-    collocation_points: int = 15
+    collocation_points: int = 30
     verification_points: int = 60
     embed_margin_m: float = 0.0           # δ_emb
     ref_weight: float = 1.0               # w_ref
@@ -168,28 +168,7 @@ class FormationFeasibility:
             return _infeasible(formation.name, "empty_preview")
         δ = self.config.embed_margin_m
 
-        # 1 ── quick check:  c(τ) = γ_ref(τ) ────────────────────────
-        ok, worst = self._eval_slots(band, ref_curve, formation, δ - self.config.feasibility_tol_m)
-        if ok:
-            return self._build_swept_result(
-                map_data, formation.name, band, ref_curve, formation,
-                robot_radius, safety_margin,
-                current_formation, current_states,
-                metadata={"check": "quick_pass", "worst_margin": worst},
-            )
-
-        # 2 ── quick-reject: centreline can shift ≤ ~0.5 m in a
-        # 1.6‑m corridor.  If the worst slot is further out than
-        # that, no optimisation can save it.
-        if worst < -0.50:
-            return self._build_swept_result(
-                map_data, formation.name, band, ref_curve, formation,
-                robot_radius, safety_margin,
-                current_formation, current_states,
-                metadata={"check": "quick_reject", "worst_margin": worst},
-            )
-
-        # 3 ── min‑violation SLSQP: determine feasibility ──────────
+        # ── min‑violation SLSQP: determine feasibility ───────────────
         bezier = _CenterlineBezier.from_reference(
             ref_curve,
             control_count=self.config.bspline_control_count,
@@ -206,7 +185,7 @@ class FormationFeasibility:
                 metadata={"check": "min_violation_pass", "worst_margin": worst_feas},
             )
 
-        # 3 ── infeasible ──────────────────────────────────────────
+        # ── infeasible ───────────────────────────────────────────────
         return self._build_swept_result(
             map_data, formation.name, band, curve_feas, formation,
             robot_radius, safety_margin,
@@ -248,30 +227,6 @@ class FormationFeasibility:
             robot_radius, safety_margin, None, None,
             metadata={"check": "optimal_centerline" if feasible else "optimal_centerline_infeasible"},
         )
-
-    @staticmethod
-    def _anchor_to_centroid(
-        anchor_curve: np.ndarray,      # [N, 2]
-        formation: FormationSpec,
-    ) -> np.ndarray:
-        """Convert anchor trajectory to centroid trajectory."""
-        if len(formation.shifted_slots) == 0:
-            return anchor_curve.copy()
-        a = -formation.anchor_xy  # centroid offset from anchor
-        n = len(anchor_curve)
-        tangents = np.zeros((n, 2), dtype=float)
-        for j in range(n):
-            if j == 0: d = anchor_curve[1] - anchor_curve[0]
-            elif j == n - 1: d = anchor_curve[-1] - anchor_curve[-2]
-            else: d = anchor_curve[j + 1] - anchor_curve[j - 1]
-            dn = float(np.linalg.norm(d))
-            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
-        centroid = np.zeros_like(anchor_curve)
-        for j in range(n):
-            cos_t = tangents[j, 0]; sin_t = tangents[j, 1]
-            centroid[j, 0] = anchor_curve[j, 0] + cos_t * a[0] - sin_t * a[1]
-            centroid[j, 1] = anchor_curve[j, 1] + sin_t * a[0] + cos_t * a[1]
-        return centroid
 
     def _optimal_centerline_beta(
         self,
@@ -530,7 +485,7 @@ class FormationFeasibility:
     @staticmethod
     def _eval_slots(
         band: SweptBand,
-        centre_curve: np.ndarray,   # [N, 2]  — anchor trajectory z(τ) or centreline c(τ)
+        centre_curve: np.ndarray,   # [N, 2]  centreline c(τ)
         formation: FormationSpec,
         margin_req: float,
     ) -> tuple[bool, float]:
@@ -588,8 +543,13 @@ class FormationFeasibility:
         formation: FormationSpec,
         margin_req: float,
     ) -> float:
-        """Sum of squared hinge violations, with tangent at τ_eff interpolation."""
-        total = 0.0
+        r"""Robust interval-based violation.
+
+            m̄_{i,j} = (m_{i,j} + m_{i,j+1} − ℓ_{i,j}) / 2 − ε_sdf
+
+        Only margins at τ_j are batch‑queried; midpoints are computed solely
+        for ℓ_{i,j} (no extra SDF look‑ups).
+        """
         n = len(centre_curve)
         if n < 2:
             return 0.0
@@ -605,29 +565,76 @@ class FormationFeasibility:
             dn = float(np.linalg.norm(d))
             tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
 
-        positions = []
-        for j in range(n):
-            tau = j / max(n - 1, 1)
-            for slot in formation.slots:
+        eps_sdf = 0.05
+        slots = formation.slots
+        n_slots = len(slots)
+
+        # ── slot positions at τ_j (batch margin query) ─────────────
+        q_j: list[list[np.ndarray | None]] = []
+        all_q: list[np.ndarray] = []
+        for slot in slots:
+            row: list[np.ndarray | None] = []
+            for j in range(n):
+                tau = j / max(n - 1, 1)
                 tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
+                    row.append(None); continue
+                jf = tau_eff * (n - 1)
+                j0 = max(0, min(int(jf), n - 2)); j1 = j0 + 1
+                frac = jf - j0
+                c = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
+                t = tangents[j0] + frac * (tangents[j1] - tangents[j0])
+                tn = float(np.linalg.norm(t))
+                if tn < 1e-9: row.append(None); continue
+                t /= tn; n_f = np.array([-t[1], t[0]])
+                p = c + slot[1] * n_f
+                row.append(p); all_q.append(p)
+            q_j.append(row)
+
+        if not all_q:
+            return 0.0
+
+        margins = band.margin_batch(np.asarray(all_q, dtype=float))
+        idx = 0
+        m_j: list[list[float | None]] = [[None] * n for _ in range(n_slots)]
+        for si in range(n_slots):
+            for j in range(n):
+                if q_j[si][j] is not None:
+                    m_j[si][j] = float(margins[idx]); idx += 1
+
+        # ── midpoint positions (ℓ only, no margin query) ────────────
+        def _midpt(slot_idx: int, j: int) -> np.ndarray | None:
+            slot = slots[slot_idx]
+            tau = (j + 0.5) / max(n - 1, 1)
+            tau_eff = tau + slot[0] / total_len
+            if tau_eff < 0.0 or tau_eff > 1.0:
+                return None
+            jf = tau_eff * (n - 1)
+            j0 = max(0, min(int(jf), n - 2)); j1 = j0 + 1
+            frac = jf - j0
+            c = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
+            t = tangents[j0] + frac * (tangents[j1] - tangents[j0])
+            tn = float(np.linalg.norm(t))
+            if tn < 1e-9: return None
+            t /= tn; n_f = np.array([-t[1], t[0]])
+            return c + slot[1] * n_f
+
+        # ── robust interval violation ──
+        total = 0.0
+        for si in range(n_slots):
+            for j in range(n - 1):
+                qa = q_j[si][j]; qb = q_j[si][j+1]
+                ma = m_j[si][j]; mb = m_j[si][j+1]
+                if qa is None or qb is None or ma is None or mb is None:
                     continue
-                j_float = tau_eff * (n - 1)
-                j0 = max(0, min(int(j_float), n - 2))
-                j1 = j0 + 1
-                frac = j_float - j0
-                c_eff = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
-                t_eff = tangents[j0] + frac * (tangents[j1] - tangents[j0])
-                tn = float(np.linalg.norm(t_eff))
-                if tn < 1e-9: continue
-                t_eff /= tn
-                n_eff = np.array([-t_eff[1], t_eff[0]])
-                positions.append(c_eff + slot[1] * n_eff)
-        if positions:
-            margins = band.margin_batch(np.asarray(positions, dtype=float))
-            for m in margins:
-                deficit = margin_req - float(m)
-                if deficit > 0: total += deficit * deficit
+                qm = _midpt(si, j)
+                if qm is None:
+                    continue
+                ell = float(np.linalg.norm(qa - qm)) + float(np.linalg.norm(qm - qb))
+                m_bar = (ma + mb - ell) / 2.0 - eps_sdf
+                deficit = margin_req - m_bar
+                if deficit > 0:
+                    total += deficit * deficit
         return total
 
     # ── min‑violation ─────────────────────────────────────────────

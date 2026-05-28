@@ -97,8 +97,6 @@ class FormationSpec:
     bounding_radius: float
     min_pairwise_distance: float
     task_utility: float = 0.0
-    anchor_xy: np.ndarray = field(default_factory=lambda: np.zeros(2))
-    shifted_slots: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
 
 
 @dataclass
@@ -253,7 +251,7 @@ class MPCWeights:
     input_smooth: float = 1.0
     obstacle_slack: float = 800.0
     neighbor_slack: float = 50.0
-    relative_position: float = 8.0
+    relative_position: float = 10.0
     terminal_position: float = 80.0
 
 

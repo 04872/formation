@@ -45,8 +45,17 @@ SUPPORTED_MAP_TYPES = [
     "obstacle_cluster", "narrow_entrance",
 ]
 ROBOT_COLORS = ["tab:blue", "tab:green", "tab:brown", "tab:pink"]
-BAND_COLORS = ["#0072B2", "#D55E00"]  # blue / vermillion, colorblind-friendly
-BAND_LINESTYLES = ["-", "--"]
+BAND_COLORS = [
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#009E73",  # green
+    "#CC79A7",  # purple
+    "#56B4E9",  # sky blue
+    "#E69F00",  # orange
+    "#8B5A00",  # brown
+    "#332288",  # indigo
+]
+BAND_LINESTYLES = ["-", "--", "-.", ":"]
 
 
 def parse_args() -> argparse.Namespace:
