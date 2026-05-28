@@ -253,7 +253,7 @@ class MPCWeights:
     input_smooth: float = 1.0
     obstacle_slack: float = 800.0
     neighbor_slack: float = 50.0
-    relative_position: float = 0.0
+    relative_position: float = 8.0
     terminal_position: float = 80.0
 
 

@@ -242,9 +242,7 @@ class FormationFeasibility:
             band, bezier, formation, self.config.embed_margin_m,
             subgoal_xy=tuple(subgoal), t_T=t_T, n_T=n_T,
         )
-        anchor_curve = bezier.evaluate(Q_opt, self.config.collocation_points)
-        # Convert anchor trajectory to centroid trajectory
-        curve_opt = self._anchor_to_centroid(anchor_curve, formation)
+        curve_opt = bezier.evaluate(Q_opt, self.config.collocation_points)
         return self._build_swept_result(
             map_data, formation.name, band, curve_opt, formation,
             robot_radius, safety_margin, None, None,
@@ -475,7 +473,26 @@ class FormationFeasibility:
             J_len = float(sum(
                 np.linalg.norm(Q[ci+1] - Q[ci]) for ci in range(bezier.control_count - 1)
             ))
-            return float(J_end + 0.5*J_len + 2.0*J_sm + 0.5*J_feas)
+            # ── J_lat: lateral smoothness penalty ──
+            # β_j = lateral offset from straight baseline (curve[0]→[-1]).
+            J_lat = 0.0
+            c0 = curve[0]; cT = curve[-1]
+            b_vec = cT - c0
+            b_len = float(np.linalg.norm(b_vec))
+            if b_len > 1e-6:
+                n_b = np.array([-b_vec[1], b_vec[0]]) / b_len
+                betas = np.zeros(K, dtype=float)
+                for j in range(K):
+                    tau_j = j / max(K - 1, 1)
+                    b_j = c0 + tau_j * b_vec
+                    betas[j] = float(np.dot(curve[j] - b_j, n_b))
+                # Δβ: penalises rapid lateral changes
+                for j in range(K - 1):
+                    J_lat += (betas[j + 1] - betas[j]) ** 2
+                # Δ²β: penalises lateral acceleration / S-shaped wandering
+                for j in range(1, K - 1):
+                    J_lat += 2.0 * (betas[j + 1] - 2.0 * betas[j] + betas[j - 1]) ** 2
+            return float(J_end + 0.5*J_len + 2.0*J_sm + 0.5*J_feas + 1.0*J_lat)
 
         def constraint(x):
             Q = Q0.copy()
@@ -519,9 +536,6 @@ class FormationFeasibility:
     ) -> tuple[bool, float]:
         r"""Check whether all formation slots stay inside the band.
 
-        Uses shifted_slots (anchor‑relative) when available; otherwise
-        falls back to centroid‑relative slots with longitudinal skip.
-
         Each slot is evaluated at its true longitudinal position
         τ_eff = τ + ξ/L, using the curve tangent at τ_eff.
         """
@@ -544,14 +558,10 @@ class FormationFeasibility:
             dn = float(np.linalg.norm(d))
             tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
 
-        # Use anchor‑relative slots if available (all ξ ≥ 0, no need for τ_eff skip)
-        use_anchor = len(formation.shifted_slots) > 0
-        slots = formation.shifted_slots if use_anchor else formation.slots
-
         positions: list[np.ndarray] = []
         for j in range(n):
             tau = j / max(n - 1, 1)
-            for slot in slots:
+            for slot in formation.slots:
                 tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
                     continue
@@ -595,13 +605,10 @@ class FormationFeasibility:
             dn = float(np.linalg.norm(d))
             tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
 
-        use_anchor = len(formation.shifted_slots) > 0
-        slots = formation.shifted_slots if use_anchor else formation.slots
-
         positions = []
         for j in range(n):
             tau = j / max(n - 1, 1)
-            for slot in slots:
+            for slot in formation.slots:
                 tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
                     continue

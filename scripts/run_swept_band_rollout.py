@@ -293,60 +293,59 @@ def draw_swept_band(context: dict, output: Path):
               cmap="gray_r", interpolation="nearest", alpha=0.95)
     ax.scatter(*map_data.goal_xy, color="tab:purple", s=80, marker="*", label="goal", zorder=5)
 
-    colors = plt.cm.tab10(np.linspace(0, 1, len(pts_list)))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(1, min(len(pts_list), 10))))
     ox, oy = map_data.origin_xy
     res = map_data.resolution
-    band_cycle_indices = {5: 0}
     for i, (pts, sel) in enumerate(zip(pts_list, sels)):
-        color = colors[i]
+        color = colors[i % len(colors)]
         tmp = _make_temp_preview_path(pts, map_data)
-        if i in band_cycle_indices:
-            band_idx = band_cycle_indices[i]
-            band = band_builder.build(map_data, tmp, clearance)
-            band_mask = np.where(band._grid > 0.0, 1.0, np.nan)
-            band_cmap = ListedColormap([BAND_COLORS[band_idx]])
-            ax.imshow(band_mask, origin="lower",
-                      extent=[ox, ox + band._w * res, oy, oy + band._h * res],
-                      cmap=band_cmap, alpha=0.22, vmin=0, vmax=1,
-                      interpolation="nearest", zorder=1)
-            xs = np.linspace(ox + 0.5 * res, ox + (band._w - 0.5) * res, band._w)
-            ys = np.linspace(oy + 0.5 * res, oy + (band._h - 0.5) * res, band._h)
-            ax.contour(
-                xs,
-                ys,
-                band._grid,
-                levels=[0.0],
-                colors=[BAND_COLORS[band_idx]],
-                linewidths=1.8,
-                linestyles=[BAND_LINESTYLES[band_idx]],
-                zorder=2,
-            )
-            # analytic offset polylines (L/R + caps) in red
-            pts_arr = np.asarray(tmp.points_xy)
-            norms_arr = np.asarray(tmp.normals_xy)
-            from formation.mpc_controller import query_distance_field
-            from formation.swept_band import SweptBandBuilder as _SB
-            _ct = 0.09 + 0.06
-            _step = 0.05; _ms = 60
-            _rm = np.zeros(len(pts_arr)); _rp = np.zeros(len(pts_arr))
-            _sb = _SB()
-            for _j in range(len(pts_arr)):
-                _rm[_j] = _sb._raycast(map_data, pts_arr[_j], -norms_arr[_j], _ct, _step, _ms)
-                _rp[_j] = _sb._raycast(map_data, pts_arr[_j], norms_arr[_j], _ct, _step, _ms)
-            _L = np.column_stack([pts_arr[:,0] - _rm * norms_arr[:,0],
-                                  pts_arr[:,1] - _rm * norms_arr[:,1]])
-            _R = np.column_stack([pts_arr[:,0] + _rp * norms_arr[:,0],
-                                  pts_arr[:,1] + _rp * norms_arr[:,1]])
-            ax.plot(_L[:,0], _L[:,1], 'r-', linewidth=1.2, zorder=3, alpha=0.85)
-            ax.plot(_R[:,0], _R[:,1], 'r-', linewidth=1.2, zorder=3, alpha=0.85)
-            ax.plot([_L[0,0],_R[0,0]], [_L[0,1],_R[0,1]], 'r:', linewidth=1.0, zorder=3, alpha=0.6)
-            ax.plot([_L[-1,0],_R[-1,0]], [_L[-1,1],_R[-1,1]], 'r:', linewidth=1.0, zorder=3, alpha=0.6)
+        # build band for every cycle and draw with contrasting color/linestyle
+        band_idx = i % len(BAND_COLORS)
+        band = band_builder.build(map_data, tmp, clearance)
+        band_mask = np.where(band._grid > 0.0, 1.0, np.nan)
+        band_cmap = ListedColormap([BAND_COLORS[band_idx]])
+        ax.imshow(band_mask, origin="lower",
+                  extent=[ox, ox + band._w * res, oy, oy + band._h * res],
+                  cmap=band_cmap, alpha=0.18, vmin=0, vmax=1,
+                  interpolation="nearest", zorder=1)
+        xs = np.linspace(ox + 0.5 * res, ox + (band._w - 0.5) * res, band._w)
+        ys = np.linspace(oy + 0.5 * res, oy + (band._h - 0.5) * res, band._h)
+        ax.contour(
+            xs,
+            ys,
+            band._grid,
+            levels=[0.0],
+            colors=[BAND_COLORS[band_idx]],
+            linewidths=1.6,
+            linestyles=[BAND_LINESTYLES[band_idx % len(BAND_LINESTYLES)]],
+            zorder=2,
+        )
+        # analytic offset polylines (L/R + caps) using band color, slightly darker
+        pts_arr = np.asarray(tmp.points_xy)
+        norms_arr = np.asarray(tmp.normals_xy)
+        from formation.swept_band import SweptBandBuilder as _SB
+        _ct = 0.09 + 0.06
+        _step = 0.05; _ms = 60
+        _rm = np.zeros(len(pts_arr)); _rp = np.zeros(len(pts_arr))
+        _sb = _SB()
+        for _j in range(len(pts_arr)):
+            _rm[_j] = _sb._raycast(map_data, pts_arr[_j], -norms_arr[_j], _ct, _step, _ms)
+            _rp[_j] = _sb._raycast(map_data, pts_arr[_j], norms_arr[_j], _ct, _step, _ms)
+        _L = np.column_stack([pts_arr[:,0] - _rm * norms_arr[:,0],
+                              pts_arr[:,1] - _rm * norms_arr[:,1]])
+        _R = np.column_stack([pts_arr[:,0] + _rp * norms_arr[:,0],
+                              pts_arr[:,1] + _rp * norms_arr[:,1]])
+        ax.plot(_L[:,0], _L[:,1], color=BAND_COLORS[band_idx], linewidth=1.4, zorder=3, alpha=0.95)
+        ax.plot(_R[:,0], _R[:,1], color=BAND_COLORS[band_idx], linewidth=1.4, zorder=3, alpha=0.95)
+        ax.plot([_L[0,0],_R[0,0]], [_L[0,1],_R[0,1]], color=BAND_COLORS[band_idx], linestyle=':', linewidth=1.0, zorder=3, alpha=0.7)
+        ax.plot([_L[-1,0],_R[-1,0]], [_L[-1,1],_R[-1,1]], color=BAND_COLORS[band_idx], linestyle=':', linewidth=1.0, zorder=3, alpha=0.7)
         # Centreline
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                color=color, linewidth=2.2, alpha=0.95, linestyle=BAND_LINESTYLES[0 if i == 5 else 1 if i == 6 else 0],
+                color=color, linewidth=2.2, alpha=0.95,
+                linestyle=BAND_LINESTYLES[i % len(BAND_LINESTYLES)],
                 label=f"cycle {i+1} [{sel}]")
 
-    ax.set_title(f"Swept Band — cycles 6/7 only — {map_data.name}")
+    ax.set_title(f"Swept Band — cycles ({1}-{len(pts_list)}) — {map_data.name}")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)
