@@ -64,6 +64,12 @@ class FormationLibrary:
         longitudinal_half_length = float(np.max(np.abs(slots[:, 0])))
         bounding_radius = float(np.max(np.linalg.norm(slots, axis=1)))
         min_pairwise_distance = FormationLibrary._compute_min_pairwise_distance(slots)
+        # Anchor: rearmost longitudinal pos, lateral midpoint of rearmost row
+        min_x = float(np.min(slots[:, 0]))
+        rearmost = slots[slots[:, 0] <= min_x + 1e-9]
+        anchor_y = float(np.mean(rearmost[:, 1]))
+        anchor = np.array([min_x, anchor_y], dtype=float)
+        shifted_slots = slots - anchor
         return FormationSpec(
             name=name,
             slots=slots,
@@ -72,6 +78,8 @@ class FormationLibrary:
             bounding_radius=bounding_radius,
             min_pairwise_distance=min_pairwise_distance,
             task_utility=lateral_half_width + (1.0 if name == "square" else 0.0),
+            anchor_xy=anchor,
+            shifted_slots=shifted_slots,
         )
 
     @staticmethod

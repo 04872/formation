@@ -56,7 +56,7 @@ class FeasibilityConfig:
     mode: str = "legacy"          # "legacy" | "swept_band"
 
     # ── swept‑band ────────────────────────────────────────────────
-    feasibility_tol_m: float = 0.06      # SDF discretisation tolerance (~1 cell)
+    feasibility_tol_m: float = 0.05      # SDF discretisation tolerance (~0.4 cell at 5cm resolution)
     bspline_control_count: int = 6
     collocation_points: int = 15
     verification_points: int = 60
@@ -218,10 +218,12 @@ class FormationFeasibility:
         self, map_data: MapData, preview_path: LocalPreviewPath,
         formation: FormationSpec, robot_radius: float, safety_margin: float,
     ) -> FormationFeasibilityResult:
-        """Hard-constrained SLSQP centreline opt for the SELECTED formation.
+        """Bézier control‑point centreline optimisation.
 
-        Objective:  J_end + J_sm + J_feas   (endpoint pull, jerk, feasibility)
-        Constraint: all formation slots must stay inside the swept band.
+        Endpoint is constrained to the transversal line at the subgoal
+        (free laterally, fixed longitudinally).  All interior control
+        points are free.  Hard constraint: all slots must stay inside the
+        swept band.
         """
         clearance_threshold = robot_radius + safety_margin
         band = self._swept_builder.build(map_data, preview_path, clearance_threshold)
@@ -229,16 +231,196 @@ class FormationFeasibility:
         bezier = _CenterlineBezier.from_reference(
             ref_curve, control_count=self.config.bspline_control_count, bezier_tension=0.35,
         )
+        subgoal = bezier._ref[-1]
+        # terminal tangent / normal from reference curve
+        d_end = ref_curve[-1] - ref_curve[-2]
+        dn = float(np.linalg.norm(d_end))
+        t_T = d_end / dn if dn > 1e-9 else np.array([1.0, 0.0])
+        n_T = np.array([-t_T[1], t_T[0]])
+
         Q_opt, feasible = self._optimal_centerline_hard(
             band, bezier, formation, self.config.embed_margin_m,
-            subgoal_xy=tuple(bezier._ref[-1]),
+            subgoal_xy=tuple(subgoal), t_T=t_T, n_T=n_T,
         )
-        curve_opt = bezier.evaluate(Q_opt, self.config.collocation_points)
+        anchor_curve = bezier.evaluate(Q_opt, self.config.collocation_points)
+        # Convert anchor trajectory to centroid trajectory
+        curve_opt = self._anchor_to_centroid(anchor_curve, formation)
         return self._build_swept_result(
             map_data, formation.name, band, curve_opt, formation,
             robot_radius, safety_margin, None, None,
             metadata={"check": "optimal_centerline" if feasible else "optimal_centerline_infeasible"},
         )
+
+    @staticmethod
+    def _anchor_to_centroid(
+        anchor_curve: np.ndarray,      # [N, 2]
+        formation: FormationSpec,
+    ) -> np.ndarray:
+        """Convert anchor trajectory to centroid trajectory."""
+        if len(formation.shifted_slots) == 0:
+            return anchor_curve.copy()
+        a = -formation.anchor_xy  # centroid offset from anchor
+        n = len(anchor_curve)
+        tangents = np.zeros((n, 2), dtype=float)
+        for j in range(n):
+            if j == 0: d = anchor_curve[1] - anchor_curve[0]
+            elif j == n - 1: d = anchor_curve[-1] - anchor_curve[-2]
+            else: d = anchor_curve[j + 1] - anchor_curve[j - 1]
+            dn = float(np.linalg.norm(d))
+            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+        centroid = np.zeros_like(anchor_curve)
+        for j in range(n):
+            cos_t = tangents[j, 0]; sin_t = tangents[j, 1]
+            centroid[j, 0] = anchor_curve[j, 0] + cos_t * a[0] - sin_t * a[1]
+            centroid[j, 1] = anchor_curve[j, 1] + sin_t * a[0] + cos_t * a[1]
+        return centroid
+
+    def _optimal_centerline_beta(
+        self,
+        band: SweptBand,
+        ref_curve: np.ndarray,
+        preview_path: LocalPreviewPath,
+        formation: FormationSpec,
+        margin_req: float,
+    ) -> tuple[np.ndarray, bool]:
+        r"""Minimise lateral offsets β along the preview curve subject to
+        all slots staying inside the band.
+
+        Variable:  β[j]  (scalar lateral offset at each curve point).
+        c_j(β) = γ_j + β_j · n_j
+        q_{i,j}(β) = c(s_j + ξ_i) + η_i · n_c(s_j + ξ_i)
+
+        Objective:
+          J = w_β·Σ β² + w₁·Σ (Δβ/Δs)² + w₂·Σ (Δ²β/Δs²)²
+              + w_c·Σ [m_tar − m_B(q)]₊²
+        s.t.
+          m_B(q_{i,j}(β)) ≥ margin_req   ∀ i,j
+          |β_j| ≤ β_max
+          |β_{j+1} − β_j| ≤ d_max
+        """
+        n_full = len(ref_curve)
+        if n_full < 2:
+            return ref_curve.copy(), False
+
+        # save full‑resolution reference + normals
+        ref_full = ref_curve.copy()
+        norms_full = np.asarray(preview_path.normals_xy, dtype=float)
+
+        # ── subsample to ~18 collocation points ────────────────────
+        n = min(n_full, 18)
+        idx = np.linspace(0, n_full - 1, n).astype(int)
+        ref_curve = ref_curve[idx]
+
+        # ── pre‑compute tangents / normals / arc‑length ──────────
+        tangents = np.zeros((n, 2), dtype=float)
+        arc = np.zeros(n, dtype=float)
+        for j in range(n):
+            if j == 0:
+                d = ref_curve[1] - ref_curve[0]
+            elif j == n - 1:
+                d = ref_curve[-1] - ref_curve[-2]
+            else:
+                d = ref_curve[j + 1] - ref_curve[j - 1]
+            dn = float(np.linalg.norm(d))
+            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+            if j > 0:
+                arc[j] = arc[j - 1] + float(np.linalg.norm(ref_curve[j] - ref_curve[j - 1]))
+        arc_total = arc[-1] if arc[-1] > 1e-6 else 1.0
+        ds = arc_total / max(n - 1, 1)
+        norms = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+
+        # ── weights and bounds ────────────────────────────────────
+        w_beta = 0.05
+        w1 = 1.0
+        w2 = 2.0
+        w_c = 0.3
+        m_tar = 0.10    # target margin above the hard threshold
+        beta_max = 0.60
+        d_max = 0.20
+
+        def _slot_centers(beta: np.ndarray) -> np.ndarray:
+            """Return all slot world positions [n_slots, 2] for the current β."""
+            total_len = float(np.sum(
+                np.linalg.norm(ref_curve[i + 1] - ref_curve[i])
+                for i in range(n - 1)
+            )) or 1.0
+            # centreline: c_j = γ_j + β_j * n_j
+            cl = ref_curve + beta[:, None] * norms
+            # cl tangents for slot orientation
+            cl_tan = np.zeros_like(cl)
+            for j in range(n):
+                if j == 0:
+                    d = cl[1] - cl[0]
+                elif j == n - 1:
+                    d = cl[-1] - cl[-2]
+                else:
+                    d = cl[j + 1] - cl[j - 1]
+                dn = float(np.linalg.norm(d))
+                cl_tan[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+            cl_n = np.column_stack([-cl_tan[:, 1], cl_tan[:, 0]])
+            positions = []
+            for j in range(n):
+                tau = j / max(n - 1, 1)
+                cj = cl[j]; ctan = cl_tan[j]; cn = cl_n[j]
+                for slot in formation.slots:
+                    te = tau + slot[0] / total_len
+                    if te < 0.0 or te > 1.0:
+                        continue
+                    jf = min(int(te * (n - 1)), n - 2)
+                    frac = te * (n - 1) - jf
+                    c_eff = cl[jf] + frac * (cl[jf + 1] - cl[jf])
+                    cn_eff = cl_n[jf] + frac * (cl_n[jf + 1] - cl_n[jf])
+                    cn_eff = cn_eff / float(np.linalg.norm(cn_eff)) if float(np.linalg.norm(cn_eff)) > 1e-9 else cn_eff
+                    q = c_eff + slot[1] * cn_eff
+                    positions.append(q)
+            return np.asarray(positions) if positions else np.zeros((0, 2))
+
+        try:
+            from scipy.optimize import minimize
+        except ImportError:
+            return ref_curve.copy(), False
+
+        x0 = np.zeros(n, dtype=float)
+        bounds = [(0.0, 0.0)] + [(-beta_max, beta_max)] * (n - 1)
+
+        def objective(x):
+            beta = np.asarray(x, dtype=float)
+            J = w_beta * float(np.sum(beta ** 2))
+            for j in range(n - 1):
+                J += w1 * ((beta[j + 1] - beta[j]) / ds) ** 2
+            for j in range(1, n - 1):
+                J += w2 * ((beta[j + 1] - 2 * beta[j] + beta[j - 1]) / (ds * ds)) ** 2
+            slots_xy = _slot_centers(beta)
+            if len(slots_xy) > 0:
+                margins = band.margin_batch(slots_xy)
+                for m in margins:
+                    deficit = float(m_tar - m)
+                    if deficit > 0:
+                        J += w_c * deficit * deficit
+            return float(J)
+
+        def constraint(x):
+            beta = np.asarray(x, dtype=float)
+            slots_xy = _slot_centers(beta)
+            if len(slots_xy) == 0:
+                return 1.0
+            margins = band.margin_batch(slots_xy)
+            return float(np.min(margins)) - margin_req  # ≥ 0
+
+        res = minimize(
+            objective, x0, method="SLSQP",
+            bounds=bounds,
+            constraints={"type": "ineq", "fun": constraint},
+            options={"maxiter": 100, "ftol": 1e-4},
+        )
+        beta_opt = np.asarray(res.x, dtype=float)
+        # Interpolate β back to full resolution
+        beta_full = np.interp(np.linspace(0, 1, n_full), np.linspace(0, 1, n), beta_opt)
+        curve_opt = (ref_full + beta_full[:, None] * norms_full)
+
+        # Check feasibility at full resolution
+        ok, _ = self._eval_slots(band, curve_opt, formation, margin_req - 1e-4)
+        return curve_opt, ok
 
     def _optimal_centerline_hard(
         self,
@@ -247,12 +429,14 @@ class FormationFeasibility:
         formation: FormationSpec,
         margin_req: float,
         subgoal_xy: tuple[float, float],
+        t_T: np.ndarray | None = None,
+        n_T: np.ndarray | None = None,
     ) -> tuple[np.ndarray, bool]:
-        r"""Solve min_Q J_end+J_sm+J_feas s.t. all slots embeddable in band.
+        r"""Solve min_Q J_len+J_sm+J_feas+J_end s.t. all slots embeddable.
 
-        J_end = |c(1)-subgoal|^2
-        J_sm  = sum |q_k-3q_{k+1}+3q_{k+2}-q_{k+3}|^2   (jerk smoothness)
-        J_feas= spacing(>0.3m) + turning(>0.5rad) hinge penalties
+        J_end = [t_T·(c(1)-subgoal)]²  (longitudinal error only)
+        Endpoint is constrained to the transversal line through subgoal:
+            t_T·(Q[-1] - subgoal) = 0
         """
         try:
             from scipy.optimize import minimize
@@ -263,12 +447,15 @@ class FormationFeasibility:
         K = self.config.collocation_points
         bbox = bezier.bounding_box()
         sg = np.asarray(subgoal_xy, dtype=float)
+        if t_T is None:
+            t_T = np.array([1.0, 0.0])
 
         def objective(x):
             Q = Q0.copy()
             Q[bezier.free_indices] = x.reshape(-1, 2)
             curve = bezier.evaluate(Q, K)
-            J_end = 5.0 * float(np.sum((curve[-1] - sg) ** 2))
+            # J_end: longitudinal error only
+            J_end = float((np.dot(curve[-1] - sg, t_T)) ** 2)
             J_sm = 0.0
             for ci in range(bezier.control_count - 3):
                 j = Q[ci] - 3*Q[ci+1] + 3*Q[ci+2] - Q[ci+3]
@@ -285,11 +472,10 @@ class FormationFeasibility:
                 cos_th = max(-1.0, min(1.0, cos_th))
                 th = math.acos(cos_th)
                 if th > 0.5: J_feas += (th - 0.5)**2
-            # Arc‑length penalty — prefer direct paths over detours
             J_len = float(sum(
                 np.linalg.norm(Q[ci+1] - Q[ci]) for ci in range(bezier.control_count - 1)
             ))
-            return float(J_end + 0.05*J_len + 2.0*J_sm + 0.5*J_feas)
+            return float(J_end + 0.5*J_len + 2.0*J_sm + 0.5*J_feas)
 
         def constraint(x):
             Q = Q0.copy()
@@ -298,12 +484,23 @@ class FormationFeasibility:
             _, worst = self._eval_slots(band, curve, formation, margin_req)
             return float(worst)  # must be >= margin_req
 
+        def endpoint_eq_constraint(x):
+            """Endpoint must stay on transversal line: t_T·(Q[-1] - sg) = 0"""
+            Q = Q0.copy()
+            Q[bezier.free_indices] = x.reshape(-1, 2)
+            return float(np.dot(Q[-1] - sg, t_T))
+
         x0 = Q0[bezier.free_indices].ravel()
         bounds = [(bbox[0], bbox[1]), (bbox[2], bbox[3])] * len(bezier.free_indices)
 
+        constraints = [
+            {"type": "ineq", "fun": lambda x: constraint(x) - margin_req},
+            {"type": "eq", "fun": endpoint_eq_constraint},
+        ]
+
         res = minimize(
             objective, x0, method="SLSQP", bounds=bounds,
-            constraints={"type": "ineq", "fun": lambda x: constraint(x) - margin_req},
+            constraints=constraints,
             options={"maxiter": 50, "ftol": 1e-6},
         )
         Q_opt = Q0.copy()
@@ -316,14 +513,17 @@ class FormationFeasibility:
     @staticmethod
     def _eval_slots(
         band: SweptBand,
-        centre_curve: np.ndarray,   # [N, 2]
+        centre_curve: np.ndarray,   # [N, 2]  — anchor trajectory z(τ) or centreline c(τ)
         formation: FormationSpec,
         margin_req: float,
     ) -> tuple[bool, float]:
         r"""Check whether all formation slots stay inside the band.
 
+        Uses shifted_slots (anchor‑relative) when available; otherwise
+        falls back to centroid‑relative slots with longitudinal skip.
+
         Each slot is evaluated at its true longitudinal position
-        τ_eff = τ + px/L, using the curve tangent at τ_eff (not at τ).
+        τ_eff = τ + ξ/L, using the curve tangent at τ_eff.
         """
         n = len(centre_curve)
         if n < 2:
@@ -344,14 +544,17 @@ class FormationFeasibility:
             dn = float(np.linalg.norm(d))
             tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
 
+        # Use anchor‑relative slots if available (all ξ ≥ 0, no need for τ_eff skip)
+        use_anchor = len(formation.shifted_slots) > 0
+        slots = formation.shifted_slots if use_anchor else formation.slots
+
         positions: list[np.ndarray] = []
         for j in range(n):
             tau = j / max(n - 1, 1)
-            for slot in formation.slots:
+            for slot in slots:
                 tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
                     continue
-                # Interpolate curve pos & tangent at τ_eff
                 j_float = tau_eff * (n - 1)
                 j0 = max(0, min(int(j_float), n - 2))
                 j1 = j0 + 1
@@ -384,22 +587,21 @@ class FormationFeasibility:
             np.linalg.norm(centre_curve[i+1] - centre_curve[i])
             for i in range(n - 1)
         )) or 1.0
-        # Pre‑compute tangents
         tangents = np.zeros((n, 2), dtype=float)
         for j in range(n):
-            if j == 0:
-                d = centre_curve[1] - centre_curve[0]
-            elif j == n - 1:
-                d = centre_curve[-1] - centre_curve[-2]
-            else:
-                d = centre_curve[j + 1] - centre_curve[j - 1]
+            if j == 0: d = centre_curve[1] - centre_curve[0]
+            elif j == n - 1: d = centre_curve[-1] - centre_curve[-2]
+            else: d = centre_curve[j + 1] - centre_curve[j - 1]
             dn = float(np.linalg.norm(d))
             tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+
+        use_anchor = len(formation.shifted_slots) > 0
+        slots = formation.shifted_slots if use_anchor else formation.slots
 
         positions = []
         for j in range(n):
             tau = j / max(n - 1, 1)
-            for slot in formation.slots:
+            for slot in slots:
                 tau_eff = tau + slot[0] / total_len
                 if tau_eff < 0.0 or tau_eff > 1.0:
                     continue
@@ -410,8 +612,7 @@ class FormationFeasibility:
                 c_eff = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
                 t_eff = tangents[j0] + frac * (tangents[j1] - tangents[j0])
                 tn = float(np.linalg.norm(t_eff))
-                if tn < 1e-9:
-                    continue
+                if tn < 1e-9: continue
                 t_eff /= tn
                 n_eff = np.array([-t_eff[1], t_eff[0]])
                 positions.append(c_eff + slot[1] * n_eff)
@@ -419,8 +620,7 @@ class FormationFeasibility:
             margins = band.margin_batch(np.asarray(positions, dtype=float))
             for m in margins:
                 deficit = margin_req - float(m)
-                if deficit > 0:
-                    total += deficit * deficit
+                if deficit > 0: total += deficit * deficit
         return total
 
     # ── min‑violation ─────────────────────────────────────────────
@@ -878,7 +1078,7 @@ class _CenterlineBezier:
 
     def bounding_box(self) -> tuple[float, float, float, float]:
         """Return (x_min, x_max, y_min, y_max) for control clamping."""
-        margin = 0.50
+        margin = 0.80
         return (
             float(min(self.start[0], self.end[0]) - margin),
             float(max(self.start[0], self.end[0]) + margin),

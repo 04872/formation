@@ -154,10 +154,10 @@ class PreviewCurvePlanner:
         λ_s = 0.5    # smoothness (jerk)
         λ_c = 5.0    # collision (rebound)
         λ_f = 0.3    # feasibility (spacing + turning)
-        λ_e = 0.5    # endpoint
-        λ_za = 0.3   # z anchor
+        λ_e = 0.1    # endpoint
+        λ_za = 0.02   # z anchor
         λ_zo = 1.5   # z obstacle
-        d_safe = 0.02
+        d_safe = 0.1
         d_max = 0.30  # ~ v_max·dt × 1.9 (v_max=0.8, dt=0.2)
         th_max = 0.50 # ~ omega_max·dt × 2.1 (omega_max=1.2, dt=0.2)
         step_q = 0.02
@@ -221,15 +221,14 @@ class PreviewCurvePlanner:
                     zg /= zgn
                     gz += -2.0 * λ_zo * zd * zg
 
-            # ── J_coll: one‑sided hinge rebound ───────────────────
+            # ── J_coll: per‑control‑point {p,v} obstacle pairs ─────
             for rb in rebounds:
-                v = rb["v"]; y = rb["y"]; supp = rb["support"]
-                if not supp: continue
-                ss = 1.0 / len(supp)
-                for ci in supp:
-                    slack = d_safe - float(np.dot(v, qo[ci] - y))
-                    if slack <= 0: continue
-                    gq[ci] += (-2.0 * λ_c * slack * ss) * v
+                ci = rb["ci"]; v = rb["v"]; y = rb["y"]
+                d_ij = float(np.dot(v, qo[ci] - y))
+                slack = d_safe - d_ij
+                if slack <= 0:
+                    continue
+                gq[ci] += (-2.0 * λ_c * slack) * v
 
             # apply with q0 freeze
             qn = qo.copy()
@@ -292,38 +291,26 @@ class PreviewCurvePlanner:
             for seg in range(seg_a, min(seg_b + 1, len(control_points) - 1)):
                 affected.update(self._control_support_for_segment(seg, len(control_points)))
 
-            # ── one consistent rebound direction per segment ──────
-            mid_idx = (s_a + s_b) // 2
-            mid_curve = np.asarray(dense_curve[mid_idx])
-            # Forward direction at collision midpoint
-            fwd_a = max(mid_idx - 1, 0)
-            fwd_b = min(mid_idx + 1, len(dense_curve) - 1)
-            fwd = np.asarray(dense_curve[fwd_b]) - np.asarray(dense_curve[fwd_a])
-            fwd_n = float(np.linalg.norm(fwd))
-            if fwd_n < 1e-9:
-                continue
-            fwd /= fwd_n
-
-            mid_guide = self._closest_on_path(mid_curve, guide_path)
-            diff = mid_guide - mid_curve
-            dist = float(np.linalg.norm(diff))
-            if dist < 1e-6:
-                continue
-            v_seg = diff / dist
-
-            # Reject if rebound pushes backwards (angle > 90° to fwd)
-            if float(np.dot(v_seg, fwd)) < 0:
-                continue
-
-            # Anchor: point on the guide path (safe side)
-            a_seg = mid_guide.copy()
-            # All affected controls (m ≠ 0) share the same rebound
-            support = sorted(m for m in affected if m != 0)
-            if support:
+            # ── per‑control‑point {p, v} pairs (EGO‑style) ───────
+            for ci in sorted(affected):
+                if ci == 0:
+                    continue
+                qi = control_points[ci]
+                p_i = self._closest_on_path(qi, guide_path)
+                dp = float(np.linalg.norm(qi - p_i))
+                if dp < 1e-6:
+                    continue
+                # v_i = distance‑field gradient at p_i  (always points
+                # away from obstacles, toward higher clearance)
+                v_i = self._distance_gradient(map_data, (float(p_i[0]), float(p_i[1])))
+                vn = float(np.linalg.norm(v_i))
+                if vn < 1e-9:
+                    continue
+                v_i /= vn
                 rebounds.append({
-                    "v": v_seg,
-                    "y": a_seg,
-                    "support": support,
+                    "ci": ci,
+                    "v": v_i,
+                    "y": p_i,
                 })
         return rebounds
 

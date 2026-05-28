@@ -216,7 +216,7 @@ class DistributedFormationMPC:
                 positions_xy=positions_xy,
                 yaw_rads=yaw_rads,
                 commands=list(commands),
-                obstacle_slacks=[0.0 for _ in range(self.config.horizon_steps + 1)],
+                obstacle_slacks=[0.0 for _ in range(H + 1)],
                 neighbor_slacks=neighbor_slacks,
                 metadata={
                     "neighbor_robot_indices": indices,
@@ -354,6 +354,9 @@ class DistributedFormationMPC:
             )
             if k > 0:
                 objective += w.input_smooth * ca.sumsqr(du[:, k] - du[:, k - 1])
+
+        # ── relative position (keep formation shape) ───────────────
+        for k in range(H):
             if (
                 neighbor_positions is not None
                 and neighbor_reference_positions is not None
@@ -433,7 +436,6 @@ class DistributedFormationMPC:
                     )
             # penalize slack with configured neighbor_slack weight (squared)
             objective += w.neighbor_slack * ca.sumsqr(eps_cbf)
-        eps_n = None
         eps_cbf_out = eps_cbf if (neighbor_count > 0 and cbf_n_vx is not None) else None
 
         opti.minimize(objective)
@@ -450,7 +452,7 @@ class DistributedFormationMPC:
         )
         return _SolverCacheEntry(
             opti=opti,
-            variables={"dx": dx, "du": du, "eps_n": eps_n, "eps_cbf": eps_cbf_out},
+            variables={"dx": dx, "du": du, "eps_cbf": eps_cbf_out},
             parameters={
                 "dx0": dx0,
                 "reference": reference,

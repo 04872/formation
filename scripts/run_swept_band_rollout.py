@@ -16,6 +16,7 @@ if _os.path.isdir(_ENV_LIB) and "CASADIPATH" not in _os.environ:
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
+from matplotlib.colors import ListedColormap
 
 from formation import (
     ControllerReferenceBuilder,
@@ -44,6 +45,8 @@ SUPPORTED_MAP_TYPES = [
     "obstacle_cluster", "narrow_entrance",
 ]
 ROBOT_COLORS = ["tab:blue", "tab:green", "tab:brown", "tab:pink"]
+BAND_COLORS = ["#0072B2", "#D55E00"]  # blue / vermillion, colorblind-friendly
+BAND_LINESTYLES = ["-", "--"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -282,7 +285,7 @@ def draw_swept_band(context: dict, output: Path):
         sels = [context["selection"].selected_formation.name]
 
     band_builder = SweptBandBuilder()
-    clearance = 0.24
+    clearance = 0.15
 
     fig, ax = plt.subplots(figsize=(12, 8), constrained_layout=True)
     extent = map_extent(map_data)
@@ -293,23 +296,57 @@ def draw_swept_band(context: dict, output: Path):
     colors = plt.cm.tab10(np.linspace(0, 1, len(pts_list)))
     ox, oy = map_data.origin_xy
     res = map_data.resolution
+    band_cycle_indices = {5: 0}
     for i, (pts, sel) in enumerate(zip(pts_list, sels)):
         color = colors[i]
         tmp = _make_temp_preview_path(pts, map_data)
-        # Only draw band for cycle 3
-        if i == 2:
+        if i in band_cycle_indices:
+            band_idx = band_cycle_indices[i]
             band = band_builder.build(map_data, tmp, clearance)
-            mask = (band._grid > 0).astype(float)
-            mask[mask == 0] = np.nan
-            ax.imshow(mask, origin="lower",
+            band_mask = np.where(band._grid > 0.0, 1.0, np.nan)
+            band_cmap = ListedColormap([BAND_COLORS[band_idx]])
+            ax.imshow(band_mask, origin="lower",
                       extent=[ox, ox + band._w * res, oy, oy + band._h * res],
-                      cmap=plt.cm.Blues, alpha=0.30, vmin=0, vmax=1)
+                      cmap=band_cmap, alpha=0.22, vmin=0, vmax=1,
+                      interpolation="nearest", zorder=1)
+            xs = np.linspace(ox + 0.5 * res, ox + (band._w - 0.5) * res, band._w)
+            ys = np.linspace(oy + 0.5 * res, oy + (band._h - 0.5) * res, band._h)
+            ax.contour(
+                xs,
+                ys,
+                band._grid,
+                levels=[0.0],
+                colors=[BAND_COLORS[band_idx]],
+                linewidths=1.8,
+                linestyles=[BAND_LINESTYLES[band_idx]],
+                zorder=2,
+            )
+            # analytic offset polylines (L/R + caps) in red
+            pts_arr = np.asarray(tmp.points_xy)
+            norms_arr = np.asarray(tmp.normals_xy)
+            from formation.mpc_controller import query_distance_field
+            from formation.swept_band import SweptBandBuilder as _SB
+            _ct = 0.09 + 0.06
+            _step = 0.05; _ms = 60
+            _rm = np.zeros(len(pts_arr)); _rp = np.zeros(len(pts_arr))
+            _sb = _SB()
+            for _j in range(len(pts_arr)):
+                _rm[_j] = _sb._raycast(map_data, pts_arr[_j], -norms_arr[_j], _ct, _step, _ms)
+                _rp[_j] = _sb._raycast(map_data, pts_arr[_j], norms_arr[_j], _ct, _step, _ms)
+            _L = np.column_stack([pts_arr[:,0] - _rm * norms_arr[:,0],
+                                  pts_arr[:,1] - _rm * norms_arr[:,1]])
+            _R = np.column_stack([pts_arr[:,0] + _rp * norms_arr[:,0],
+                                  pts_arr[:,1] + _rp * norms_arr[:,1]])
+            ax.plot(_L[:,0], _L[:,1], 'r-', linewidth=1.2, zorder=3, alpha=0.85)
+            ax.plot(_R[:,0], _R[:,1], 'r-', linewidth=1.2, zorder=3, alpha=0.85)
+            ax.plot([_L[0,0],_R[0,0]], [_L[0,1],_R[0,1]], 'r:', linewidth=1.0, zorder=3, alpha=0.6)
+            ax.plot([_L[-1,0],_R[-1,0]], [_L[-1,1],_R[-1,1]], 'r:', linewidth=1.0, zorder=3, alpha=0.6)
         # Centreline
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                color=color, linewidth=2.0, alpha=0.85,
+                color=color, linewidth=2.2, alpha=0.95, linestyle=BAND_LINESTYLES[0 if i == 5 else 1 if i == 6 else 0],
                 label=f"cycle {i+1} [{sel}]")
 
-    ax.set_title(f"Swept Band — cycle 3 only — {map_data.name}")
+    ax.set_title(f"Swept Band — cycles 6/7 only — {map_data.name}")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)

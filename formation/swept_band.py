@@ -81,50 +81,27 @@ class SweptBandBuilder:
             r_minus[i] = self._raycast(map_data, pts[i], -norms[i], clearance_threshold, step, ms)
             r_plus[i] = self._raycast(map_data, pts[i], norms[i], clearance_threshold, step, ms)
 
-        # ── 2. rasterise swept band as a single polygon ───────────────
-        # Right boundary: R_j = γ_j + r₊_j · n_j,  j = 0 … N-1
-        # Left boundary:  L_j = γ_j − r₋_j · n_j,  j = N-1 … 0  (reversed)
-        right_xy = np.column_stack([
-            pts[:, 0] + r_plus * norms[:, 0],
-            pts[:, 1] + r_plus * norms[:, 1],
-        ])
-        left_xy = np.column_stack([
-            pts[:, 0] - r_minus * norms[:, 0],
-            pts[:, 1] - r_minus * norms[:, 1],
-        ])
-        poly_xy = np.vstack([right_xy, left_xy[::-1]])  # [2N, 2]
-
-        # Convert to pixel coordinates for scanline fill
-        poly_px = np.column_stack([
-            (poly_xy[:, 0] - ox) / res,
-            (poly_xy[:, 1] - oy) / res,
-        ])
-
-        ymin = max(0, int(math.floor(np.min(poly_px[:, 1]))))
-        ymax = min(h - 1, int(math.ceil(np.max(poly_px[:, 1]))))
+        # ── 2. rasterise swept band: point‑in‑contour via matplotlib ─────
+        from matplotlib.path import Path
+        L_pts = np.column_stack([pts[:, 0] - r_minus * norms[:, 0],
+                                  pts[:, 1] - r_minus * norms[:, 1]])
+        R_pts = np.column_stack([pts[:, 0] + r_plus * norms[:, 0],
+                                  pts[:, 1] + r_plus * norms[:, 1]])
+        contour = np.vstack([R_pts, L_pts[::-1]])
+        # Build grid of cell centres inside the contour bounding box
+        ix0 = max(0, int(math.floor((contour[:, 0].min() - ox) / res)))
+        ix1 = min(w - 1, int(math.ceil((contour[:, 0].max() - ox) / res)))
+        iy0 = max(0, int(math.floor((contour[:, 1].min() - oy) / res)))
+        iy1 = min(h - 1, int(math.ceil((contour[:, 1].max() - oy) / res)))
         mask = np.zeros((h, w), dtype=np.uint8)
+        gx = ox + (np.arange(ix0, ix1 + 1) + 0.5) * res
+        gy = oy + (np.arange(iy0, iy1 + 1) + 0.5) * res
+        gxx, gyy = np.meshgrid(gx, gy)
+        points = np.column_stack([gxx.ravel(), gyy.ravel()])
+        inside = Path(contour).contains_points(points)
+        mask[iy0:iy1 + 1, ix0:ix1 + 1] = inside.reshape(iy1 - iy0 + 1, ix1 - ix0 + 1)
 
-        n_poly = len(poly_px)
-        for iy in range(ymin, ymax + 1):
-            yy = iy + 0.5  # cell centre in pixel coords
-            xs = []
-            for k in range(n_poly):
-                y0 = poly_px[k, 1]; y1 = poly_px[(k + 1) % n_poly, 1]
-                if (y0 <= yy < y1) or (y1 <= yy < y0):
-                    x0 = poly_px[k, 0]; x1 = poly_px[(k + 1) % n_poly, 0]
-                    xs.append(x0 + (yy - y0) * (x1 - x0) / (y1 - y0))
-            xs.sort()
-            for p in range(0, len(xs) - 1, 2):
-                x0 = max(0, int(math.floor(xs[p])))
-                x1 = min(w - 1, int(math.ceil(xs[p + 1])))
-                if x0 <= x1:
-                    mask[iy, x0:x1 + 1] = 1
-
-        # ── 3. 1‑cell dilation for discretisation tolerance ──────────
-        from scipy.ndimage import binary_dilation
-        mask = binary_dilation(mask, iterations=1).astype(np.uint8)
-
-        # ── 4. signed distance transform ──────────────────────────
+        # ── 3. signed distance transform ──────────────────────────
         grid = _signed_distance_transform(mask, res)
         return SweptBand(grid, map_data.origin_xy, res)
 

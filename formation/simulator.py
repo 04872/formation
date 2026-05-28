@@ -130,7 +130,14 @@ class MultiRobotSimulator:
                 stop_reason = "goal_reached"
                 break
 
-            ref_xy = self._centroid(current_states)
+            cent_xy = self._centroid(current_states)
+            # Compute formation anchor position from centroid + heading
+            avg_yaw = sum(s.yaw for s in current_states) / max(len(current_states), 1)
+            fm_anchor = current_formation.anchor_xy if current_formation is not None else np.zeros(2)
+            ref_xy = (
+                cent_xy[0] + math.cos(avg_yaw) * fm_anchor[0] - math.sin(avg_yaw) * fm_anchor[1],
+                cent_xy[1] + math.sin(avg_yaw) * fm_anchor[0] + math.cos(avg_yaw) * fm_anchor[1],
+            )
             preview_ref_history.append(ref_xy)
             goal_history.append(current_goal_distance)
 

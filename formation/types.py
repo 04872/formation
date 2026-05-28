@@ -91,12 +91,14 @@ class GlobalPath:
 @dataclass
 class FormationSpec:
     name: str
-    slots: np.ndarray
+    slots: np.ndarray            # original slots (centroid frame)
     lateral_half_width: float
     longitudinal_half_length: float
     bounding_radius: float
     min_pairwise_distance: float
     task_utility: float = 0.0
+    anchor_xy: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    shifted_slots: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
 
 
 @dataclass
@@ -251,7 +253,7 @@ class MPCWeights:
     input_smooth: float = 1.0
     obstacle_slack: float = 800.0
     neighbor_slack: float = 50.0
-    relative_position: float = 10.0
+    relative_position: float = 0.0
     terminal_position: float = 80.0
 
 
@@ -412,7 +414,7 @@ class SimulationTrace:
 
 @dataclass
 class PreviewCurveConfig:
-    sample_spacing_m: float = 0.10
+    sample_spacing_m: float = 0.05
     bezier_tension: float = 0.35
     reduced_tension: float = 0.18
     min_point_spacing_m: float = 0.05
