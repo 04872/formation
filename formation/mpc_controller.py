@@ -36,6 +36,7 @@ class _RobotSolveInput:
     own_reference: RobotReferenceTrajectory
     neighbor_predictions: list[RobotPrediction]
     neighbor_reference_positions: np.ndarray
+    neighbor_reference_speeds: np.ndarray
     neighbor_indices: list[int]
     map_data: MapData
 
@@ -69,6 +70,7 @@ class DistributedFormationMPC:
                 self._reference_to_prediction(controller_reference.robot_trajectories[j].window(0, horizon))
                 for j in neighbor_indices
             ]
+            neighbor_reference_speeds = self._build_neighbor_speed_matrix(neighbor_ref_predictions)
             use_previous = (
                 previous_predictions is not None
                 and len(previous_predictions) == robot_count
@@ -87,6 +89,7 @@ class DistributedFormationMPC:
                 own_reference=controller_reference.robot_trajectories[robot_index].window(0, horizon),
                 neighbor_predictions=neighbor_predictions,
                 neighbor_reference_positions=neighbor_reference_positions,
+                neighbor_reference_speeds=neighbor_reference_speeds,
                 neighbor_indices=neighbor_indices,
                 map_data=map_data,
             ))
@@ -114,6 +117,7 @@ class DistributedFormationMPC:
             solver_slot=solve_input.solver_slot,
             neighbor_indices=solve_input.neighbor_indices,
             neighbor_reference_positions=solve_input.neighbor_reference_positions,
+            neighbor_reference_speeds=solve_input.neighbor_reference_speeds,
         )
 
     def solve_robot(
@@ -126,6 +130,7 @@ class DistributedFormationMPC:
         solver_slot: int = 0,
         neighbor_indices: list[int] | None = None,
         neighbor_reference_positions: np.ndarray | None = None,
+        neighbor_reference_speeds: np.ndarray | None = None,
     ) -> tuple[ControlCommand, RobotPrediction]:
         if own_reference.sample_count <= 0:
             raise ValueError("Robot reference trajectory is empty.")
@@ -133,9 +138,14 @@ class DistributedFormationMPC:
         solver = self._get_solver(map_data, len(neighbor_predictions), solver_slot)
         padded_ref = own_reference.window(0, self.config.horizon_steps)
         reference_matrix = self._build_reference_matrix(state, padded_ref)
+        reference_tangents = self._build_tangent_matrix(reference_matrix[:2, :])
         neighbor_positions = self._build_neighbor_position_matrix(neighbor_predictions)
         if neighbor_reference_positions is None:
             neighbor_reference_positions = neighbor_positions
+        if neighbor_reference_speeds is None:
+            neighbor_reference_speeds = self._build_neighbor_speed_matrix(neighbor_predictions)
+        neighbor_reference_tangents = self._build_tangent_matrix(neighbor_reference_positions)
+        neighbor_prediction_speeds = self._build_neighbor_speed_matrix(neighbor_predictions)
 
         H = self.config.horizon_steps
         safe_dist = 2.0 * self.config.robot_radius + self.config.inter_robot_margin
@@ -159,8 +169,12 @@ class DistributedFormationMPC:
             solver,
             state,
             reference_matrix,
+            reference_tangents,
             neighbor_positions,
             neighbor_reference_positions,
+            neighbor_prediction_speeds,
+            neighbor_reference_speeds,
+            neighbor_reference_tangents,
             n_vx,
             n_vy,
         )
@@ -305,6 +319,48 @@ class DistributedFormationMPC:
         matrix[4, :] = np.clip(matrix[4, :], -self.config.omega_max, self.config.omega_max)
         return matrix
 
+    def _build_tangent_matrix(self, positions_matrix: np.ndarray) -> np.ndarray:
+        if positions_matrix.size == 0:
+            return np.zeros_like(positions_matrix)
+        if positions_matrix.shape[0] % 2 != 0:
+            raise ValueError("positions_matrix must have an even number of rows.")
+        row_count, sample_count = positions_matrix.shape
+        tangents = np.zeros_like(positions_matrix)
+        for row_start in range(0, row_count, 2):
+            xs = positions_matrix[row_start]
+            ys = positions_matrix[row_start + 1]
+            for k in range(sample_count):
+                if sample_count == 1:
+                    dx = 1.0
+                    dy = 0.0
+                elif k == 0:
+                    dx = xs[1] - xs[0]
+                    dy = ys[1] - ys[0]
+                elif k == sample_count - 1:
+                    dx = xs[-1] - xs[-2]
+                    dy = ys[-1] - ys[-2]
+                else:
+                    dx = xs[k + 1] - xs[k - 1]
+                    dy = ys[k + 1] - ys[k - 1]
+                norm = math.hypot(dx, dy)
+                if norm < 1e-9:
+                    tangents[row_start, k] = 1.0
+                    tangents[row_start + 1, k] = 0.0
+                else:
+                    tangents[row_start, k] = dx / norm
+                    tangents[row_start + 1, k] = dy / norm
+        return tangents
+
+    def _build_neighbor_speed_matrix(self, neighbor_predictions: list[RobotPrediction]) -> np.ndarray:
+        if not neighbor_predictions:
+            return np.zeros((0, self.config.horizon_steps), dtype=float)
+        H = self.config.horizon_steps
+        speeds = np.zeros((len(neighbor_predictions), H), dtype=float)
+        for pred_idx, prediction in enumerate(neighbor_predictions):
+            for k in range(H):
+                speeds[pred_idx, k] = self._prediction_speed(prediction, k)
+        return speeds
+
     def _get_solver(self, map_data: MapData, neighbor_count: int, solver_slot: int) -> _SolverCacheEntry:
         cache_key = (id(map_data), self.config.horizon_steps, neighbor_count, solver_slot)
         with self._cache_lock:
@@ -324,8 +380,12 @@ class DistributedFormationMPC:
 
         dx0 = opti.parameter(3)
         reference = opti.parameter(5, H + 1)
+        reference_tangents = opti.parameter(2, H + 1)
         neighbor_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
         neighbor_reference_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
+        neighbor_prediction_speeds = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
+        neighbor_reference_speeds = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
+        neighbor_reference_tangents = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
 
         objective = 0
         opti.subject_to(dx[0, 0] == dx0[0])
@@ -355,24 +415,40 @@ class DistributedFormationMPC:
             if k > 0:
                 objective += w.input_smooth * ca.sumsqr(du[:, k] - du[:, k - 1])
 
-        # ── relative position (keep formation shape) ───────────────
+        # ── tracking-error consensus (keep formation shape under mismatch) ────
         for k in range(H):
             if (
                 neighbor_positions is not None
                 and neighbor_reference_positions is not None
+                and neighbor_prediction_speeds is not None
+                and neighbor_reference_speeds is not None
+                and neighbor_reference_tangents is not None
                 and neighbor_count > 0
                 and w.relative_position > 0.0
             ):
-                sx = reference[0, k] + dx[0, k]
-                sy = reference[1, k] + dx[1, k]
+                e_ix = dx[0, k]
+                e_iy = dx[1, k]
+                slot_progress_i = e_ix * reference_tangents[0, k] + e_iy * reference_tangents[1, k]
+                speed_error_i = du[0, k]
                 for n in range(neighbor_count):
                     nx = neighbor_positions[2 * n, k]
                     ny = neighbor_positions[2 * n + 1, k]
                     ref_dx = reference[0, k] - neighbor_reference_positions[2 * n, k]
                     ref_dy = reference[1, k] - neighbor_reference_positions[2 * n + 1, k]
-                    err_x = (sx - nx) - ref_dx
-                    err_y = (sy - ny) - ref_dy
+                    err_x = (reference[0, k] + e_ix - nx) - ref_dx
+                    err_y = (reference[1, k] + e_iy - ny) - ref_dy
                     objective += w.relative_position * (err_x**2 + err_y**2)
+
+                    neigh_err_x = nx - neighbor_reference_positions[2 * n, k]
+                    neigh_err_y = ny - neighbor_reference_positions[2 * n + 1, k]
+                    neigh_progress = (
+                        neigh_err_x * neighbor_reference_tangents[2 * n, k]
+                        + neigh_err_y * neighbor_reference_tangents[2 * n + 1, k]
+                    )
+                    objective += w.progress_sync * (slot_progress_i - neigh_progress)**2
+
+                    neigh_speed_error = neighbor_prediction_speeds[n, k] - neighbor_reference_speeds[n, k]
+                    objective += w.velocity_consensus * (speed_error_i - neigh_speed_error)**2
 
         objective += w.terminal_position * (dx[0, H]**2 + dx[1, H]**2)
 
@@ -456,16 +532,23 @@ class DistributedFormationMPC:
             parameters={
                 "dx0": dx0,
                 "reference": reference,
+                "reference_tangents": reference_tangents,
                 "neighbor_positions": neighbor_positions,
                 "neighbor_reference_positions": neighbor_reference_positions,
+                "neighbor_prediction_speeds": neighbor_prediction_speeds,
+                "neighbor_reference_speeds": neighbor_reference_speeds,
+                "neighbor_reference_tangents": neighbor_reference_tangents,
                 "cbf_n_vx": cbf_n_vx, "cbf_n_vy": cbf_n_vy,
             },
         )
 
     def _set_parameter_values(
         self, solver: _SolverCacheEntry, state: RobotState,
-        reference_matrix: np.ndarray, neighbor_positions: np.ndarray,
-        neighbor_reference_positions: np.ndarray,
+        reference_matrix: np.ndarray, reference_tangents: np.ndarray,
+        neighbor_positions: np.ndarray, neighbor_reference_positions: np.ndarray,
+        neighbor_prediction_speeds: np.ndarray,
+        neighbor_reference_speeds: np.ndarray,
+        neighbor_reference_tangents: np.ndarray,
         n_vx: np.ndarray | None = None, n_vy: np.ndarray | None = None,
     ) -> None:
         dx0 = np.array([
@@ -474,10 +557,18 @@ class DistributedFormationMPC:
         ], dtype=float)
         solver.opti.set_value(solver.parameters["dx0"], dx0)
         solver.opti.set_value(solver.parameters["reference"], reference_matrix)
+        if solver.parameters.get("reference_tangents") is not None:
+            solver.opti.set_value(solver.parameters["reference_tangents"], reference_tangents)
         if solver.parameters.get("neighbor_positions") is not None:
             solver.opti.set_value(solver.parameters["neighbor_positions"], neighbor_positions)
         if solver.parameters.get("neighbor_reference_positions") is not None:
             solver.opti.set_value(solver.parameters["neighbor_reference_positions"], neighbor_reference_positions)
+        if solver.parameters.get("neighbor_prediction_speeds") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_prediction_speeds"], neighbor_prediction_speeds)
+        if solver.parameters.get("neighbor_reference_speeds") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_reference_speeds"], neighbor_reference_speeds)
+        if solver.parameters.get("neighbor_reference_tangents") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_reference_tangents"], neighbor_reference_tangents)
         if n_vx is not None and solver.parameters.get("cbf_n_vx") is not None:
             solver.opti.set_value(solver.parameters["cbf_n_vx"], n_vx)
             solver.opti.set_value(solver.parameters["cbf_n_vy"], n_vy)

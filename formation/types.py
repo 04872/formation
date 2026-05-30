@@ -252,6 +252,8 @@ class MPCWeights:
     obstacle_slack: float = 800.0
     neighbor_slack: float = 50.0
     relative_position: float = 10.0
+    velocity_consensus: float = 4.0
+    progress_sync: float = 2.0
     terminal_position: float = 80.0
 
 
