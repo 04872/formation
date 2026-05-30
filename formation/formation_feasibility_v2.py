@@ -22,11 +22,44 @@ from formation.formation_feasibility import (
     _resample_polyline,
     _infeasible,
 )
+from formation.mpc_controller import query_distance_field
 from formation.types import FormationSpec, LocalPreviewPath, MapData
+
+
+def _make_temp_preview(pts_xy):
+    """Minimal LocalPreviewPath from a list of (x, y) tuples."""
+    n = len(pts_xy)
+    return LocalPreviewPath(
+        points_xy=pts_xy,
+        arc_lengths=[0.0] * n,
+        tangents_xy=[(1.0, 0.0)] * n,
+        normals_xy=[(0.0, 1.0)] * n,
+        curvatures=[0.0] * n,
+        source_mode="v2_temp",
+        is_safe=True,
+        min_clearance=0.5,
+    )
 
 
 class FormationFeasibilityV2(FormationFeasibility):
     """Extended feasibility checker using band-recenter + envelope logic."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self._v2_cache: dict = {}
+        self._band_recenter_history: list = []
+
+    def optimize_centerline(
+        self, map_data, preview_path, formation, robot_radius, safety_margin,
+    ):
+        if self.config.mode == "swept_band_v2" and self._v2_cache:
+            c = self._v2_cache
+            return self._build_swept_result(
+                map_data, formation.name, c["band"], c["C_star"], formation,
+                robot_radius, safety_margin, None, None,
+                metadata={"check": "v2_cached"})
+        return super().optimize_centerline(
+            map_data, preview_path, formation, robot_radius, safety_margin)
 
     def check(
         self,
@@ -102,16 +135,19 @@ class FormationFeasibilityV2(FormationFeasibility):
             return _infeasible(formation.name, "empty_preview")
 
         bz = _CenterlineBezier.from_reference(C0, control_count=6, bezier_tension=0.35)
-        _, C_star = self._band_recenter_qp(band, bz, C0, clearance)
-        δL, δR = self._compute_widths(band, C_star)
+        _, C_star = self._band_recenter_qp(map_data, band, bz, C0, clearance)
+        δL, δR = self._compute_widths(map_data, C_star, clearance)
         δ = self.config.embed_margin_m - self.config.feasibility_tol_m
+
+        C_star_pts = [(float(p[0]), float(p[1])) for p in C_star]
+        band_star = self._swept_builder.build(map_data, _make_temp_preview(C_star_pts), clearance)
 
         feasible = self._check_envelope(formation, δL, δR)
         if feasible:
-            feasible, _ = self._eval_slots(band, C_star, formation, δ)
+            feasible, _ = self._eval_slots(band_star, C_star, formation, δ)
 
         return self._build_swept_result(
-            map_data, formation.name, band, C_star, formation,
+            map_data, formation.name, band_star, C_star, formation,
             robot_radius, safety_margin, current_formation, current_states,
             metadata={"check": "v2_pass" if feasible else "v2_fail",
                        "delta_L": δL, "delta_R": δR},
@@ -138,13 +174,17 @@ class FormationFeasibilityV2(FormationFeasibility):
 
         # ── 1. band‑recenter ───────────────────────────────────
         bz = _CenterlineBezier.from_reference(C0, control_count=6, bezier_tension=0.35)
-        Q_R, C_R = self._band_recenter_qp(band, bz, C0, clearance)
+        Q_R, C_R = self._band_recenter_qp(map_data, band, bz, C0, clearance)
+        self._band_recenter_history.append([(float(p[0]), float(p[1])) for p in C_R])
 
         # ── 2. final polish ─────────────────────────────────────
-        Q_star, C_star = self._final_polish_qp(band, bz, Q_R, C_R, clearance)
+        Q_star, C_star = self._final_polish_qp(map_data, band, bz, Q_R, C_R, clearance)
 
-        # ── 3. compute widths ───────────────────────────────────
-        δL, δR = self._compute_widths(band, C_star)
+        # ── 3. compute widths and rebuild band ───────────────────
+        δL, δR = self._compute_widths(map_data, C_star, clearance)
+        C_star_pts = [(float(p[0]), float(p[1])) for p in C_star]
+        band_star = self._swept_builder.build(map_data, _make_temp_preview(C_star_pts), clearance)
+        self._v2_cache = {"C_star": C_star, "C_R": C_R, "band": band_star, "delta_L": δL, "delta_R": δR}
         δ = self.config.embed_margin_m - self.config.feasibility_tol_m
 
         if preference_order is not None:
@@ -158,9 +198,9 @@ class FormationFeasibilityV2(FormationFeasibility):
         for fm in ordered:
             feasible = self._check_envelope(fm, δL, δR)
             if feasible:
-                feasible, _ = self._eval_slots(band, C_star, fm, δ)
+                feasible, _ = self._eval_slots(band_star, C_star, fm, δ)
             results.append(self._build_swept_result(
-                map_data, fm.name, band, C_star, fm,
+                map_data, fm.name, band_star, C_star, fm,
                 robot_radius, safety_margin, current_formation, current_states,
                 metadata={"check": "v2_pass" if feasible else "v2_fail",
                            "delta_L": δL, "delta_R": δR},
@@ -174,7 +214,7 @@ class FormationFeasibilityV2(FormationFeasibility):
     # ═══════════════════════════════════════════════════════════════
 
     def _band_recenter_qp(
-        self, band: SweptBand, bezier: _CenterlineBezier,
+        self, map_data: MapData, band: SweptBand, bezier: _CenterlineBezier,
         C_init: np.ndarray, clearance: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         """QP micro‑loop: push curve toward wider side of band."""
@@ -189,33 +229,18 @@ class FormationFeasibilityV2(FormationFeasibility):
         n_free = len(bezier.free_indices)
         prev_W = 0.0
 
-        def _normals(cc):
-            nn = np.zeros_like(cc)
-            for j in range(len(cc)):
-                if j == 0: d = cc[1] - cc[0]
-                elif j == len(cc)-1: d = cc[-1] - cc[-2]
-                else: d = cc[j+1] - cc[j-1]
-                dn = float(np.linalg.norm(d))
-                t = d/dn if dn > 1e-9 else np.array([1.0, 0.0])
-                nn[j] = np.array([-t[1], t[0]])
-            return nn
-
         def _max_off(cc, nn, sg):
-            for d in np.linspace(0.0, 0.50, 11):
-                pts = cc + (sg * d) * nn
-                if np.any(band.margin_batch(pts) < 0.0):
-                    return max(0.0, d - 0.05)
-            return 0.50
+            return self._max_uniform_offset_df(map_data, cc, nn, sg, clearance)
 
         for k in range(5):
             C = bezier.evaluate(Q, M)
-            nn = _normals(C)
+            nn = self._normals(C)
             nn_lp = self._lowpass_normals(nn, window=3)
             δL = _max_off(C, nn_lp, +1.0); δR = _max_off(C, nn_lp, -1.0)
             W = δL + δR; μ = (δL - δR) / 2.0
-            if abs(μ) < 0.015 or (k > 0 and abs(W - prev_W) < 0.01):
-                break
-            prev_W = W; direction = np.sign(μ)
+            print(f"    [QP k={k}] δL={δL:.3f} δR={δR:.3f} μ={μ:.4f}", flush=True)
+            direction = np.sign(μ)
+            prev_W = W
 
             J = self._bezier_jacobian(bezier, Q, M)
             A = np.zeros((M * 2, n_free * 2))
@@ -245,7 +270,10 @@ class FormationFeasibilityV2(FormationFeasibility):
                     J_sm += float(np.sum(L**2))
                 dC = A @ dq.ravel()
                 J_long = sum(float(np.dot(t_C[j], dC[j*2:j*2+2])**2) for j in range(M))
-                return 0.5*J_sm + 0.3*J_long + 2.0*float(np.sum(xi**2))
+                J_start = float(np.sum(dq[0]**2))
+                J_step  = float(np.sum(dq**2))
+                return (0.5*J_sm + 0.3*J_long + 0.5*J_start
+                        + 0.05*J_step + 2.0*float(np.sum(xi**2)))
 
             def _constraints(x):
                 dq = x[:n_free*2].reshape(n_free, 2); xi = x[n_free*2:]
@@ -253,23 +281,25 @@ class FormationFeasibilityV2(FormationFeasibility):
                 vals = np.zeros(M)
                 for j in range(M):
                     tau_j = j / max(M-1, 1)
-                    chi = 1.0 if tau_j > 0.15 else tau_j / 0.15
+                    chi = 0.0 if j == 0 else 1.0
                     vals[j] = direction * float(np.dot(nn_lp[j], dC[j])) - chi * 0.5 * abs(μ) + xi[j]
                 return vals
 
             bounds = [(None, None)] * (n_free*2) + [(0.0, None)] * M
             x0 = np.zeros(n_vars)
             shift = min(0.5 * abs(μ), 0.06)
+            dc_desired = np.zeros(M * 2)
             for j in range(M):
-                tau_j = j / max(M-1, 1)
-                chi = 1.0 if tau_j > 0.15 else tau_j / 0.15
-                x0[j*2] += direction * shift * chi * nn_lp[j, 0] / n_free
-                x0[j*2+1] += direction * shift * chi * nn_lp[j, 1] / n_free
+                chi = 1.0 if j > 0 else 0.0
+                dc_desired[j*2]     = direction * shift * chi * nn_lp[j, 0]
+                dc_desired[j*2 + 1] = direction * shift * chi * nn_lp[j, 1]
+            x0[:n_free*2] = A.T @ dc_desired
 
             res = minimize(_obj, x0, method="SLSQP", bounds=bounds,
                            constraints={"type": "ineq", "fun": _constraints},
                            options={"maxiter": 50, "ftol": 1e-6})
             dq = res.x[:n_free*2].reshape(n_free, 2)
+            print(f"    [SLSQP] success={res.success} |dq|={float(np.linalg.norm(dq)):.4f} |xi|={float(np.linalg.norm(res.x[n_free*2:])):.3f}", flush=True)
 
             # verify candidate with η-blend
             for eta in [1.0, 0.5, 0.25]:
@@ -277,25 +307,29 @@ class FormationFeasibilityV2(FormationFeasibility):
                 for fi, ci in enumerate(bezier.free_indices): Q_cand[ci] += eta * dq[fi]
                 Q_cand[0] = C_init[0].copy()
                 C_cand = bezier.evaluate(Q_cand, M)
-                if np.any(band.margin_batch(C_cand) < 0.0):
+                if np.any(self._margin_batch(map_data, C_cand, clearance) < -0.02):
                     continue
-                nn_c = _normals(C_cand); nn_lp_c = self._lowpass_normals(nn_c)
-                δL_c = _max_off(C_cand, nn_lp_c, +1.0)
-                δR_c = _max_off(C_cand, nn_lp_c, -1.0)
+                nn_c = self._normals(C_cand); nn_lp_c = self._lowpass_normals(nn_c)
+                δL_c = self._max_uniform_offset_df(map_data, C_cand, nn_lp_c, +1.0, clearance)
+                δR_c = self._max_uniform_offset_df(map_data, C_cand, nn_lp_c, -1.0, clearance)
                 if any(abs(self._curvature_at(C_cand, j)) > 3.0 for j in range(1, M-1)):
                     continue
                 if δL_c + δR_c >= W - 0.02:
                     Q = Q_cand; C = C_cand
                     break
 
-        return Q, bezier.evaluate(Q, M)
+        C_final = bezier.evaluate(Q, M)
+        C_init_eval = bezier.evaluate(bezier.initial_controls(), M)
+        shift = float(np.max(np.linalg.norm(C_final - C_init_eval, axis=1)))
+        print(f"  [v2] band_recenter max_shift={shift:.3f}m", flush=True)
+        return Q, C_final
 
     # ═══════════════════════════════════════════════════════════════
     #  final polish QP
     # ═══════════════════════════════════════════════════════════════
 
     def _final_polish_qp(
-        self, band: SweptBand, bezier: _CenterlineBezier,
+        self, map_data: MapData, band: SweptBand, bezier: _CenterlineBezier,
         Q_R: np.ndarray, C_R: np.ndarray, clearance: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         """QP polish: smoothness + feasibility + terminal + band non‑regression."""
@@ -318,8 +352,8 @@ class FormationFeasibilityV2(FormationFeasibility):
                 nn[j] = np.array([-t[1], t[0]])
             return nn
 
-        nn_R = _normals(C_R); nn_R_lp = self._lowpass_normals(nn_R)
-        δL_R, δR_R = self._compute_widths(band, C_R)
+        nn_R = self._normals(C_R); nn_R_lp = self._lowpass_normals(nn_R)
+        δL_R, δR_R = self._compute_widths(map_data, C_R, clearance)
         W_R = δL_R + δR_R
         σ_R = 1.0 if δL_R > δR_R else -1.0
         balanced = abs(δL_R - δR_R) < 0.03
@@ -367,7 +401,7 @@ class FormationFeasibilityV2(FormationFeasibility):
             xi_b = x[n_free*2:n_free*2+M]; xi_c = x[n_free*2+M:]
             dC = (A @ dq.ravel()).reshape(M, 2)
             C_c = C_R + dC
-            margins = band.margin_batch(C_c)
+            margins = self._margin_batch(map_data, C_c, clearance)
             vals = []
             # collision: margin ≥ 0
             for j in range(M):
@@ -393,10 +427,10 @@ class FormationFeasibilityV2(FormationFeasibility):
             for fi, ci in enumerate(bezier.free_indices): Q_cand[ci] += eta * dq[fi]
             Q_cand[0] = C_R[0].copy()
             C_cand = bezier.evaluate(Q_cand, M)
-            if np.any(band.margin_batch(C_cand) < 0.0):
+            if np.any(self._margin_batch(map_data, C_cand, clearance) < -0.02):
                 continue
-            nn_c = _normals(C_cand); nn_c_lp = self._lowpass_normals(nn_c)
-            δL_c, δR_c = self._compute_widths(band, C_cand)
+            nn_c = self._normals(C_cand); nn_c_lp = self._lowpass_normals(nn_c)
+            δL_c, δR_c = self._compute_widths(map_data, C_cand, clearance)
             if δL_c + δR_c < W_R - 0.02:
                 continue
             if any(abs(self._curvature_at(C_cand, j)) > 3.0 for j in range(1, M-1)):
@@ -404,7 +438,11 @@ class FormationFeasibilityV2(FormationFeasibility):
             Q = Q_cand; C_R = C_cand
             break
 
-        return Q, bezier.evaluate(Q, M)
+        C_final = bezier.evaluate(Q, M)
+        C_init_eval = bezier.evaluate(bezier.initial_controls(), M)
+        shift = float(np.max(np.linalg.norm(C_final - C_init_eval, axis=1)))
+        print(f"  [v2] band_recenter max_shift={shift:.3f}m", flush=True)
+        return Q, C_final
 
     # ═══════════════════════════════════════════════════════════════
     #  helpers
@@ -425,6 +463,27 @@ class FormationFeasibilityV2(FormationFeasibility):
         return J
 
     @staticmethod
+    def _normals(cc):
+        nn = np.zeros_like(cc); n = len(cc)
+        for j in range(n):
+            if j == 0: d = cc[1] - cc[0]
+            elif j == n - 1: d = cc[-1] - cc[-2]
+            else: d = cc[j + 1] - cc[j - 1]
+            dn = float(np.linalg.norm(d)); t = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+            nn[j] = np.array([-t[1], t[0]])
+        return nn
+
+    @staticmethod
+    def _curve_tangents(cc):
+        M = len(cc); tC = np.zeros((M, 2))
+        for j in range(M):
+            if j == 0: d = cc[1] - cc[0]
+            elif j == M - 1: d = cc[-1] - cc[-2]
+            else: d = cc[j + 1] - cc[j - 1]
+            dn = float(np.linalg.norm(d)); tC[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+        return tC
+
+    @staticmethod
     def _lowpass_normals(nn: np.ndarray, window: int = 3) -> np.ndarray:
         """Boxcar low‑pass on normal vectors."""
         n_lp = nn.copy(); hw = window // 2
@@ -435,27 +494,31 @@ class FormationFeasibilityV2(FormationFeasibility):
             if nrm > 1e-9: n_lp[j] = avg / nrm
         return n_lp
 
-    def _compute_widths(
-        self, band: SweptBand, curve: np.ndarray,
-    ) -> tuple[float, float]:
-        """δ_L, δ_R — max uniform lateral offset where all points have margin ≥ 0."""
-        K = len(curve)
-        nn = np.zeros_like(curve)
-        for j in range(K):
-            if j == 0: d = curve[1] - curve[0]
-            elif j == K-1: d = curve[-1] - curve[-2]
-            else: d = curve[j+1] - curve[j-1]
-            dn = float(np.linalg.norm(d)); t = d/dn if dn > 1e-9 else np.array([1.0,0.0])
-            nn[j] = np.array([-t[1], t[0]])
-        nn_lp = self._lowpass_normals(nn)
+    @staticmethod
+    def _margin_batch(map_data: MapData, pts: np.ndarray, clearance: float) -> np.ndarray:
+        """Batch query: signed margin relative to clearance threshold."""
+        margins = np.array([query_distance_field(map_data, (float(p[0]), float(p[1])))
+                            for p in pts], dtype=float)
+        return margins - clearance  # positive = safe
 
-        def _max_off(sg):
-            for d in np.linspace(0.0, 0.50, 11):
-                pts = curve + (sg * d) * nn_lp
-                if np.any(band.margin_batch(pts) < 0.0):
-                    return max(0.0, d - 0.05)
-            return 0.50
-        return _max_off(+1.0), _max_off(-1.0)
+    @staticmethod
+    def _max_uniform_offset_df(map_data: MapData, cc: np.ndarray, nn: np.ndarray,
+                                sg: float, clearance: float) -> float:
+        """Max uniform offset δ such that all cc[j] + δ*sg*nn[j] are safe."""
+        for d in np.linspace(0.0, 1.50, 16):
+            pts = cc + (sg * d) * nn
+            margins = FormationFeasibilityV2._margin_batch(map_data, pts, clearance)
+            if np.any(margins < -0.02):  # 2cm tolerance for distance-field discretisation
+                return max(0.0, d - 0.05)
+        return 1.50
+
+    def _compute_widths(
+        self, map_data: MapData, curve: np.ndarray, clearance: float,
+    ) -> tuple[float, float]:
+        K = len(curve)
+        nn = self._normals(curve); nn_lp = self._lowpass_normals(nn)
+        return (self._max_uniform_offset_df(map_data, curve, nn_lp, +1.0, clearance),
+                self._max_uniform_offset_df(map_data, curve, nn_lp, -1.0, clearance))
 
     @staticmethod
     def _check_envelope(formation: FormationSpec, δL: float, δR: float) -> bool:

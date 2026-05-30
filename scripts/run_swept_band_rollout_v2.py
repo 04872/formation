@@ -168,7 +168,7 @@ def build_pipeline(
         "map_data": map_data, "global_path": global_path,
         "preview": preview, "selection": selection,
         "trace": trace, "mpc_config": mpc_config,
-        "formations": formations,
+        "formations": formations, "_sim": simulator,
     }
 
 
@@ -252,6 +252,42 @@ def draw_preview(context: dict, output: Path):
     fig.savefig(output, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"  preview → {output}")
+
+
+# ── band‑recenter plot (v2 only) ─────────────────────────────────
+
+def draw_band_recenter(context: dict, output: Path):
+    trace = context["trace"]
+    meta = trace.metadata
+    feasi = getattr(context.get("_sim"), "_feasibility", None)
+    cr_list = getattr(feasi, "_band_recenter_history", []) if feasi else []
+    if not cr_list:
+        cr_list = meta.get("per_cycle_band_recenter", [])
+    if not cr_list:
+        print("  band_recenter → (no data, skip)")
+        return
+
+    map_data = context["map_data"]
+    selected = meta.get("selected_formations", [])
+    fig, ax = plt.subplots(figsize=(10, 8), constrained_layout=True)
+    ox, oy = map_data.origin_xy
+    w, h = map_data.width_m, map_data.height_m
+    ax.imshow(map_data.occupancy.astype(float), origin="lower", cmap="gray_r",
+              extent=[ox, ox + w, oy, oy + h], alpha=0.5)
+    ax.set_xlim(ox, ox + w); ax.set_ylim(oy, oy + h)
+    colors = plt.cm.tab20(np.linspace(0.05, 0.95, max(1, len(cr_list))))
+    for i, cr_pts in enumerate(cr_list):
+        if not cr_pts: continue
+        xs = [p[0] for p in cr_pts]; ys = [p[1] for p in cr_pts]
+        ax.plot(xs, ys, color=colors[i], linewidth=1.8, alpha=0.9,
+                linestyle="--", label=f"cycle {i+1} C^R [{selected[i] if i < len(selected) else ''}]")
+        # mark start
+        ax.plot(cr_pts[0][0], cr_pts[0][1], "o", color=colors[i], markersize=4)
+    ax.legend(fontsize=6, loc="upper right")
+    ax.set_title("band-recenter C^R per cycle")
+    fig.savefig(str(output), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  band_recenter → {output}")
 
 
 # ── feasibility centerline plot ──────────────────────────────────
@@ -510,6 +546,7 @@ def main():
     draw_trajectory(ctx, _out(args, "traj", "png"))
     draw_preview(ctx, _out(args, "preview", "png"))
     draw_feasibility_centerline(ctx, _out(args, "centerline", "png"))
+    draw_band_recenter(ctx, _out(args, "band_recenter", "png"))
     draw_swept_band(ctx, _out(args, "band", "png"))
     if not args.no_mp4:
         save_animation(ctx, _out(args, "rollout", "mp4"), fps=max(1, args.fps))
