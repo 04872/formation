@@ -153,8 +153,9 @@ def build_pipeline(
     selection.guide = square_guide
 
     # Inject swept‑band feasibility
-    from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
-    simulator._feasibility = FormationFeasibility(FeasibilityConfig(mode="swept_band_v2"))
+    from formation.formation_feasibility_v2 import FormationFeasibilityV2
+    from formation.formation_feasibility import FeasibilityConfig
+    simulator._feasibility = FormationFeasibilityV2(FeasibilityConfig(mode="swept_band_v2"))
     trace = simulator.simulate_full_path(
         initial_states, map_data, global_path, formations,
         preview_planner, selector, reference_builder,
