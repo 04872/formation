@@ -26,16 +26,47 @@ from formation.mpc_controller import query_distance_field
 from formation.types import FormationSpec, LocalPreviewPath, MapData
 
 
-def _make_temp_preview(pts_xy):
-    """Minimal LocalPreviewPath from a list of (x, y) tuples."""
-    n = len(pts_xy)
+def _make_preview_from_curve(pts_xy, source_mode: str = "v2_cr"):
+    """Build a LocalPreviewPath from a polyline using its own Frenet frame."""
+    pts = np.asarray(pts_xy, dtype=float)
+    n = len(pts)
+
+    arc = np.zeros(n, dtype=float)
+    if n >= 2:
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        arc[1:] = np.cumsum(seg)
+
+    tangents = np.zeros_like(pts)
+    for j in range(n):
+        if n == 0:
+            d = np.array([1.0, 0.0])
+        elif n == 1:
+            d = np.array([1.0, 0.0])
+        elif j == 0:
+            d = pts[1] - pts[0]
+        elif j == n - 1:
+            d = pts[-1] - pts[-2]
+        else:
+            d = pts[j + 1] - pts[j - 1]
+        dn = float(np.linalg.norm(d))
+        tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+
+    normals = np.column_stack((-tangents[:, 1], tangents[:, 0])) if n > 0 else np.zeros((0, 2), dtype=float)
+    normals_lp = normals.copy()
+    for j in range(n):
+        lo, hi = max(0, j - 1), min(n, j + 2)
+        avg = np.mean(normals[lo:hi], axis=0)
+        an = float(np.linalg.norm(avg))
+        if an > 1e-9:
+            normals_lp[j] = avg / an
+
     return LocalPreviewPath(
-        points_xy=pts_xy,
-        arc_lengths=[0.0] * n,
-        tangents_xy=[(1.0, 0.0)] * n,
-        normals_xy=[(0.0, 1.0)] * n,
+        points_xy=[(float(p[0]), float(p[1])) for p in pts],
+        arc_lengths=[float(s) for s in arc],
+        tangents_xy=[(float(t[0]), float(t[1])) for t in tangents],
+        normals_xy=[(float(nn[0]), float(nn[1])) for nn in normals_lp],
         curvatures=[0.0] * n,
-        source_mode="v2_temp",
+        source_mode=source_mode,
         is_safe=True,
         min_clearance=0.5,
     )
@@ -139,8 +170,8 @@ class FormationFeasibilityV2(FormationFeasibility):
         δL, δR = self._compute_widths(map_data, C_R, clearance)
         δ = self.config.embed_margin_m - self.config.feasibility_tol_m
 
-        C_R_pts = [(float(p[0]), float(p[1])) for p in C_R]
-        band_star = self._swept_builder.build(map_data, _make_temp_preview(C_R_pts), clearance)
+        preview_R = _make_preview_from_curve(C_R, source_mode="v2_cr")
+        band_star = self._swept_builder.build(map_data, preview_R, clearance)
 
         feasible = self._check_envelope(formation, δL, δR)
         if feasible:
@@ -179,8 +210,8 @@ class FormationFeasibilityV2(FormationFeasibility):
 
         # ── 2. compute widths and rebuild band from C_R ──────────
         δL, δR = self._compute_widths(map_data, C_R, clearance)
-        C_R_pts = [(float(p[0]), float(p[1])) for p in C_R]
-        band_star = self._swept_builder.build(map_data, _make_temp_preview(C_R_pts), clearance)
+        preview_R = _make_preview_from_curve(C_R, source_mode="v2_cr")
+        band_star = self._swept_builder.build(map_data, preview_R, clearance)
         self._v2_cache = {"C_star": C_R, "C_R": C_R, "band": band_star, "delta_L": δL, "delta_R": δR}
         δ = self.config.embed_margin_m - self.config.feasibility_tol_m
 
@@ -195,7 +226,9 @@ class FormationFeasibilityV2(FormationFeasibility):
         for fm in ordered:
             feasible = self._check_envelope(fm, δL, δR)
             if feasible:
-                feasible, _ = self._eval_slots(band_star, C_R, fm, δ)
+                ok_s, worst_s = self._eval_slots(band_star, C_R, fm, δ)
+                if not ok_s: print(f"    [eval fail] {fm.name}: envelope_ok slot_worst={worst_s:.3f} δL={δL:.3f} δR={δR:.3f}", flush=True)
+                feasible = ok_s
             results.append(self._build_swept_result(
                 map_data, fm.name, band_star, C_R, fm,
                 robot_radius, safety_margin, current_formation, current_states,

@@ -85,15 +85,16 @@ class ControllerReferenceBuilder:
                 positions_xy.append((wx, wy))
             if guide.switched and current_states is not None and len(current_states) > robot_index:
                 positions_xy[0] = (current_states[robot_index].x, current_states[robot_index].y)
+            heading_rads = self._build_heading_profile(positions_xy, dense_h)
             v_refs, omega_refs = self._build_reference_inputs(
-                positions_xy, dense_h, dt, nominal_speed,
+                positions_xy, heading_rads, dt, nominal_speed,
             )
             unclipped_v_refs.append(list(v_refs))
             unclipped_omega_refs.append(list(omega_refs))
 
             samples: list[RobotReferenceSample] = []
             for step_index, (pos_xy, h, alpha, v_ref, w_ref) in enumerate(
-                zip(positions_xy, dense_h, transition_alphas, v_refs, omega_refs)
+                zip(positions_xy, heading_rads, transition_alphas, v_refs, omega_refs)
             ):
                 c_v = min(max(v_ref, 0.0), controller_config.v_max)
                 c_w = min(max(w_ref, -controller_config.omega_max), controller_config.omega_max)
@@ -204,6 +205,29 @@ class ControllerReferenceBuilder:
             v_refs.append(linear_speed)
             omega_refs.append(angular_speed)
         return v_refs, omega_refs
+
+    def _build_heading_profile(self, positions_xy: list[Point2D], fallback_headings: list[float]) -> list[float]:
+        sample_count = len(positions_xy)
+        if sample_count <= 0:
+            return []
+        if sample_count == 1:
+            return [float(fallback_headings[0]) if fallback_headings else 0.0]
+
+        headings: list[float] = []
+        for step_index in range(sample_count):
+            source_index, target_index = self._difference_indices(step_index, sample_count)
+            dx = positions_xy[target_index][0] - positions_xy[source_index][0]
+            dy = positions_xy[target_index][1] - positions_xy[source_index][1]
+            if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+                if step_index > 0:
+                    headings.append(headings[-1])
+                elif fallback_headings:
+                    headings.append(float(fallback_headings[0]))
+                else:
+                    headings.append(0.0)
+            else:
+                headings.append(math.atan2(dy, dx))
+        return headings
 
     def _difference_indices(self, step_index: int, sample_count: int) -> tuple[int, int]:
         if sample_count <= 1:
