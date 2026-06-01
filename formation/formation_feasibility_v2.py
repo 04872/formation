@@ -24,6 +24,11 @@ from formation.formation_feasibility import (
 )
 from formation.mpc_controller import query_distance_field
 from formation.types import FormationSpec, LocalPreviewPath, MapData
+import osqp as _osqp
+from scipy import sparse as _sparse
+
+import osqp as _osqp
+from scipy import sparse as _sparse
 
 
 def _make_preview_from_curve(pts_xy, source_mode: str = "v2_cr"):
@@ -247,65 +252,62 @@ class FormationFeasibilityV2(FormationFeasibility):
         self, map_data: MapData, band: SweptBand, bezier: _CenterlineBezier,
         C_init: np.ndarray, clearance: float,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """QP micro‑loop: push curve toward wider side of band."""
-        try:
-            from scipy.optimize import minimize
-        except ImportError:
-            Q = bezier.initial_controls()
-            return Q, C_init
-
+        """QP micro‑loop: precomputed gradient + Bernstein basis + OSQP."""
         Q = bezier.initial_controls().copy()
         M = self.config.collocation_points
         n_free = len(bezier.free_indices)
         N_c = bezier.control_count
 
-        def _max_off(cc, nn, sg):
-            return self._max_uniform_offset_df(map_data, cc, nn, sg, clearance)
+        grad_x, grad_y = self._precompute_grad(map_data)
+        A_tensor = self._bernstein_basis(bezier, M)  # [M, 2, N_c, 2]
 
-        # pre‑compute z_prog, t_T once
         C_init_eval = bezier.evaluate(Q, M)
         d_end = C_init_eval[-1] - C_init_eval[-2]
         dn = float(np.linalg.norm(d_end))
         t_T = d_end / dn if dn > 1e-9 else np.array([1.0, 0.0])
         z_prog = C_init_eval[-1].copy()
 
+        w_m=10.0; w_W=2.0; w_bal=1.0; w_sm=0.5; w_prog=5.0
+        w_c=5.0; w_b=3.0; w_step=1.0
+        ρ=clearance; d_max=1.50; r_q=0.15; θ_max=0.6
+
+        # D2 matrix for control-point bi-Laplacian
+        D2 = np.zeros((N_c-4, N_c))
+        for c in range(2, N_c-2): D2[c-2, c-2:c+3] = [1, -4, 6, -4, 1]
+        D2f = D2[:, bezier.free_indices]
+        H_sm_block = w_sm * (D2f.T @ D2f)
+
+        # Flatten A for dq (free CPs only)
+        A_free = np.zeros((M, 2, n_free, 2))
+        for fi, ci in enumerate(bezier.free_indices):
+            A_free[:, :, fi, :] = A_tensor[:, :, ci, :]
+        A_flat = np.zeros((M*2, n_free*2))
+        for j in range(M):
+            for dim in range(2):
+                for fi in range(n_free):
+                    for pd in range(2):
+                        A_flat[j*2+dim, fi*2+pd] = A_free[j, dim, fi, pd]
+
         for k in range(5):
             C = bezier.evaluate(Q, M)
-            nn = self._normals(C)
-            nn_lp = self._lowpass_normals(nn, window=3)
-            δL_cur = _max_off(C, nn_lp, +1.0); δR_cur = _max_off(C, nn_lp, -1.0)
-            print(f"    [QP k={k}] δL={δL_cur:.3f} δR={δR_cur:.3f} μ={(δL_cur-δR_cur)/2:.4f}", flush=True)
+            nn = self._normals(C); nn_lp = self._lowpass_normals(nn, window=3)
+            δL_cur = self._max_uniform_offset_batch(map_data, C, nn_lp, +1.0, clearance)
+            δR_cur = self._max_uniform_offset_batch(map_data, C, nn_lp, -1.0, clearance)
+            μ = (δL_cur - δR_cur) / 2.0
+            print(f"    [QP k={k}] δL={δL_cur:.3f} δR={δR_cur:.3f} μ={μ:.4f}", flush=True)
 
-            # ── linearisation points + EDT gradients (batch) ─────
-            e = 0.02; bif = self._bilinear_batch
-            all_pts = np.zeros((9*M, 2))
-            x_L = np.zeros((M, 2)); x_R = np.zeros((M, 2))
-            for j in range(M):
-                cx, cy = C[j,0], C[j,1]
-                pLx = cx + δL_cur*nn_lp[j,0]; pLy = cy + δL_cur*nn_lp[j,1]
-                pRx = cx - δR_cur*nn_lp[j,0]; pRy = cy - δR_cur*nn_lp[j,1]
-                all_pts[j*9+0]=[pLx,pLy]; all_pts[j*9+1]=[pLx+e,pLy]; all_pts[j*9+2]=[pLx,pLy+e]
-                all_pts[j*9+3]=[pRx,pRy]; all_pts[j*9+4]=[pRx+e,pRy]; all_pts[j*9+5]=[pRx,pRy+e]
-                all_pts[j*9+6]=[cx,cy];   all_pts[j*9+7]=[cx+e,cy];   all_pts[j*9+8]=[cx,cy+e]
-                x_L[j]=[pLx,pLy]; x_R[j]=[pRx,pRy]
-            vals = bif(map_data, all_pts)
-            D_L=np.zeros(M); g_L=np.zeros((M,2)); D_R=np.zeros(M); g_R=np.zeros((M,2))
-            D_c=np.zeros(M); g_c=np.zeros((M,2))
-            for j in range(M):
-                D_L[j]=vals[j*9+0]; g_L[j,0]=(vals[j*9+1]-D_L[j])/e; g_L[j,1]=(vals[j*9+2]-D_L[j])/e
-                D_R[j]=vals[j*9+3]; g_R[j,0]=(vals[j*9+4]-D_R[j])/e; g_R[j,1]=(vals[j*9+5]-D_R[j])/e
-                D_c[j]=vals[j*9+6]; g_c[j,0]=(vals[j*9+7]-D_c[j])/e; g_c[j,1]=(vals[j*9+8]-D_c[j])/e
+            # Batch query D and gradient at linearisation points
+            x_L = C + δL_cur * nn_lp; x_R = C - δR_cur * nn_lp
+            all_pts = np.vstack([x_L, x_R, C])
+            D_all = self._bilinear_batch(map_data, all_pts)
+            gx_all = self._bilinear_query(map_data, grad_x, all_pts)
+            gy_all = self._bilinear_query(map_data, grad_y, all_pts)
+            D_L = D_all[0:M]; D_R = D_all[M:2*M]; D_c = D_all[2*M:3*M]
+            g_L = np.column_stack([gx_all[0:M], gy_all[0:M]])
+            g_R = np.column_stack([gx_all[M:2*M], gy_all[M:2*M]])
+            g_c = np.column_stack([gx_all[2*M:3*M], gy_all[2*M:3*M]])
 
-            # Jacobian
-            J = self._bezier_jacobian(bezier, Q, M)
-            A = np.zeros((M*2, n_free*2))
-            for j in range(M):
-                for dim in range(2):
-                    for fi in range(n_free):
-                        for pd in range(2):
-                            A[j*2+dim, fi*2+pd] = J[j, dim, fi, pd]
-
-            # start/end directions
+            # Start/end
             if M >= 2:
                 e0 = C[1]-C[0]; e0n=float(np.linalg.norm(e0))
                 e0 = e0/e0n if e0n>1e-9 else np.array([1.,0.])
@@ -315,120 +317,136 @@ class FormationFeasibilityV2(FormationFeasibility):
             else:
                 e0=e_end=np.array([1.,0.]); n0=np.array([0.,1.])
 
-            # ── weights ──────────────────────────────────────────
-            w_m=10.0; w_W=2.0; w_bal=1.0; w_sm=0.5; w_prog=5.0
-            w_c=5.0; w_b=3.0; w_step=1.0
-            ρ=clearance; d_max=1.50; r_q=0.15; r_lin=0.12; l_min=0.1; θ_max=0.6
+            # ── Assemble sparse QP ──────────────────────────────
+            n_vars = n_free*2 + 3 + 3  # dq, dL, dR, m, xi_L, xi_R, xi_c
+            i_dL=n_free*2; i_dR=n_free*2+1; i_m=n_free*2+2
+            i_xiL=n_free*2+3; i_xiR=n_free*2+4; i_xic=n_free*2+5
 
-            # vars: dq[n_free*2], d_L, d_R, m, xi_L[M], xi_R[M], xi_c[M]
-            n_vars = n_free*2 + 3 + 3*M
-            Q_free = np.zeros((n_free, 2))
-            for fi, ci in enumerate(bezier.free_indices): Q_free[fi] = Q[ci]
+            from scipy.sparse import lil_matrix, csc_matrix
+            H_sp = lil_matrix((n_vars, n_vars))
+            # CP smoothness + step: H_sm_block ⊗ I₂
+            for fi in range(n_free):
+                for fj in range(n_free):
+                    v = H_sm_block[fi, fj]
+                    if abs(v) > 1e-15:
+                        H_sp[fi*2,   fj*2]   += v
+                        H_sp[fi*2+1, fj*2+1] += v
+                    if fi == fj:
+                        H_sp[fi*2,   fi*2]   += w_step
+                        H_sp[fi*2+1, fi*2+1] += w_step
+            # dL, dR, m: w_bal*(dL-dR)² = 2w_bal*dL² + 2w_bal*dR² - 4w_bal*dL*dR
+            H_sp[i_dL, i_dL] += 2*w_bal; H_sp[i_dR, i_dR] += 2*w_bal
+            H_sp[i_dL, i_dR] -= 2*w_bal; H_sp[i_dR, i_dL] -= 2*w_bal
+            # Slack penalties
+            H_sp[i_xiL, i_xiL] += 2*w_b; H_sp[i_xiR, i_xiR] += 2*w_b
+            H_sp[i_xic, i_xic] += 2*w_c
 
-            def _obj(x):
-                dq=x[:n_free*2].reshape(n_free,2)
-                dLv=x[n_free*2]; dRv=x[n_free*2+1]; mv=x[n_free*2+2]
-                xi_L=x[n_free*2+3:n_free*2+3+M]
-                xi_R=x[n_free*2+3+M:n_free*2+3+2*M]
-                xi_c=x[n_free*2+3+2*M:]
-                dq_full=np.zeros((N_c,2))
-                for fi,ci in enumerate(bezier.free_indices): dq_full[ci]=dq[fi]
-                Qp=Q.copy()
-                for fi,ci in enumerate(bezier.free_indices): Qp[ci]+=dq[fi]
-                J_sm=sum(float(np.sum((Qp[c-2]-4*Qp[c-1]+6*Qp[c]-4*Qp[c+1]+Qp[c+2])**2))
-                         for c in range(2,N_c-2))
-                dC=(A@dq.ravel()).reshape(M,2)
-                C_new=C+dC
-                J_prog=float(np.dot(C_new[-1]-z_prog,t_T)**2)
-                J_step=float(np.sum(dq**2))
-                return (-w_m*mv - w_W*(dLv+dRv) + w_bal*(dLv-dRv)**2
-                        + w_sm*J_sm + w_prog*J_prog + w_step*J_step
-                        + w_c*float(np.sum(xi_c**2))
-                        + w_b*float(np.sum(xi_L**2)+np.sum(xi_R**2)))
+            # progress term: w_prog * |t_T·(C[-1]+A_last·dq - z_prog)|²
+            A_last = A_flat[-2:].T  # [n_free*2, 2]
+            tA = A_last @ t_T  # [n_free*2]
+            for ii in range(n_free*2):
+                for jj in range(n_free*2):
+                    vv = 2*w_prog * tA[ii] * tA[jj]
+                    if abs(vv) > 1e-15: H_sp[ii, jj] += vv
 
-            def _constraints(x):
-                dq=x[:n_free*2].reshape(n_free,2)
-                dLv=x[n_free*2]; dRv=x[n_free*2+1]; mv=x[n_free*2+2]
-                xi_L=x[n_free*2+3:n_free*2+3+M]
-                xi_R=x[n_free*2+3+M:n_free*2+3+2*M]
-                xi_c=x[n_free*2+3+2*M:]
-                Qp=Q.copy()
-                for fi,ci in enumerate(bezier.free_indices): Qp[ci]+=dq[fi]
-                dC=(A@dq.ravel()).reshape(M,2)
-                C_new=C+dC
-                vals=[]
-                vals.append(dLv-mv); vals.append(dRv-mv)
-                vals.append(d_max-dLv); vals.append(d_max-dRv)
-                # width delta bounds
-                vals.append(dLv-(δL_cur-0.30)); vals.append((δL_cur+0.30)-dLv)
-                vals.append(dRv-(δR_cur-0.30)); vals.append((δR_cur+0.30)-dRv)
-                # left/right boundary linearised
-                for j in range(M):
-                    pred=D_L[j]+float(np.dot(g_L[j],C_new[j]+dLv*nn_lp[j]-x_L[j]))
-                    vals.append(pred-ρ+xi_L[j])
-                for j in range(M):
-                    pred=D_R[j]+float(np.dot(g_R[j],C_new[j]-dRv*nn_lp[j]-x_R[j]))
-                    vals.append(pred-ρ+xi_R[j])
-                # centreline safety
-                for j in range(M):
-                    pred=D_c[j]+float(np.dot(g_c[j],C_new[j]-C[j]))
-                    vals.append(pred-ρ+xi_c[j])
-                # trust region on dC and dQ
-                for j in range(M):
-                    vals.append(r_lin**2-float(np.sum(dC[j]**2)))
-                for fi in range(n_free):
-                    vals.append(r_q**2-float(np.sum(dq[fi]**2)))
-                # overall progress
-                vals.append(float(np.dot(C_new[-1]-C_init_eval[0],t_T))-l_min)
-                # start derivative: q₁ ahead of q₀, limit lateral
-                if n_free>=1:
-                    q1_new=Qp[1]; q0=Qp[0]
-                    vals.append(float(np.dot(q1_new-q0,e0))-0.01)
-                    vals.append(θ_max*abs(float(np.dot(q1_new-q0,e0))+0.01)
-                                -abs(float(np.dot(q1_new-q0,n0))))
-                # end derivative
-                if n_free>=1:
-                    vals.append(float(np.dot(Qp[-1]-Qp[-2],e_end))-0.02)
-                return np.array(vals)
+            f_vec = np.zeros(n_vars)
+            f_vec[i_dL] = -w_W; f_vec[i_dR] = -w_W; f_vec[i_m] = -w_m
+            f_vec[:n_free*2] += 2*w_prog * float(np.dot(C[-1]-z_prog, t_T)) * tA
 
-            bnd = ([(None,None)]*(n_free*2)
-                   +[(0.0,d_max)]*2+[(0.0,None)]
-                   +[(0.0,None)]*(3*M))
-            x0=np.zeros(n_vars)
-            x0[n_free*2]=δL_cur; x0[n_free*2+1]=δR_cur
-            x0[n_free*2+2]=min(δL_cur,δR_cur)
-            # warm start: push toward wider side
-            shift_init=min(0.5*abs((δL_cur-δR_cur)/2),0.06)
-            direction=np.sign((δL_cur-δR_cur)/2)
-            dc_d=np.zeros(M*2)
+            H_sp = csc_matrix(H_sp)
+
+            # ── Constraints ─────────────────────────────────────
+            Gl, Gu, Gv = [], [], []
+            lb, ub = [], []
+            def _add(ci, vi, coeff, lo, hi):
+                if abs(coeff)>1e-15: Gl.append(ci); Gv.append(coeff); Gu.append(vi)
+                return lo, hi
+
+            ci = 0
+            # m ≤ dL, m ≤ dR, bounds
+            lo,_=_add(ci,i_dL,1.,0,1e9); _,_=_add(ci,i_m,-1.,0,1e9); lb.append(lo);ub.append(1e9);ci+=1
+            lo,_=_add(ci,i_dR,1.,0,1e9); _,_=_add(ci,i_m,-1.,0,1e9); lb.append(lo);ub.append(1e9);ci+=1
+            lo,_=_add(ci,i_dL,1.,0,d_max); lb.append(0);ub.append(d_max);ci+=1
+            lo,_=_add(ci,i_dR,1.,0,d_max); lb.append(0);ub.append(d_max);ci+=1
+            lo,_=_add(ci,i_dL,1.,δL_cur-0.30,δL_cur+0.30);lb.append(δL_cur-0.30);ub.append(δL_cur+0.30);ci+=1
+            lo,_=_add(ci,i_dR,1.,δR_cur-0.30,δR_cur+0.30);lb.append(δR_cur-0.30);ub.append(δR_cur+0.30);ci+=1
+
             for j in range(M):
-                chi=1.0 if j>0 else 0.0
-                dc_d[j*2]=direction*shift_init*chi*nn_lp[j,0]
-                dc_d[j*2+1]=direction*shift_init*chi*nn_lp[j,1]
-            x0[:n_free*2]=A.T@dc_d
+                Adq_j = A_free[j]  # [2, n_free, 2]
+                A_j_flat = np.zeros((2, n_free*2))
+                for fi in range(n_free):
+                    A_j_flat[0, fi*2] = Adq_j[0, fi, 0]; A_j_flat[0, fi*2+1] = Adq_j[0, fi, 1]
+                    A_j_flat[1, fi*2] = Adq_j[1, fi, 0]; A_j_flat[1, fi*2+1] = Adq_j[1, fi, 1]
+                # Left boundary
+                coeff_L = g_L[j,0]*A_j_flat[0] + g_L[j,1]*A_j_flat[1]
+                c_dL = float(np.dot(g_L[j], nn_lp[j]))
+                rhs_L = ρ + float(np.dot(g_L[j], x_L[j])) - D_L[j] - float(np.dot(g_L[j], C[j]))
+                lo=0; hi=0
+                for ii in range(n_free*2): lo,_=_add(ci,ii,coeff_L[ii],0,0)
+                lo,_=_add(ci,i_dL,c_dL,0,0); lo,_=_add(ci,i_xiL,1.,0,0)
+                lb.append(rhs_L); ub.append(1e9); ci+=1
+                # Right boundary
+                coeff_R = g_R[j,0]*A_j_flat[0] + g_R[j,1]*A_j_flat[1]
+                c_dR = -float(np.dot(g_R[j], nn_lp[j]))
+                rhs_R = ρ + float(np.dot(g_R[j], x_R[j])) - D_R[j] - float(np.dot(g_R[j], C[j]))
+                for ii in range(n_free*2): lo,_=_add(ci,ii,coeff_R[ii],0,0)
+                lo,_=_add(ci,i_dR,c_dR,0,0); lo,_=_add(ci,i_xiR,1.,0,0)
+                lb.append(rhs_R); ub.append(1e9); ci+=1
+                # Centreline
+                coeff_c = g_c[j,0]*A_j_flat[0] + g_c[j,1]*A_j_flat[1]
+                rhs_c = ρ - D_c[j]
+                for ii in range(n_free*2): lo,_=_add(ci,ii,coeff_c[ii],0,0)
+                lo,_=_add(ci,i_xic,1.,0,0)
+                lb.append(rhs_c); ub.append(1e9); ci+=1
 
-            res=minimize(_obj,x0,method="SLSQP",bounds=bnd,
-                        constraints={"type":"ineq","fun":_constraints},
-                        options={"maxiter":100,"ftol":1e-6})
-            dq=res.x[:n_free*2].reshape(n_free,2)
-            for fi,ci in enumerate(bezier.free_indices): Q[ci]+=dq[fi]
-            Q[0]=C_init_eval[0].copy()
-            print(f"    [SLSQP] ok={res.success} dL*={res.x[n_free*2]:.3f} dR*={res.x[n_free*2+1]:.3f} |dq|={float(np.linalg.norm(dq)):.3f}", flush=True)
+            # Trust region on dq
+            for fi in range(n_free):
+                lo,_=_add(ci,fi*2,1.,-r_q,r_q); lo,_=_add(ci,fi*2+1,1.,-r_q,r_q)
+                lb.append(-r_q); ub.append(r_q); ci+=1
+                lb.append(-r_q); ub.append(r_q); ci+=1
 
-        # ── post‑QP real verification ────────────────────────────
-        C_final=bezier.evaluate(Q,M)
-        C_i=bezier.evaluate(bezier.initial_controls(),M)
-        shift=float(np.max(np.linalg.norm(C_final-C_i,axis=1)))
-        nn_f=self._normals(C_final); nn_flp=self._lowpass_normals(nn_f)
-        δL_f=self._max_uniform_offset_df(map_data,C_final,nn_flp,+1.0,clearance)
-        δR_f=self._max_uniform_offset_df(map_data,C_final,nn_flp,-1.0,clearance)
-        mg=self._margin_batch(map_data,C_final,clearance)
-        min_m=float(np.min(mg)); n_bad=int(np.sum(mg<-0.02))
-        has_rev=any(float(np.dot(C_final[j+1]-C_final[j],C_final[1]-C_final[0]))<-0.005 for j in range(M-1)) if M>=2 else False
-        st="WARN" if(min_m<-0.02 or has_rev) else "OK"
+            # Start/end derivative
+            if n_free >= 1:
+                lo,_=_add(ci,0,e0[0],0.01,1e9); lo,_=_add(ci,1,e0[1],0.01,1e9)
+                lb.append(0.01); ub.append(1e9); ci+=1
+                lo,_=_add(ci,0,n0[0]-e0[0]*θ_max,-1e9,1e9)
+                lo,_=_add(ci,1,n0[1]-e0[1]*θ_max,-1e9,1e9)
+                lb.append(-θ_max*0.01); ub.append(1e9); ci+=1
+
+            # Slacks ≥ 0
+            lo,_=_add(ci,i_xiL,1.,0,1e9); lb.append(0); ub.append(1e9); ci+=1
+            lo,_=_add(ci,i_xiR,1.,0,1e9); lb.append(0); ub.append(1e9); ci+=1
+            lo,_=_add(ci,i_xic,1.,0,1e9); lb.append(0); ub.append(1e9); ci+=1
+
+            G_sp = csc_matrix((Gv, (Gl, Gu)), shape=(ci, n_vars))
+            l_arr = np.array(lb); u_arr = np.array(ub)
+
+            # ── OSQP ────────────────────────────────────────────
+            prob = _osqp.OSQP()
+            prob.setup(H_sp, f_vec, G_sp, l_arr, u_arr,
+                       eps_abs=1e-5, eps_rel=1e-5, max_iter=200,
+                       verbose=False)
+            res = prob.solve()
+            if res.info.status_val in (1, 2):
+                dq = res.x[:n_free*2].reshape(n_free, 2)
+                for fi, ci in enumerate(bezier.free_indices): Q[ci] += dq[fi]
+                Q[0] = C_init_eval[0].copy()
+            dq_n = float(np.linalg.norm(res.x[:n_free*2])) if res.x is not None else 0
+            print(f"    [OSQP] ok={res.info.status_val in (1,2)} dL*={res.x[i_dL]:.3f} dR*={res.x[i_dR]:.3f} |dq|={dq_n:.3f}", flush=True)
+
+        C_final = bezier.evaluate(Q, M)
+        C_i = bezier.evaluate(bezier.initial_controls(), M)
+        shift = float(np.max(np.linalg.norm(C_final - C_i, axis=1)))
+        nn_f = self._normals(C_final); nn_flp = self._lowpass_normals(nn_f)
+        δL_f = self._max_uniform_offset_batch(map_data, C_final, nn_flp, +1.0, clearance)
+        δR_f = self._max_uniform_offset_batch(map_data, C_final, nn_flp, -1.0, clearance)
+        mg = self._margin_batch(map_data, C_final, clearance)
+        min_m = float(np.min(mg)); n_bad = int(np.sum(mg < -0.02))
+        has_rev = any(float(np.dot(C_final[j+1]-C_final[j], C_final[1]-C_final[0])) < -0.005 for j in range(M-1)) if M >= 2 else False
+        st = "WARN" if (min_m < -0.02 or has_rev) else "OK"
         print(f"  [v2] band_recenter max_shift={shift:.3f}m final δL={δL_f:.3f} δR={δR_f:.3f} "
-              f"min_m={min_m:.3f} n_bad={n_bad} rev={has_rev} [{st}]",flush=True)
-        return Q,C_final
+              f"min_m={min_m:.3f} n_bad={n_bad} rev={has_rev} [{st}]", flush=True)
+        return Q, C_final
 
     # ═══════════════════════════════════════════════════════════════
     #  final polish QP
@@ -554,19 +572,82 @@ class FormationFeasibilityV2(FormationFeasibility):
     #  helpers
     # ═══════════════════════════════════════════════════════════════
 
-    def _bezier_jacobian(
-        self, bezier: _CenterlineBezier, Q: np.ndarray, M: int, eps: float = 0.005,
-    ) -> np.ndarray:
-        """Numerical Jacobian ∂C/∂Q[free]: [M × 2 × n_free × 2]."""
-        n_free = len(bezier.free_indices)
-        C0 = bezier.evaluate(Q, M)
-        J = np.zeros((M, 2, n_free, 2))
-        for fi, ci in enumerate(bezier.free_indices):
+
+    @staticmethod
+    def _precompute_grad(map_data: MapData):
+        """Precompute distance-field gradient grids."""
+        df = map_data.distance_field
+        r = map_data.resolution
+        rows, cols = df.shape
+        gx = np.zeros_like(df); gy = np.zeros_like(df)
+        gx[:, 1:-1] = (df[:, 2:] - df[:, :-2]) / (2 * r)
+        gy[1:-1, :] = (df[2:, :] - df[:-2, :]) / (2 * r)
+        return gx, gy
+
+    @staticmethod
+    def _bilinear_query(map_data: MapData, grid: np.ndarray, pts: np.ndarray):
+        """Bilinear interpolation on an arbitrary grid."""
+        ox, oy = map_data.origin_xy; res = map_data.resolution
+        gx_v = (pts[:, 0] - ox) / res - 0.5; gy_v = (pts[:, 1] - oy) / res - 0.5
+        x0 = np.floor(gx_v).astype(int); y0 = np.floor(gy_v).astype(int)
+        x1 = np.minimum(x0 + 1, map_data.cols - 1); y1 = np.minimum(y0 + 1, map_data.rows - 1)
+        wx = gx_v - x0; wy = gy_v - y0
+        x0c = np.clip(x0, 0, map_data.cols - 1); y0c = np.clip(y0, 0, map_data.rows - 1)
+        x1c = np.clip(x1, 0, map_data.cols - 1); y1c = np.clip(y1, 0, map_data.rows - 1)
+        v00 = grid[y0c, x0c]; v10 = grid[y0c, x1c]; v01 = grid[y1c, x0c]; v11 = grid[y1c, x1c]
+        return (1 - wy) * (1 - wx) * v00 + (1 - wy) * wx * v10 + wy * (1 - wx) * v01 + wy * wx * v11
+
+    @staticmethod
+    def _bernstein_basis(bezier: _CenterlineBezier, M: int):
+        """Precompute Bernstein basis A: C(s_j; Q) = A_j @ Q for all j."""
+        n_cp = bezier.control_count
+        Q0 = bezier.initial_controls()
+        A_full = np.zeros((M * 2, n_cp * 2))
+        eps = 0.005
+        for ci in range(n_cp):
             for d in range(2):
-                Qp = Q.copy(); Qp[ci, d] += eps
+                Qp = Q0.copy(); Qp[ci, d] += eps
                 Cp = bezier.evaluate(Qp, M)
-                J[:, :, fi, d] = (Cp - C0) / eps
-        return J
+                C0 = bezier.evaluate(Q0, M)
+                # Each CP affects C_j via ∂C_j/∂q_ci. Build full matrix.
+                for j in range(M):
+                    A_full[j*2 + 0, ci*2 + d] += (Cp[j, 0] - C0[j, 0]) / eps
+                    A_full[j*2 + 0, ci*2 + 0:ci*2+2] = 0  # reset — only [ci,d] column
+        # Proper build: one column at a time
+        A_full = np.zeros((M * 2, n_cp * 2))
+        for ci in range(n_cp):
+            for d in range(2):
+                Qp = Q0.copy(); Qp[ci, d] += eps
+                Cp = bezier.evaluate(Qp, M)
+                C0_val = bezier.evaluate(Q0, M)
+                for j in range(M):
+                    A_full[j*2 + d, ci*2 + d] = (Cp[j, d] - C0_val[j, d]) / eps
+        # Compact form: [M, 2, n_cp, 2]
+        A_tensor = np.zeros((M, 2, n_cp, 2))
+        for ci in range(n_cp):
+            for d in range(2):
+                Qp = Q0.copy(); Qp[ci, d] += eps
+                Cp = bezier.evaluate(Qp, M)
+                C0_val = bezier.evaluate(Q0, M)
+                A_tensor[:, :, ci, d] = (Cp - C0_val) / eps
+        return A_tensor
+
+    @staticmethod
+    def _max_uniform_offset_batch(map_data: MapData, cc: np.ndarray, nn: np.ndarray,
+                                   sg: float, clearance: float, n_steps: int = 16):
+        """Vectorized max uniform offset: batch all d values into one query."""
+        ds = np.linspace(0.0, 1.50, n_steps)
+        M = len(cc)
+        # Build [n_steps, M, 2] then reshape
+        pts_all = cc[None, :, :] + ds[:, None, None] * (sg * nn)[None, :, :]
+        pts_flat = pts_all.reshape(-1, 2)
+        margins = FormationFeasibilityV2._margin_batch(map_data, pts_flat, clearance)
+        margins_2d = margins.reshape(n_steps, M)
+        unsafe = np.any(margins_2d < -0.02, axis=1)
+        idx = np.argmax(unsafe)
+        if idx == 0 or not unsafe[idx]:
+            return ds[-1]
+        return max(0.0, ds[idx - 1])
 
     @staticmethod
     def _normals(cc):
