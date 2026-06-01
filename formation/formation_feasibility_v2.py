@@ -175,7 +175,7 @@ class FormationFeasibilityV2(FormationFeasibility):
 
         feasible = self._check_envelope(formation, δL, δR)
         if feasible:
-            feasible, _ = self._eval_slots_extended(map_data, C_R, formation, clearance, δ)
+            feasible, _ = self._eval_slots_rigid(map_data, C_R, formation, clearance, δ)
 
         return self._build_swept_result(
             map_data, formation.name, band_star, C_R, formation,
@@ -226,7 +226,7 @@ class FormationFeasibilityV2(FormationFeasibility):
         for fm in ordered:
             feasible = self._check_envelope(fm, δL, δR)
             if feasible:
-                ok_s, worst_s = self._eval_slots_extended(map_data, C_R, fm, clearance, δ)
+                ok_s, worst_s = self._eval_slots_rigid(map_data, C_R, fm, clearance, δ)
                 if not ok_s: print(f"    [eval fail] {fm.name}: envelope_ok slot_worst={worst_s:.3f} δL={δL:.3f} δR={δR:.3f}", flush=True)
                 feasible = ok_s
             results.append(self._build_swept_result(
@@ -643,26 +643,20 @@ class FormationFeasibilityV2(FormationFeasibility):
                 self._max_uniform_offset_df(map_data, curve, nn_lp, -1.0, clearance))
 
     @staticmethod
-    def _eval_slots_extended(
+    @staticmethod
+    def _eval_slots_rigid(
         map_data: MapData, centre_curve: np.ndarray,
         formation: FormationSpec, clearance: float, margin_req: float,
-        delta_ext: float = 0.10,
     ) -> tuple[bool, float]:
-        r"""Slot validation with prefix/suffix tangent caps.
+        r"""Rigid-body slot validation.
 
-        centre_curve  c(τ), τ ∈ [0, 1]  is the robot **motion** domain.
-        For footprint evaluation, extend the domain by max longitudinal
-        slot offsets so that slots beyond the curve endpoints are checked
-        against tangent‑line extensions instead of being skipped.
+        q_i(s_j) = C_R(s_j) + ℓ_i·t(s_j) + b_i·n(s_j)
+
+        where t, n are the centreline tangent/normal at s_j.
         """
         n = len(centre_curve)
         if n < 2:
             return False, float("-inf")
-
-        total_len = float(sum(
-            np.linalg.norm(centre_curve[i + 1] - centre_curve[i])
-            for i in range(n - 1)
-        )) or 1.0
 
         tangents = np.zeros((n, 2), dtype=float)
         for j in range(n):
@@ -672,52 +666,19 @@ class FormationFeasibilityV2(FormationFeasibility):
             dn = float(np.linalg.norm(d))
             tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
 
-        # extension lengths from formation longitudinal extents
-        max_front = max(0.0, max(s[0] for s in formation.slots)) + delta_ext
-        max_rear  = max(0.0, -min(s[0] for s in formation.slots)) + delta_ext
-
-        def _eval_at(sigma: float) -> np.ndarray:
-            """World position on the extended centreline at arc-length sigma."""
-            if sigma < 0.0:
-                return centre_curve[0] + sigma * (-tangents[0])
-            if sigma > total_len:
-                return centre_curve[-1] + (sigma - total_len) * tangents[-1]
-            # normal interpolation within [0, total_len]
-            jf = sigma / max(total_len, 1e-9) * (n - 1)
-            j0 = max(0, min(int(jf), n - 2))
-            j1 = j0 + 1
-            frac = jf - j0
-            return centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
-
-        def _tangent_at(sigma: float) -> np.ndarray:
-            if sigma <= 0.0:
-                return tangents[0].copy()
-            if sigma >= total_len:
-                return tangents[-1].copy()
-            jf = sigma / max(total_len, 1e-9) * (n - 1)
-            j0 = max(0, min(int(jf), n - 2))
-            j1 = j0 + 1
-            frac = jf - j0
-            t = tangents[j0] + frac * (tangents[j1] - tangents[j0])
-            tn = float(np.linalg.norm(t))
-            return t / tn if tn > 1e-9 else np.array([1.0, 0.0])
-
-        # sample s_j evenly on motion domain [0, total_len]
         positions: list[tuple[float, float]] = []
         for j in range(n):
-            s_j = j / max(n - 1, 1) * total_len
+            cx, cy = centre_curve[j, 0], centre_curve[j, 1]
+            tx, ty = tangents[j, 0], tangents[j, 1]
+            nx, ny = -ty, tx  # normal (rotate tangent by +90°)
             for slot in formation.slots:
-                sigma = s_j + slot[0]
-                if sigma < -max_rear or sigma > total_len + max_front:
-                    continue
-                c_eff = _eval_at(sigma)
-                t_eff = _tangent_at(sigma)
-                n_eff = np.array([-t_eff[1], t_eff[0]])
-                slot_world = c_eff + slot[1] * n_eff
-                positions.append((float(slot_world[0]), float(slot_world[1])))
+                ell, b = slot[0], slot[1]
+                qx = cx + ell * tx + b * nx
+                qy = cy + ell * ty + b * ny
+                positions.append((float(qx), float(qy)))
 
         if not positions:
-            return True, 0.0  # no slots to check (should not happen)
+            return True, 0.0
 
         margins = FormationFeasibilityV2._margin_batch(
             map_data, np.asarray(positions, dtype=float), clearance)

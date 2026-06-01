@@ -67,16 +67,16 @@ class SCurveCorridorConfig(BaseMapConfig):
 class ObstacleClusterConfig(BaseMapConfig):
     rectangular_obstacles: list[tuple[Point2D, float, float]] = field(
         default_factory=lambda: [
-            ((-1.8, 1.4), 1.0, 0.8),
-            ((-0.6, -1.5), 1.2, 0.9),
-            ((1.2, 1.1), 0.9, 1.0),
-            ((2.1, -0.9), 0.8, 0.8),
+            ((-2.0, 1.5), 0.50, 0.50),
+            ((-0.3, -1.6), 0.50, 0.50),
+            ((1.5, 1.2), 0.50, 0.50),
+            ((2.5, -0.7), 0.50, 0.50),
         ]
     )
     circular_obstacles: list[tuple[Point2D, float]] = field(
         default_factory=lambda: [
-            ((-0.2, 0.7), 0.35),
-            ((0.8, -0.2), 0.30),
+            ((-0.5, 0.3), 0.15),
+            ((0.9, -0.2), 0.15),
         ]
     )
 
