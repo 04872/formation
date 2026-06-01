@@ -125,6 +125,7 @@ def build_pipeline(
     )
     reference_builder = ControllerReferenceBuilder(mpc_config)
     controller = DistributedFormationMPC(mpc_config)
+    controller.set_consensus_enabled(False)
     # 默认在回放脚本中关闭 CBF 约束项以便排查数值问题
     controller.set_cbf_enabled(False)
     simulator = MultiRobotSimulator(controller)

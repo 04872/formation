@@ -255,6 +255,7 @@ class MPCWeights:
     relative_position: float = 10.0
     velocity_consensus: float = 4.0
     progress_sync: float = 2.0
+    progress_rate_sync: float = 0.0
     terminal_position: float = 80.0
 
 
