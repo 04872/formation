@@ -201,8 +201,6 @@ class DistributedFormationMPC:
                 eps_value = np.asarray(solution.value(solver.variables["eps_cbf"]), dtype=float)
                 if eps_value.ndim == 1:
                     eps_value = eps_value.reshape(len(neighbor_predictions), self.config.horizon_steps)
-                if eps_value.size > 0:
-                    print(f"    [cbf slack] max={float(np.max(eps_value)):.4f} mean={float(np.mean(eps_value)):.4f}", flush=True)
             absolutes = np.zeros_like(dx_value)
             absolutes[:, 0] = np.array([state.x, state.y, state.yaw], dtype=float)
             for k in range(1, dx_value.shape[1]):
