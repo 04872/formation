@@ -83,8 +83,12 @@ class ControllerReferenceBuilder:
                 wx = cx + ch * lx - sh * ly
                 wy = cy + sh * lx + ch * ly
                 positions_xy.append((wx, wy))
-            if guide.switched and current_states is not None and len(current_states) > robot_index:
-                positions_xy[0] = (current_states[robot_index].x, current_states[robot_index].y)
+            # Do not overwrite the reference first sample with the current
+            # robot state here. Let the MPC absorb the initial tracking error
+            # via its dx0 term (e_0 = p_now - p_ref0). Overwriting p_ref0 and
+            # also applying MPC blending can distort the intended reference
+            # shape (double-editing); the simulator/selector should prevent
+            # choosing formations whose step-0 slots are unreachable.
             heading_rads = self._build_heading_profile(positions_xy, dense_h)
             v_refs, omega_refs = self._build_reference_inputs(
                 positions_xy, heading_rads, dt, nominal_speed,

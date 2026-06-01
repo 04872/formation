@@ -125,6 +125,8 @@ def build_pipeline(
     )
     reference_builder = ControllerReferenceBuilder(mpc_config)
     controller = DistributedFormationMPC(mpc_config)
+    # 默认在回放脚本中关闭 CBF 约束项以便排查数值问题
+    controller.set_cbf_enabled(False)
     simulator = MultiRobotSimulator(controller)
 
     if map_type == "narrowing_corridor":
@@ -365,6 +367,94 @@ def draw_feasibility_centerline(context: dict, output: Path):
     print(f"  centerline → {output}")
 
 
+# ── per-cycle robot reference trajectories ───────────────────────
+
+def draw_cycle_robot_references(context: dict, output: Path):
+    """Plot one fixed robot's reference trajectory for each replanning cycle."""
+    trace = context["trace"]
+    map_data = context["map_data"]
+    reference_history = list(trace.reference_history)
+    robot_index = 0
+
+    if not reference_history:
+        print("  robot_refs → (no data, skip)")
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 8), constrained_layout=True)
+    extent = map_extent(map_data)
+    ax.imshow(
+        map_data.occupancy.astype(float),
+        origin="lower",
+        extent=extent,
+        cmap="gray_r",
+        interpolation="nearest",
+        alpha=0.95,
+    )
+
+    cycle_colors = plt.cm.tab20(np.linspace(0.05, 0.95, max(1, len(reference_history))))
+    for cycle_index, controller_reference in enumerate(reference_history):
+        cycle_color = cycle_colors[cycle_index % len(cycle_colors)]
+        if robot_index >= len(controller_reference.robot_trajectories):
+            continue
+        trajectory = controller_reference.robot_trajectories[robot_index]
+        if not trajectory.samples:
+            continue
+
+        pts = [sample.position_xy for sample in trajectory.samples]
+        ax.plot(
+            [p[0] for p in pts],
+            [p[1] for p in pts],
+            color=cycle_color,
+            linewidth=2.0,
+            alpha=0.85,
+            linestyle="-",
+            zorder=3,
+        )
+        ax.scatter(
+            pts[0][0],
+            pts[0][1],
+            color=cycle_color,
+            s=24,
+            marker="s",
+            alpha=0.7,
+            zorder=4,
+        )
+        ax.scatter(
+            pts[-1][0],
+            pts[-1][1],
+            color=cycle_color,
+            s=18,
+            marker="o",
+            alpha=0.8,
+            zorder=4,
+        )
+
+        # place cycle label at the box start (first sample) with a small offset
+        start_pt = trajectory.samples[0].position_xy
+        ax.text(
+            start_pt[0] + 0.02,
+            start_pt[1] + 0.02,
+            f"c{cycle_index + 1}",
+            color=cycle_color,
+            fontsize=8,
+            ha="left",
+            va="bottom",
+            zorder=5,
+        )
+
+    ax.scatter(*map_data.goal_xy, color="tab:purple", s=80, marker="*", label="goal", zorder=6)
+    ax.scatter(*map_data.start_xy, color="tab:green", s=60, marker="o", label="start", zorder=6)
+    ax.set_title(f"Robot {robot_index} Reference Trajectories per Cycle — {map_data.name}")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_aspect("equal")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  robot_refs → {output}")
+
+
 # ── SweptBand visualisation (NEW) ─────────────────────────────────
 
 def _make_temp_preview_path(pts_xy, map_data) -> LocalPreviewPath:
@@ -545,7 +635,7 @@ def main():
 
     draw_trajectory(ctx, _out(args, "traj", "png"))
     draw_preview(ctx, _out(args, "preview", "png"))
-    draw_feasibility_centerline(ctx, _out(args, "centerline", "png"))
+    draw_cycle_robot_references(ctx, _out(args, "robot_refs", "png"))
     draw_band_recenter(ctx, _out(args, "band_recenter", "png"))
     draw_swept_band(ctx, _out(args, "band", "png"))
     if not args.no_mp4:

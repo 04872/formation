@@ -48,6 +48,18 @@ class DistributedFormationMPC:
         self.config = config or MPCConfig()
         self._solver_cache: dict[tuple[int, int, int, int], _SolverCacheEntry] = {}
         self._cache_lock = __import__("threading").Lock()
+        # runtime switch to enable/disable formation-consensus terms
+        self._consensus_enabled = True
+        # runtime switch to enable/disable CBF constraints and slack penalty
+        self._cbf_enabled = True
+
+    def set_consensus_enabled(self, enabled: bool) -> None:
+        """Enable or disable the tracking‑error consensus terms (temporary runtime switch)."""
+        self._consensus_enabled = bool(enabled)
+
+    def set_cbf_enabled(self, enabled: bool) -> None:
+        """Enable or disable the pairwise CBF constraints (temporary runtime switch)."""
+        self._cbf_enabled = bool(enabled)
 
     def solve_all(
         self,
@@ -200,6 +212,8 @@ class DistributedFormationMPC:
                 eps_value = np.asarray(solution.value(solver.variables["eps_cbf"]), dtype=float)
                 if eps_value.ndim == 1:
                     eps_value = eps_value.reshape(len(neighbor_predictions), self.config.horizon_steps)
+                if eps_value.size > 0:
+                    print(f"    [cbf slack] max={float(np.max(eps_value)):.4f} mean={float(np.mean(eps_value)):.4f}", flush=True)
             absolutes = np.zeros_like(dx_value)
             absolutes[:, 0] = np.array([state.x, state.y, state.yaw], dtype=float)
             for k in range(1, dx_value.shape[1]):
@@ -302,12 +316,14 @@ class DistributedFormationMPC:
         H = matrix.shape[1]
         if H <= 1:
             return matrix
-        blend_steps = min(H, max(3, H // 2))
+        # Do not blend positions over a long window — only apply a very
+        # short yaw blend to avoid abrupt heading jumps. Position blending
+        # plus replacing p_ref0 causes double-editing; prefer leaving
+        # positions intact so MPC sees the true initial error via dx0.
         orig = matrix[:, :H].copy()
-        for k in range(blend_steps):
-            alpha = (k + 1.0) / blend_steps
-            matrix[0, k] = state.x + alpha * (orig[0, k] - state.x)
-            matrix[1, k] = state.y + alpha * (orig[1, k] - state.y)
+        yaw_blend_steps = min(3, H)
+        for k in range(yaw_blend_steps):
+            alpha = (k + 1.0) / yaw_blend_steps
             th_target = state.yaw + wrap_to_pi(orig[2, k] - state.yaw)
             matrix[2, k] = state.yaw + alpha * wrap_to_pi(th_target - state.yaw)
         for k in range(H - 1):
@@ -381,6 +397,7 @@ class DistributedFormationMPC:
         dx0 = opti.parameter(3)
         reference = opti.parameter(5, H + 1)
         reference_tangents = opti.parameter(2, H + 1)
+        previous_command = opti.parameter(2)
         neighbor_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
         neighbor_reference_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
         neighbor_prediction_speeds = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
@@ -415,17 +432,25 @@ class DistributedFormationMPC:
             if k > 0:
                 objective += w.input_smooth * ca.sumsqr(du[:, k] - du[:, k - 1])
 
+        # Penalize the first commanded input relative to the current executed command.
+        objective += w.initial_input_smooth * (
+            (reference[3, 0] + du[0, 0] - previous_command[0]) ** 2
+            + (reference[4, 0] + du[1, 0] - previous_command[1]) ** 2
+        )
+
         # ── tracking-error consensus (keep formation shape under mismatch) ────
-        for k in range(H):
-            if (
-                neighbor_positions is not None
-                and neighbor_reference_positions is not None
-                and neighbor_prediction_speeds is not None
-                and neighbor_reference_speeds is not None
-                and neighbor_reference_tangents is not None
-                and neighbor_count > 0
-                and w.relative_position > 0.0
-            ):
+        if self._consensus_enabled:
+            for k in range(H):
+                if (
+                    neighbor_positions is None
+                    or neighbor_reference_positions is None
+                    or neighbor_prediction_speeds is None
+                    or neighbor_reference_speeds is None
+                    or neighbor_reference_tangents is None
+                    or neighbor_count <= 0
+                ):
+                    continue
+
                 e_ix = dx[0, k]
                 e_iy = dx[1, k]
                 slot_progress_i = e_ix * reference_tangents[0, k] + e_iy * reference_tangents[1, k]
@@ -435,20 +460,23 @@ class DistributedFormationMPC:
                     ny = neighbor_positions[2 * n + 1, k]
                     ref_dx = reference[0, k] - neighbor_reference_positions[2 * n, k]
                     ref_dy = reference[1, k] - neighbor_reference_positions[2 * n + 1, k]
-                    err_x = (reference[0, k] + e_ix - nx) - ref_dx
-                    err_y = (reference[1, k] + e_iy - ny) - ref_dy
-                    objective += w.relative_position * (err_x**2 + err_y**2)
+                    if w.relative_position > 0.0:
+                        err_x = (reference[0, k] + e_ix - nx) - ref_dx
+                        err_y = (reference[1, k] + e_iy - ny) - ref_dy
+                        objective += w.relative_position * (err_x**2 + err_y**2)
 
-                    neigh_err_x = nx - neighbor_reference_positions[2 * n, k]
-                    neigh_err_y = ny - neighbor_reference_positions[2 * n + 1, k]
-                    neigh_progress = (
-                        neigh_err_x * neighbor_reference_tangents[2 * n, k]
-                        + neigh_err_y * neighbor_reference_tangents[2 * n + 1, k]
-                    )
-                    objective += w.progress_sync * (slot_progress_i - neigh_progress)**2
+                    if w.progress_sync > 0.0:
+                        neigh_err_x = nx - neighbor_reference_positions[2 * n, k]
+                        neigh_err_y = ny - neighbor_reference_positions[2 * n + 1, k]
+                        neigh_progress = (
+                            neigh_err_x * neighbor_reference_tangents[2 * n, k]
+                            + neigh_err_y * neighbor_reference_tangents[2 * n + 1, k]
+                        )
+                        objective += w.progress_sync * (slot_progress_i - neigh_progress)**2
 
-                    neigh_speed_error = neighbor_prediction_speeds[n, k] - neighbor_reference_speeds[n, k]
-                    objective += w.velocity_consensus * (speed_error_i - neigh_speed_error)**2
+                    if w.velocity_consensus > 0.0:
+                        neigh_speed_error = neighbor_prediction_speeds[n, k] - neighbor_reference_speeds[n, k]
+                        objective += w.velocity_consensus * (speed_error_i - neigh_speed_error)**2
 
         objective += w.terminal_position * (dx[0, H]**2 + dx[1, H]**2)
 
@@ -457,18 +485,17 @@ class DistributedFormationMPC:
         cbf_n_vx = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
         cbf_n_vy = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
         R_sq = safe_dist ** 2
+        eps_cbf = None
 
         # Replace VO sqrt-based CBF with discrete linearized disk-center CBF per-step.
         # Linearize at reference point (dx=0, du=0) so constraints are affine in dx,du.
-        if neighbor_positions is not None and neighbor_count > 0 and cbf_n_vx is not None:
+        if self._cbf_enabled and neighbor_positions is not None and neighbor_count > 0 and cbf_n_vx is not None:
             eps_cbf = opti.variable(neighbor_count, H)
             # hyperparameters: gamma for class-K term, eps_max upper bound for slack
             gamma = 1.0
-            eps_max = 0.5
             for k in range(H):
                 for n in range(neighbor_count):
                     opti.subject_to(eps_cbf[n, k] >= 0.0)
-                    opti.subject_to(eps_cbf[n, k] <= eps_max)
                     # parameters at linearization point (reference)
                     nx = neighbor_positions[2 * n, k]
                     ny = neighbor_positions[2 * n + 1, k]
@@ -512,7 +539,7 @@ class DistributedFormationMPC:
                     )
             # penalize slack with configured neighbor_slack weight (squared)
             objective += w.neighbor_slack * ca.sumsqr(eps_cbf)
-        eps_cbf_out = eps_cbf if (neighbor_count > 0 and cbf_n_vx is not None) else None
+        eps_cbf_out = eps_cbf if eps_cbf is not None else None
 
         opti.minimize(objective)
         opti.solver(
@@ -533,6 +560,7 @@ class DistributedFormationMPC:
                 "dx0": dx0,
                 "reference": reference,
                 "reference_tangents": reference_tangents,
+                "previous_command": previous_command,
                 "neighbor_positions": neighbor_positions,
                 "neighbor_reference_positions": neighbor_reference_positions,
                 "neighbor_prediction_speeds": neighbor_prediction_speeds,
@@ -557,6 +585,8 @@ class DistributedFormationMPC:
         ], dtype=float)
         solver.opti.set_value(solver.parameters["dx0"], dx0)
         solver.opti.set_value(solver.parameters["reference"], reference_matrix)
+        if solver.parameters.get("previous_command") is not None:
+            solver.opti.set_value(solver.parameters["previous_command"], np.array([state.v, state.omega], dtype=float))
         if solver.parameters.get("reference_tangents") is not None:
             solver.opti.set_value(solver.parameters["reference_tangents"], reference_tangents)
         if solver.parameters.get("neighbor_positions") is not None:
@@ -580,13 +610,40 @@ class DistributedFormationMPC:
         reference_matrix: np.ndarray,
     ) -> None:
         H = self.config.horizon_steps
-        solver.opti.set_initial(solver.variables["dx"], np.zeros((3, H + 1), dtype=float))
-        solver.opti.set_initial(solver.variables["du"], np.zeros((2, H), dtype=float))
-        if solver.variables.get("eps_n") is not None:
-            solver.opti.set_initial(
-                solver.variables["eps_n"],
-                np.zeros((solver.variables["eps_n"].shape[0], H + 1), dtype=float),
+        dt = self.config.dt
+        dx_init = np.zeros((3, H + 1), dtype=float)
+        dx_init[:, 0] = np.array([
+            state.x - reference_matrix[0, 0],
+            state.y - reference_matrix[1, 0],
+            wrap_to_pi(state.yaw - reference_matrix[2, 0]),
+        ], dtype=float)
+        du_init = np.zeros((2, H), dtype=float)
+        for k in range(H):
+            th = reference_matrix[2, k]
+            v_ref = reference_matrix[3, k]
+            dx_init[0, k + 1] = (
+                dx_init[0, k]
+                - dt * v_ref * math.sin(th) * dx_init[2, k]
+                + dt * math.cos(th) * du_init[0, k]
             )
+            dx_init[1, k + 1] = (
+                dx_init[1, k]
+                + dt * v_ref * math.cos(th) * dx_init[2, k]
+                + dt * math.sin(th) * du_init[0, k]
+            )
+            dx_init[2, k + 1] = dx_init[2, k] + dt * du_init[1, k]
+        solver.opti.set_initial(solver.variables["dx"], dx_init)
+        solver.opti.set_initial(solver.variables["du"], du_init)
+        eps_cbf = solver.variables.get("eps_cbf")
+        if eps_cbf is not None:
+            solver.opti.set_initial(
+                eps_cbf,
+                np.zeros((eps_cbf.shape[0], eps_cbf.shape[1]), dtype=float),
+            )
+        try:
+            solver.opti.set_initial(solver.opti.lam_g, 0)
+        except Exception:
+            pass
 
     def _vo_barrier(
         self,
