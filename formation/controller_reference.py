@@ -40,21 +40,20 @@ class ControllerReferenceBuilder:
             )
 
         dt = controller_config.dt
-        ds_max = controller_config.v_max * dt  # max arc per MPC step
 
-        # ── Subsample keyframes (skip resample if input is already sparse) ──
-        if sample_count <= 8:
-            kf_xy = [sample.center_xy for sample in guide.guide_samples]
-            kf_h = [sample.heading_rad for sample in guide.guide_samples]
-        else:
-            stride = max(1, sample_count // 8)
-            kf_indices = list(range(0, sample_count, stride))
-            if kf_indices[-1] != sample_count - 1:
-                kf_indices.append(sample_count - 1)
-            kf_xy = [guide.guide_samples[i].center_xy for i in kf_indices]
-            kf_h = [guide.guide_samples[i].heading_rad for i in kf_indices]
+        # ── Strictly use guide centreline (no subsample, no Hermite) ──
+        c_xy = np.array([[s.center_xy[0] for s in guide.guide_samples],
+                          [s.center_xy[1] for s in guide.guide_samples]])
+        N = c_xy.shape[1]
+        # centreline heading from finite differences
+        psi = np.zeros(N, dtype=float)
+        for k in range(N):
+            if k == 0:       d = c_xy[:, 1] - c_xy[:, 0]
+            elif k == N - 1: d = c_xy[:, -1] - c_xy[:, -2]
+            else:            d = c_xy[:, k + 1] - c_xy[:, k - 1]
+            dn = float(np.linalg.norm(d))
+            psi[k] = math.atan2(d[1], d[0]) if dn > 1e-9 else 0.0
 
-        # Allocate slot local positions (same for every step)
         robot_count = len(guide.guide_samples[0].robot_points_xy)
         slots_local = [
             (float(sl[0]), float(sl[1])) for sl in
@@ -62,68 +61,55 @@ class ControllerReferenceBuilder:
                 [(0.0, 0.0)] * robot_count if robot_count else [])
         ]
 
-        # ── Hermite resample (only when subsampled) ──
-        if sample_count <= 8:
-            dense_xy = np.array([[p[0] for p in kf_xy], [p[1] for p in kf_xy]])
-            dense_h = np.array(kf_h)
-        else:
-            dense_xy, dense_h = self._hermite_resample(kf_xy, kf_h, ds_max)
-
-        transition_alphas = self._normalize_transition_alphas(guide, dense_xy.shape[1])
+        transition_alphas = self._normalize_transition_alphas(guide, N)
         robot_trajectories: list[RobotReferenceTrajectory] = []
-        unclipped_v_refs: list[list[float]] = []
-        unclipped_omega_refs: list[list[float]] = []
-        clipped_v_count, clipped_omega_count = 0, 0
 
         for robot_index in range(robot_count):
             lx, ly = slots_local[robot_index]
             positions_xy: list[Point2D] = []
-            for cx, cy, h in zip(dense_xy[0], dense_xy[1], dense_h):
-                ch, sh = math.cos(h), math.sin(h)
-                wx = cx + ch * lx - sh * ly
-                wy = cy + sh * lx + ch * ly
+            for k in range(N):
+                ch, sh = math.cos(psi[k]), math.sin(psi[k])
+                wx = c_xy[0, k] + ch * lx - sh * ly
+                wy = c_xy[1, k] + sh * lx + ch * ly
                 positions_xy.append((wx, wy))
-            # Do not overwrite the reference first sample with the current
-            # robot state here. Let the MPC absorb the initial tracking error
-            # via its dx0 term (e_0 = p_now - p_ref0). Overwriting p_ref0 and
-            # also applying MPC blending can distort the intended reference
-            # shape (double-editing); the simulator/selector should prevent
-            # choosing formations whose step-0 slots are unreachable.
-            heading_rads = self._build_heading_profile(positions_xy, dense_h)
-            v_refs, omega_refs = self._build_reference_inputs(
-                positions_xy, heading_rads, dt, nominal_speed,
-            )
-            unclipped_v_refs.append(list(v_refs))
-            unclipped_omega_refs.append(list(omega_refs))
+
+            # v_ref: projection of slot displacement onto formation heading
+            # ω_ref: formation heading rate (same for all robots)
+            v_refs: list[float] = []
+            omega_refs: list[float] = []
+            for k in range(N):
+                if k < N - 1:
+                    dq = np.array(positions_xy[k + 1]) - np.array(positions_xy[k])
+                    fwd = np.array([math.cos(psi[k]), math.sin(psi[k])])
+                    v_raw = float(np.dot(dq, fwd)) / max(dt, 1e-9)
+                    v_refs.append(max(0.0, min(controller_config.v_max, v_raw)))
+                    dw = wrap_to_pi(psi[k + 1] - psi[k])
+                    omega_refs.append(max(-controller_config.omega_max,
+                                         min(controller_config.omega_max, dw / max(dt, 1e-9))))
+                else:
+                    v_refs.append(v_refs[-1] if v_refs else 0.0)
+                    omega_refs.append(omega_refs[-1] if omega_refs else 0.0)
 
             samples: list[RobotReferenceSample] = []
-            for step_index, (pos_xy, h, alpha, v_ref, w_ref) in enumerate(
-                zip(positions_xy, heading_rads, transition_alphas, v_refs, omega_refs)
+            for k, (pos_xy, alpha, v_ref, w_ref) in enumerate(
+                zip(positions_xy, transition_alphas, v_refs, omega_refs)
             ):
-                c_v = min(max(v_ref, 0.0), controller_config.v_max)
-                c_w = min(max(w_ref, -controller_config.omega_max), controller_config.omega_max)
-                clipped_v_count += int(abs(c_v - v_ref) > 1e-12)
-                clipped_omega_count += int(abs(c_w - w_ref) > 1e-12)
                 samples.append(RobotReferenceSample(
-                    position_xy=pos_xy, yaw=h, v_ref=c_v, omega_ref=c_w,
-                    alpha=alpha, t=step_index * dt,
+                    position_xy=pos_xy, yaw=float(psi[k]),
+                    v_ref=v_ref, omega_ref=w_ref,
+                    alpha=alpha, t=k * dt,
                 ))
             robot_trajectories.append(RobotReferenceTrajectory(robot_index=robot_index, samples=samples))
 
-        center_points_xy = [(float(dense_xy[0, i]), float(dense_xy[1, i])) for i in range(dense_xy.shape[1])]
-        center_heading_rads = [float(h) for h in dense_h]
+        center_points_xy = [(float(c_xy[0, i]), float(c_xy[1, i])) for i in range(N)]
+        center_heading_rads = [float(h) for h in psi]
 
         metadata = dict(guide.metadata)
         metadata.update({
             "switched": guide.switched, "nominal_speed": nominal_speed,
-            "unclipped_v_refs": unclipped_v_refs,
-            "unclipped_omega_refs": unclipped_omega_refs,
-            "clipped_v_count": clipped_v_count,
-            "clipped_omega_count": clipped_omega_count,
             "terminal_center_heading_rad": center_heading_rads[-1],
             "robot_slots_local": slots_local,
             "terminal_center_xy": center_points_xy[-1],
-            "hermite_keyframe_count": len(kf_xy),
         })
         return FormationControllerReference(
             formation_name=guide.formation_name,
