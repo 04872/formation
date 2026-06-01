@@ -150,81 +150,36 @@ class DistributedFormationMPC:
         solver = self._get_solver(map_data, len(neighbor_predictions), solver_slot)
         padded_ref = own_reference.window(0, self.config.horizon_steps)
         reference_matrix = self._build_reference_matrix(state, padded_ref)
-        H = self.config.horizon_steps; dt = self.config.dt
-        # ── heading reference: unwrap aligned to current yaw ─────
-        ref_yaws = reference_matrix[2, :].copy()
-        uw = np.zeros(H + 1, dtype=float)
-        uw[0] = state.yaw + wrap_to_pi(ref_yaws[0] - state.yaw)
-        for k in range(1, H + 1):
-            uw[k] = uw[k - 1] + wrap_to_pi(ref_yaws[k] - ref_yaws[k - 1])
-        # ── nominal rollout from current state ───────────────────
-        nominal_state = np.zeros((3, H + 1), dtype=float)
-        nominal_state[:, 0] = np.array([state.x, state.y, state.yaw])
-        nominal_input = reference_matrix[3:5, :H].copy()
-        nominal_input[0] = np.clip(nominal_input[0], 0.0, self.config.v_max)
-        nominal_input[1] = np.clip(nominal_input[1], -self.config.omega_max, self.config.omega_max)
-        for k in range(H):
-            th = nominal_state[2, k]; v = nominal_input[0, k]; om = nominal_input[1, k]
-            nominal_state[0, k + 1] = nominal_state[0, k] + dt * v * math.cos(th)
-            nominal_state[1, k + 1] = nominal_state[1, k] + dt * v * math.sin(th)
-            nominal_state[2, k + 1] = wrap_to_pi(nominal_state[2, k] + dt * om)
-        # unwrap nominal heading
-        for k in range(1, H + 1):
-            d = nominal_state[2, k] - nominal_state[2, k - 1]
-            nominal_state[2, k] = nominal_state[2, k - 1] + wrap_to_pi(d)
-        # ── Jacobians (column‑major flatten for CasADi) ───────────
-        A_mat = np.zeros((9, H), dtype=float)
-        B_mat = np.zeros((6, H), dtype=float)
-        c_vec = np.zeros((3, H), dtype=float)
-        for k in range(H):
-            th = nominal_state[2, k]; v = nominal_input[0, k]; om = nominal_input[1, k]
-            A_k = np.array([[1.,0.,-dt*v*math.sin(th)], [0.,1.,dt*v*math.cos(th)], [0.,0.,1.]])
-            B_k = np.array([[dt*math.cos(th),0.],[dt*math.sin(th),0.],[0.,dt]])
-            f_bar = np.array([nominal_state[0,k]+dt*v*math.cos(th),
-                              nominal_state[1,k]+dt*v*math.sin(th),
-                              nominal_state[2,k]+dt*om])
-            c_k = f_bar - A_k @ nominal_state[:, k] - B_k @ nominal_input[:, k]
-            A_mat[:, k] = A_k.reshape(-1, order="F")
-            B_mat[:, k] = B_k.reshape(-1, order="F")
-            c_vec[:, k] = c_k
-        ref_tangents = self._build_tangent_matrix(reference_matrix[:2, :])
-        # ── neighbors ────────────────────────────────────────────
-        neigh_pos = self._build_neighbor_position_matrix(neighbor_predictions)
-        if neighbor_reference_positions is None: neighbor_reference_positions = neigh_pos
-        if neighbor_reference_speeds is None: neighbor_reference_speeds = self._build_neighbor_speed_matrix(neighbor_predictions)
-        neigh_ref_tan = self._build_tangent_matrix(neighbor_reference_positions)
-        neigh_pred_spd = self._build_neighbor_speed_matrix(neighbor_predictions)
-        # ── CBF: linearise at nominal ────────────────────────────
+        self._unwrap_reference_heading_in_place(reference_matrix, state.yaw)
+        reference_tangents = self._build_tangent_matrix(reference_matrix[:2, :])
+        neighbor_positions = self._build_neighbor_position_matrix(neighbor_predictions)
+        if neighbor_reference_positions is None:
+            neighbor_reference_positions = neighbor_positions
+        if neighbor_reference_speeds is None:
+            neighbor_reference_speeds = self._build_neighbor_speed_matrix(neighbor_predictions)
+        neighbor_reference_tangents = self._build_tangent_matrix(neighbor_reference_positions)
+        neighbor_prediction_speeds = self._build_neighbor_speed_matrix(neighbor_predictions)
+
+        H = self.config.horizon_steps
         safe_dist = 2.0 * self.config.robot_radius + self.config.inter_robot_margin
-        ds_sq = safe_dist**2; nc = len(neighbor_predictions)
-        cbf_hbar   = np.zeros((nc, H)); cbf_grad   = np.zeros((2*nc, H))
-        cbf_hbar_n = np.zeros((nc, H)); cbf_grad_n = np.zeros((2*nc, H))
-        for k in range(H):
-            nb_nom = nominal_state[:2, k]; nb_nom1 = nominal_state[:2, k + 1]
-            for n in range(nc):
-                pj_k  = neigh_pos[2*n:2*n+2, k]
-                pj_k1 = neigh_pos[2*n:2*n+2, k + 1]
-                r_k  = nb_nom - pj_k;  r_k1 = nb_nom1 - pj_k1
-                nr_k  = float(np.linalg.norm(r_k)); nr_k1 = float(np.linalg.norm(r_k1))
-                cbf_hbar[n,k]   = float(np.sum(r_k**2))
-                cbf_hbar_n[n,k] = float(np.sum(r_k1**2))
-                # protect against near-zero gradient when robots are close
-                fallback = np.array([1.0, 0.0])
-                if nr_k < 0.05:
-                    cbf_grad[2*n:2*n+2,k] = 2.0 * fallback
-                else:
-                    cbf_grad[2*n:2*n+2,k] = 2.0 * r_k
-                if nr_k1 < 0.05:
-                    cbf_grad_n[2*n:2*n+2,k] = 2.0 * fallback
-                else:
-                    cbf_grad_n[2*n:2*n+2,k] = 2.0 * r_k1
+        cbf_rbar_next = self._build_cbf_linearization_vectors(
+            reference_matrix,
+            neighbor_positions,
+            safe_dist,
+        )
         self._set_parameter_values(
-            solver, state, reference_matrix, uw, ref_tangents,
-            nominal_state, nominal_input, A_mat, B_mat, c_vec,
-            neigh_pos, neighbor_reference_positions,
-            neigh_pred_spd, neighbor_reference_speeds, neigh_ref_tan,
-            cbf_hbar, cbf_grad, cbf_hbar_n, cbf_grad_n)
-        self._set_initial_guess(solver, nominal_state, nominal_input)
+            solver,
+            state,
+            reference_matrix,
+            reference_tangents,
+            neighbor_positions,
+            neighbor_reference_positions,
+            neighbor_prediction_speeds,
+            neighbor_reference_speeds,
+            neighbor_reference_tangents,
+            cbf_rbar_next,
+        )
+        self._set_initial_guess(solver, state, reference_matrix)
         with DistributedFormationMPC._stdout_lock:
             old_fd = os.dup(1)
             devnull = os.open(os.devnull, os.O_WRONLY)
@@ -239,8 +194,8 @@ class DistributedFormationMPC:
                 os.close(old_fd)
 
         if solution is not None:
-            x_value = np.asarray(solution.value(solver.variables["X"]), dtype=float)
-            u_value = np.asarray(solution.value(solver.variables["U"]), dtype=float)
+            dx_value = np.asarray(solution.value(solver.variables["dx"]), dtype=float)
+            du_value = np.asarray(solution.value(solver.variables["du"]), dtype=float)
             eps_value = np.zeros((len(neighbor_predictions), self.config.horizon_steps + 1), dtype=float)
             if solver.variables.get("eps_cbf") is not None:
                 eps_value = np.asarray(solution.value(solver.variables["eps_cbf"]), dtype=float)
@@ -248,23 +203,25 @@ class DistributedFormationMPC:
                     eps_value = eps_value.reshape(len(neighbor_predictions), self.config.horizon_steps)
                 if eps_value.size > 0:
                     print(f"    [cbf slack] max={float(np.max(eps_value)):.4f} mean={float(np.mean(eps_value)):.4f}", flush=True)
-            # nonlinear rollout from solved U
-            dt_v = self.config.dt
-            absolutes = np.zeros((3, x_value.shape[1]), dtype=float)
+            absolutes = np.zeros_like(dx_value)
             absolutes[:, 0] = np.array([state.x, state.y, state.yaw], dtype=float)
-            for k in range(u_value.shape[1]):
-                vk = float(u_value[0, k]); wk = float(u_value[1, k])
-                absolutes[0, k + 1] = absolutes[0, k] + dt_v * vk * math.cos(absolutes[2, k])
-                absolutes[1, k + 1] = absolutes[1, k] + dt_v * vk * math.sin(absolutes[2, k])
-                absolutes[2, k + 1] = wrap_to_pi(absolutes[2, k] + dt_v * wk)
+            for k in range(1, dx_value.shape[1]):
+                ref_v = reference_matrix[3, k - 1]
+                ref_w = reference_matrix[4, k - 1]
+                dt = self.config.dt
+                v_k = max(0.0, ref_v + du_value[0, k - 1])
+                w_k = ref_w + du_value[1, k - 1]
+                absolutes[0, k] = absolutes[0, k - 1] + dt * v_k * math.cos(absolutes[2, k - 1])
+                absolutes[1, k] = absolutes[1, k - 1] + dt * v_k * math.sin(absolutes[2, k - 1])
+                absolutes[2, k] = wrap_to_pi(absolutes[2, k - 1] + dt * w_k)
             positions_xy = [(float(absolutes[0, k]), float(absolutes[1, k])) for k in range(absolutes.shape[1])]
             yaw_rads = [float(wrap_to_pi(absolutes[2, k])) for k in range(absolutes.shape[1])]
             commands = [
                 ControlCommand(
-                    v=float(max(0.0, min(self.config.v_max, u_value[0, k]))),
-                    omega=float(max(-self.config.omega_max, min(self.config.omega_max, u_value[1, k]))),
+                    v=float(max(0.0, min(self.config.v_max, reference_matrix[3, k] + du_value[0, k]))),
+                    omega=float(max(-self.config.omega_max, min(self.config.omega_max, reference_matrix[4, k] + du_value[1, k]))),
                 )
-                for k in range(u_value.shape[1])
+                for k in range(du_value.shape[1])
             ]
             neighbor_slacks = [
                 [float(eps_value[n, k]) for n in range(eps_value.shape[0])]
@@ -333,6 +290,63 @@ class DistributedFormationMPC:
             return max(1, min(self.config.parallel_workers, robot_count))
         cpu_count = os.cpu_count() or 1
         return max(1, min(cpu_count, robot_count))
+
+    @staticmethod
+    def _unwrap_reference_heading_in_place(reference_matrix: np.ndarray, current_yaw: float) -> None:
+        """Put reference yaw on the same continuous branch as the current yaw.
+
+        The MPC optimizes heading error in a linear error coordinate. Keeping the
+        reference yaw unwrapped avoids artificial jumps at +/-pi.
+        """
+        if reference_matrix.shape[1] == 0:
+            return
+        reference_matrix[2, 0] = current_yaw + wrap_to_pi(reference_matrix[2, 0] - current_yaw)
+        for k in range(1, reference_matrix.shape[1]):
+            reference_matrix[2, k] = reference_matrix[2, k - 1] + wrap_to_pi(
+                reference_matrix[2, k] - reference_matrix[2, k - 1]
+            )
+
+    def _build_cbf_linearization_vectors(
+        self,
+        reference_matrix: np.ndarray,
+        neighbor_positions: np.ndarray,
+        safe_dist: float,
+    ) -> np.ndarray:
+        """Build next-step distance-CBF linearization vectors.
+
+        Variables are error coordinates, so the absolute predicted position is
+        p_i,k = p_ref_i,k + dx_i,k. For the convexified distance constraint, we
+        linearize ||p_i,k+1 - p_j,k+1||^2 at p_ref_i,k+1.
+        """
+        H = self.config.horizon_steps
+        neighbor_count = neighbor_positions.shape[0] // 2
+        rbar = np.zeros((2 * neighbor_count, H), dtype=float)
+        if neighbor_count == 0:
+            return rbar
+
+        # Avoid a zero linearization normal when a reference slot coincides with
+        # a neighbor prediction. The exact direction is not important in this
+        # degenerate case; it only provides a stable separating normal for the
+        # slackened affine constraint.
+        min_norm = max(0.05, 0.5 * safe_dist)
+        for n in range(neighbor_count):
+            for k in range(H):
+                ref_next = reference_matrix[:2, k + 1]
+                neigh_next = neighbor_positions[2 * n : 2 * n + 2, k + 1]
+                vec = ref_next - neigh_next
+                norm = float(np.linalg.norm(vec))
+                if norm < min_norm:
+                    # Prefer the current-step relative direction if available.
+                    ref_now = reference_matrix[:2, k]
+                    neigh_now = neighbor_positions[2 * n : 2 * n + 2, k]
+                    fallback = ref_now - neigh_now
+                    fallback_norm = float(np.linalg.norm(fallback))
+                    if fallback_norm < 1e-9:
+                        fallback = np.array([1.0, 0.0], dtype=float)
+                        fallback_norm = 1.0
+                    vec = fallback / fallback_norm * min_norm
+                rbar[2 * n : 2 * n + 2, k] = vec
+        return rbar
 
     def _build_reference_matrix(self, state: RobotState, own_reference: RobotReferenceTrajectory) -> np.ndarray:
         matrix = np.asarray(
@@ -419,201 +433,246 @@ class DistributedFormationMPC:
     def _build_solver(self, neighbor_count: int) -> _SolverCacheEntry:
         ca = _require_casadi()
         opti = ca.Opti()
-        H = self.config.horizon_steps; dt = self.config.dt; w = self.config.weights
+        H = self.config.horizon_steps
+        dt = self.config.dt
+        w = self.config.weights
 
-        X = opti.variable(3, H + 1)
-        U = opti.variable(2, H)
+        # Error-state MPC variables:
+        #   dx[:, k] = x[:, k] - x_ref[:, k]
+        #   du[:, k] = u[:, k] - u_ref[:, k]
+        dx = opti.variable(3, H + 1)
+        du = opti.variable(2, H)
 
-        state0       = opti.parameter(3)
-        reference_pos = opti.parameter(2, H + 1)        # tracking target position
-        ref_thetas_uw = opti.parameter(H + 1)            # unwrapped heading ref
-        ref_input     = opti.parameter(2, H)             # v_ref, omega_ref
-        ref_tangents  = opti.parameter(2, H + 1)         # tangent per step
-        nominal_state = opti.parameter(3, H + 1)         # nominal rollout
-        nominal_input = opti.parameter(2, H)             # nominal input sequence
-        A_mat  = opti.parameter(9, H)                    # linearised A_k (col-major)
-        B_mat  = opti.parameter(6, H)                    # linearised B_k (col-major)
-        c_vec  = opti.parameter(3, H)                    # defect c_k
-        prev_cmd = opti.parameter(2)
-        neigh_pos  = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
-        neigh_ref  = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
-        neigh_pred_spd = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
-        neigh_ref_spd  = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
-        neigh_ref_tan  = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
-        cbf_hbar   = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
-        cbf_grad   = opti.parameter(2 * neighbor_count, H) if neighbor_count > 0 else None
-        cbf_hbar_n = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
-        cbf_grad_n = opti.parameter(2 * neighbor_count, H) if neighbor_count > 0 else None
+        dx0 = opti.parameter(3)
+        reference = opti.parameter(5, H + 1)
+        reference_tangents = opti.parameter(2, H + 1)
+        previous_command = opti.parameter(2)
+
+        neighbor_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
+        neighbor_reference_positions = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
+        neighbor_prediction_speeds = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
+        neighbor_reference_speeds = opti.parameter(neighbor_count, H) if neighbor_count > 0 else None
+        neighbor_reference_tangents = opti.parameter(2 * neighbor_count, H + 1) if neighbor_count > 0 else None
+        cbf_rbar_next = opti.parameter(2 * neighbor_count, H) if neighbor_count > 0 else None
 
         objective = 0
-        opti.subject_to(X[:, 0] == state0)
-
-        r_pos, r_theta, r_v, r_w = 0.50, 1.00, self.config.v_max, self.config.omega_max
+        opti.subject_to(dx[:, 0] == dx0)
 
         for k in range(H):
-            Ak = ca.reshape(A_mat[:, k], 3, 3)
-            Bk = ca.reshape(B_mat[:, k], 3, 2)
-            opti.subject_to(X[:, k + 1] == ca.mtimes(Ak, X[:, k]) + ca.mtimes(Bk, U[:, k]) + c_vec[:, k])
+            # Linearized unicycle tracking-error dynamics around the reference.
+            theta_ref = reference[2, k]
+            v_ref = reference[3, k]
+            cos_ref = ca.cos(theta_ref)
+            sin_ref = ca.sin(theta_ref)
 
-            opti.subject_to(opti.bounded(0.0, U[0, k], self.config.v_max))
-            opti.subject_to(opti.bounded(-self.config.omega_max, U[1, k], self.config.omega_max))
-            # trust region around nominal (k≥1 for state)
-            if k >= 1:
-                opti.subject_to(opti.bounded(-r_pos, X[0, k] - nominal_state[0, k], r_pos))
-                opti.subject_to(opti.bounded(-r_pos, X[1, k] - nominal_state[1, k], r_pos))
-                opti.subject_to(opti.bounded(-r_theta, X[2, k] - nominal_state[2, k], r_theta))
-            opti.subject_to(opti.bounded(-r_v, U[0, k] - nominal_input[0, k], r_v))
-            opti.subject_to(opti.bounded(-r_w, U[1, k] - nominal_input[1, k], r_w))
+            opti.subject_to(
+                dx[0, k + 1]
+                == dx[0, k]
+                - dt * v_ref * sin_ref * dx[2, k]
+                + dt * cos_ref * du[0, k]
+            )
+            opti.subject_to(
+                dx[1, k + 1]
+                == dx[1, k]
+                + dt * v_ref * cos_ref * dx[2, k]
+                + dt * sin_ref * du[0, k]
+            )
+            opti.subject_to(dx[2, k + 1] == dx[2, k] + dt * du[1, k])
+
+            # Hard input bounds on absolute commands u = u_ref + du.
+            opti.subject_to(opti.bounded(0.0, reference[3, k] + du[0, k], self.config.v_max))
+            opti.subject_to(opti.bounded(-self.config.omega_max, reference[4, k] + du[1, k], self.config.omega_max))
 
             objective += (
-                w.position  * ((X[0,k]-reference_pos[0,k])**2 + (X[1,k]-reference_pos[1,k])**2)
-                + w.heading * (X[2,k] - ref_thetas_uw[k])**2
-                + w.input   * ca.sumsqr(U[:, k] - ref_input[:, k])
+                w.position * (dx[0, k] ** 2 + dx[1, k] ** 2)
+                + w.heading * dx[2, k] ** 2
+                + w.input * ca.sumsqr(du[:, k])
             )
             if k > 0:
-                objective += w.input_smooth * ca.sumsqr(U[:, k] - U[:, k - 1])
+                objective += w.input_smooth * ca.sumsqr(du[:, k] - du[:, k - 1])
 
-        objective += w.initial_input_smooth * ca.sumsqr(U[:, 0] - prev_cmd)
-        # k=H trust region
-        opti.subject_to(opti.bounded(-r_pos, X[0, H] - nominal_state[0, H], r_pos))
-        opti.subject_to(opti.bounded(-r_pos, X[1, H] - nominal_state[1, H], r_pos))
-        opti.subject_to(opti.bounded(-r_theta, X[2, H] - nominal_state[2, H], r_theta))
-        objective += w.terminal_position * ((X[0,H]-reference_pos[0,H])**2 + (X[1,H]-reference_pos[1,H])**2)
+        # Penalize the first absolute command relative to the currently executed command.
+        objective += w.initial_input_smooth * (
+            (reference[3, 0] + du[0, 0] - previous_command[0]) ** 2
+            + (reference[4, 0] + du[1, 0] - previous_command[1]) ** 2
+        )
 
-        # ── consensus ─────────────────────────────────────────────
-        if self._consensus_enabled and neigh_pos is not None and neighbor_count > 0:
+        # Terminal slot-tracking error.
+        objective += w.terminal_position * (dx[0, H] ** 2 + dx[1, H] ** 2)
+
+        # ── Clean error-coordinate consensus terms ───────────────────────
+        # Absolute position alias: p_i,k = p_ref_i,k + dx_i,k.
+        # Neighbor prediction error alias: ehat_j,k = p_hat_j,k - p_ref_j,k.
+        # Then relative-position consensus is simply ||e_i,k - ehat_j,k||^2.
+        if self._consensus_enabled and neighbor_count > 0:
             for k in range(H):
-                e_ix = X[0,k] - reference_pos[0,k]
-                e_iy = X[1,k] - reference_pos[1,k]
-                slot_prog = e_ix*ref_tangents[0,k] + e_iy*ref_tangents[1,k]
-                spd_err_i = U[0,k] - ref_input[0,k]
-                for n in range(neighbor_count):
-                    ref_dx = reference_pos[0,k] - neigh_ref[2*n,k]
-                    ref_dy = reference_pos[1,k] - neigh_ref[2*n+1,k]
-                    if w.relative_position > 0.0:
-                        err_x = (X[0,k] - neigh_pos[2*n,k]) - ref_dx
-                        err_y = (X[1,k] - neigh_pos[2*n+1,k]) - ref_dy
-                        objective += w.relative_position * (err_x**2 + err_y**2)
-                    if w.progress_sync > 0.0:
-                        npx = neigh_pos[2*n,k] - neigh_ref[2*n,k]
-                        npy = neigh_pos[2*n+1,k] - neigh_ref[2*n+1,k]
-                        nprog = npx*neigh_ref_tan[2*n,k] + npy*neigh_ref_tan[2*n+1,k]
-                        objective += w.progress_sync * (slot_prog - nprog)**2
-                    if w.velocity_consensus > 0.0:
-                        nse = neigh_pred_spd[n,k] - neigh_ref_spd[n,k]
-                        objective += w.velocity_consensus * (spd_err_i - nse)**2
+                if (
+                    neighbor_positions is None
+                    or neighbor_reference_positions is None
+                    or neighbor_prediction_speeds is None
+                    or neighbor_reference_speeds is None
+                    or neighbor_reference_tangents is None
+                ):
+                    continue
 
-        # ── CBF: next-step distance constraint linearised at nominal ──
+                slot_progress_i = dx[0, k] * reference_tangents[0, k] + dx[1, k] * reference_tangents[1, k]
+                speed_error_i = du[0, k]
+
+                for n in range(neighbor_count):
+                    neigh_err_x = neighbor_positions[2 * n, k] - neighbor_reference_positions[2 * n, k]
+                    neigh_err_y = neighbor_positions[2 * n + 1, k] - neighbor_reference_positions[2 * n + 1, k]
+
+                    if w.relative_position > 0.0:
+                        objective += w.relative_position * (
+                            (dx[0, k] - neigh_err_x) ** 2
+                            + (dx[1, k] - neigh_err_y) ** 2
+                        )
+
+                    if w.progress_sync > 0.0:
+                        neigh_progress = (
+                            neigh_err_x * neighbor_reference_tangents[2 * n, k]
+                            + neigh_err_y * neighbor_reference_tangents[2 * n + 1, k]
+                        )
+                        objective += w.progress_sync * (slot_progress_i - neigh_progress) ** 2
+
+                    if w.velocity_consensus > 0.0:
+                        neigh_speed_error = neighbor_prediction_speeds[n, k] - neighbor_reference_speeds[n, k]
+                        objective += w.velocity_consensus * (speed_error_i - neigh_speed_error) ** 2
+
+        # ── Distance-CBF / separation in error coordinates ───────────────
+        # h(p) = ||p_i - p_j||^2 - d_safe^2.
+        # With p_i = p_ref_i + dx_i, linearize ||p_i - p_j||^2 at
+        # p_bar_i = p_ref_i and supplied rbar = p_bar_i - p_j.
         eps_cbf = None
         safe_dist = 2.0 * self.config.robot_radius + self.config.inter_robot_margin
-        d_safe_sq = safe_dist**2
-        if self._cbf_enabled and neigh_pos is not None and neighbor_count > 0:
+        d_safe_sq = safe_dist ** 2
+        if self._cbf_enabled and neighbor_count > 0 and neighbor_positions is not None and cbf_rbar_next is not None:
             eps_cbf = opti.variable(neighbor_count, H)
             for k in range(H):
                 for n in range(neighbor_count):
                     opti.subject_to(eps_cbf[n, k] >= 0.0)
-                    h_nxt = (cbf_hbar_n[n,k]
-                             + ca.dot(cbf_grad_n[2*n:2*n+2,k], X[:2,k+1] - nominal_state[:2,k+1]))
-                    opti.subject_to(h_nxt - d_safe_sq + eps_cbf[n,k] >= 0)
+
+                    # Next-step absolute self position alias.
+                    p_abs_x = reference[0, k + 1] + dx[0, k + 1]
+                    p_abs_y = reference[1, k + 1] + dx[1, k + 1]
+                    neigh_x = neighbor_positions[2 * n, k + 1]
+                    neigh_y = neighbor_positions[2 * n + 1, k + 1]
+                    rbar_x = cbf_rbar_next[2 * n, k]
+                    rbar_y = cbf_rbar_next[2 * n + 1, k]
+
+                    # Affine under-estimator of ||p_abs - p_neighbor||^2.
+                    h_dist_lin = (
+                        2.0 * rbar_x * (p_abs_x - neigh_x)
+                        + 2.0 * rbar_y * (p_abs_y - neigh_y)
+                        - (rbar_x ** 2 + rbar_y ** 2)
+                    )
+                    opti.subject_to(h_dist_lin - d_safe_sq + eps_cbf[n, k] >= 0.0)
             objective += w.neighbor_slack * ca.sumsqr(eps_cbf)
         eps_cbf_out = eps_cbf if eps_cbf is not None else None
 
         opti.minimize(objective)
-        opti.solver("qrsqp", {
-            "print_time": False, "print_header": False,
-            "qpsol": "osqp", "qpsol_options": {"verbose": False},
-            "hessian_approximation": "exact", "max_iter": 30,
-        })
+        opti.solver(
+            "qrsqp",
+            {
+                "print_time": False,
+                "print_header": False,
+                "qpsol": "osqp",
+                "qpsol_options": {"verbose": False},
+                "hessian_approximation": "exact",
+                "max_iter": 30,
+            },
+        )
         return _SolverCacheEntry(
-            opti=opti, variables={"X": X, "U": U, "eps_cbf": eps_cbf_out},
+            opti=opti,
+            variables={"dx": dx, "du": du, "eps_cbf": eps_cbf_out},
             parameters={
-                "state0": state0, "reference_pos": reference_pos,
-                "ref_thetas_uw": ref_thetas_uw, "ref_input": ref_input, "ref_tangents": ref_tangents,
-                "nominal_state": nominal_state, "nominal_input": nominal_input,
-                "A_mat": A_mat, "B_mat": B_mat, "c_vec": c_vec,
-                "prev_cmd": prev_cmd, "neigh_pos": neigh_pos, "neigh_ref": neigh_ref,
-                "neigh_pred_spd": neigh_pred_spd, "neigh_ref_spd": neigh_ref_spd,
-                "neigh_ref_tan": neigh_ref_tan,
-                "cbf_hbar": cbf_hbar, "cbf_grad": cbf_grad,
-                "cbf_hbar_n": cbf_hbar_n, "cbf_grad_n": cbf_grad_n,
+                "dx0": dx0,
+                "reference": reference,
+                "reference_tangents": reference_tangents,
+                "previous_command": previous_command,
+                "neighbor_positions": neighbor_positions,
+                "neighbor_reference_positions": neighbor_reference_positions,
+                "neighbor_prediction_speeds": neighbor_prediction_speeds,
+                "neighbor_reference_speeds": neighbor_reference_speeds,
+                "neighbor_reference_tangents": neighbor_reference_tangents,
+                "cbf_rbar_next": cbf_rbar_next,
             },
         )
 
     def _set_parameter_values(
         self, solver: _SolverCacheEntry, state: RobotState,
-        reference_matrix: np.ndarray, ref_thetas_uw: np.ndarray, ref_tangents: np.ndarray,
-        nominal_state: np.ndarray, nominal_input: np.ndarray,
-        A_mat: np.ndarray, B_mat: np.ndarray, c_vec: np.ndarray,
-        neigh_pos: np.ndarray, neigh_ref: np.ndarray,
-        neigh_pred_spd: np.ndarray, neigh_ref_spd: np.ndarray, neigh_ref_tan: np.ndarray,
-        cbf_hbar: np.ndarray, cbf_grad: np.ndarray,
-        cbf_hbar_n: np.ndarray, cbf_grad_n: np.ndarray,
+        reference_matrix: np.ndarray, reference_tangents: np.ndarray,
+        neighbor_positions: np.ndarray, neighbor_reference_positions: np.ndarray,
+        neighbor_prediction_speeds: np.ndarray,
+        neighbor_reference_speeds: np.ndarray,
+        neighbor_reference_tangents: np.ndarray,
+        cbf_rbar_next: np.ndarray,
     ) -> None:
-        p = solver.parameters
-        solver.opti.set_value(p["state0"], np.array([state.x, state.y, state.yaw], dtype=float))
-        solver.opti.set_value(p["reference_pos"], reference_matrix[:2, :])
-        solver.opti.set_value(p["ref_thetas_uw"], ref_thetas_uw)
-        H = nominal_input.shape[1]
-        solver.opti.set_value(p["ref_input"], reference_matrix[3:5, :H])
-        solver.opti.set_value(p["ref_tangents"], ref_tangents)
-        solver.opti.set_value(p["nominal_state"], nominal_state)
-        solver.opti.set_value(p["nominal_input"], nominal_input)
-        solver.opti.set_value(p["A_mat"], A_mat)
-        solver.opti.set_value(p["B_mat"], B_mat)
-        solver.opti.set_value(p["c_vec"], c_vec)
-        if p.get("prev_cmd") is not None:
-            solver.opti.set_value(p["prev_cmd"], np.array([state.v, state.omega], dtype=float))
-        if p.get("neigh_pos") is not None: solver.opti.set_value(p["neigh_pos"], neigh_pos)
-        if p.get("neigh_ref") is not None: solver.opti.set_value(p["neigh_ref"], neigh_ref)
-        if p.get("neigh_pred_spd") is not None: solver.opti.set_value(p["neigh_pred_spd"], neigh_pred_spd)
-        if p.get("neigh_ref_spd") is not None: solver.opti.set_value(p["neigh_ref_spd"], neigh_ref_spd)
-        if p.get("neigh_ref_tan") is not None: solver.opti.set_value(p["neigh_ref_tan"], neigh_ref_tan)
-        if p.get("cbf_hbar") is not None: solver.opti.set_value(p["cbf_hbar"], cbf_hbar)
-        if p.get("cbf_grad") is not None: solver.opti.set_value(p["cbf_grad"], cbf_grad)
-        if p.get("cbf_hbar_n") is not None: solver.opti.set_value(p["cbf_hbar_n"], cbf_hbar_n)
-        if p.get("cbf_grad_n") is not None: solver.opti.set_value(p["cbf_grad_n"], cbf_grad_n)
+        dx0 = np.array([
+            state.x - reference_matrix[0, 0],
+            state.y - reference_matrix[1, 0],
+            wrap_to_pi(state.yaw - reference_matrix[2, 0]),
+        ], dtype=float)
+        solver.opti.set_value(solver.parameters["dx0"], dx0)
+        solver.opti.set_value(solver.parameters["reference"], reference_matrix)
+        if solver.parameters.get("previous_command") is not None:
+            solver.opti.set_value(solver.parameters["previous_command"], np.array([state.v, state.omega], dtype=float))
+        if solver.parameters.get("reference_tangents") is not None:
+            solver.opti.set_value(solver.parameters["reference_tangents"], reference_tangents)
+        if solver.parameters.get("neighbor_positions") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_positions"], neighbor_positions)
+        if solver.parameters.get("neighbor_reference_positions") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_reference_positions"], neighbor_reference_positions)
+        if solver.parameters.get("neighbor_prediction_speeds") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_prediction_speeds"], neighbor_prediction_speeds)
+        if solver.parameters.get("neighbor_reference_speeds") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_reference_speeds"], neighbor_reference_speeds)
+        if solver.parameters.get("neighbor_reference_tangents") is not None:
+            solver.opti.set_value(solver.parameters["neighbor_reference_tangents"], neighbor_reference_tangents)
+        if solver.parameters.get("cbf_rbar_next") is not None:
+            solver.opti.set_value(solver.parameters["cbf_rbar_next"], cbf_rbar_next)
 
     def _set_initial_guess(
         self,
         solver: _SolverCacheEntry,
-        nominal_state: np.ndarray,
-        nominal_input: np.ndarray,
+        state: RobotState,
+        reference_matrix: np.ndarray,
     ) -> None:
-        solver.opti.set_initial(solver.variables["X"], nominal_state)
-        solver.opti.set_initial(solver.variables["U"], nominal_input)
+        H = self.config.horizon_steps
+        dt = self.config.dt
+        dx_init = np.zeros((3, H + 1), dtype=float)
+        dx_init[:, 0] = np.array([
+            state.x - reference_matrix[0, 0],
+            state.y - reference_matrix[1, 0],
+            wrap_to_pi(state.yaw - reference_matrix[2, 0]),
+        ], dtype=float)
+        du_init = np.zeros((2, H), dtype=float)
+        for k in range(H):
+            th = reference_matrix[2, k]
+            v_ref = reference_matrix[3, k]
+            dx_init[0, k + 1] = (
+                dx_init[0, k]
+                - dt * v_ref * math.sin(th) * dx_init[2, k]
+                + dt * math.cos(th) * du_init[0, k]
+            )
+            dx_init[1, k + 1] = (
+                dx_init[1, k]
+                + dt * v_ref * math.cos(th) * dx_init[2, k]
+                + dt * math.sin(th) * du_init[0, k]
+            )
+            dx_init[2, k + 1] = dx_init[2, k] + dt * du_init[1, k]
+        solver.opti.set_initial(solver.variables["dx"], dx_init)
+        solver.opti.set_initial(solver.variables["du"], du_init)
         eps_cbf = solver.variables.get("eps_cbf")
         if eps_cbf is not None:
-            solver.opti.set_initial(eps_cbf, np.zeros((eps_cbf.shape[0], eps_cbf.shape[1]), dtype=float))
+            solver.opti.set_initial(
+                eps_cbf,
+                np.zeros((eps_cbf.shape[0], eps_cbf.shape[1]), dtype=float),
+            )
         try:
             solver.opti.set_initial(solver.opti.lam_g, 0)
         except Exception:
             pass
-
-    def _vo_barrier(
-        self,
-        p_i: tuple[float, float],
-        theta_i: float,
-        v_i: float,
-        p_j: tuple[float, float],
-        theta_j: float,
-        v_j: float,
-        safe_dist: float,
-    ) -> float:
-        dx = p_j[0] - p_i[0]
-        dy = p_j[1] - p_i[1]
-        d2 = dx * dx + dy * dy
-        d = math.sqrt(max(d2, 1e-12))
-        ct_i = math.cos(theta_i)
-        st_i = math.sin(theta_i)
-        ct_j = math.cos(theta_j)
-        st_j = math.sin(theta_j)
-        v_i_xy = (v_i * ct_i, v_i * st_i)
-        v_j_xy = (v_j * ct_j, v_j * st_j)
-        v_rel = (v_j_xy[0] - v_i_xy[0], v_j_xy[1] - v_i_xy[1])
-        v_rel_norm = math.sqrt(v_rel[0] * v_rel[0] + v_rel[1] * v_rel[1])
-        margin_sq = max(d2 - safe_dist * safe_dist, 0.0)
-        cone_term = v_rel_norm * math.sqrt(margin_sq)
-        return dx * v_rel[0] + dy * v_rel[1] + cone_term
 
     def _prediction_speed(self, prediction: RobotPrediction, k: int) -> float:
         if prediction.commands:
@@ -627,60 +686,6 @@ class DistributedFormationMPC:
                 math.hypot(curr[0] - prev[0], curr[1] - prev[1]) / max(self.config.dt, 1e-9)
             )
         return 0.0
-
-    def _compute_vo_cbf_coeffs(
-        self,
-        ref_mat: np.ndarray,
-        neighbor_predictions: list[RobotPrediction],
-        safe_dist: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        H = ref_mat.shape[1] - 1
-        N = len(neighbor_predictions)
-        Ax = np.zeros((N, H), dtype=float)
-        Ay = np.zeros((N, H), dtype=float)
-        Av = np.zeros((N, H), dtype=float)
-        Aw = np.zeros((N, H), dtype=float)
-        Ath = np.zeros((N, H), dtype=float)
-        Bh = np.zeros((N, H), dtype=float)
-        if N == 0:
-            return Ax, Ay, Av, Aw, Ath, Bh
-
-        eps = 0.01
-        max_c = 10.0
-        for k in range(H):
-            p_i = (float(ref_mat[0, k]), float(ref_mat[1, k]))
-            theta_i = float(ref_mat[2, k])
-            v_i = float(ref_mat[3, k])
-            for n, prediction in enumerate(neighbor_predictions):
-                idx = min(k, len(prediction.positions_xy) - 1)
-                p_j = prediction.positions_xy[idx]
-                theta_j = prediction.yaw_rads[idx] if prediction.yaw_rads else 0.0
-                v_j = self._prediction_speed(prediction, k)
-                dx = p_j[0] - p_i[0]
-                dy = p_j[1] - p_i[1]
-                d = math.hypot(dx, dy)
-                if d >= safe_dist * 2.0:
-                    continue
-
-                base_h = self._vo_barrier(p_i, theta_i, v_i, p_j, theta_j, v_j, safe_dist)
-                Bh[n, k] = base_h
-
-                h_xp = self._vo_barrier((p_i[0] + eps, p_i[1]), theta_i, v_i, p_j, theta_j, v_j, safe_dist)
-                h_xm = self._vo_barrier((p_i[0] - eps, p_i[1]), theta_i, v_i, p_j, theta_j, v_j, safe_dist)
-                h_yp = self._vo_barrier((p_i[0], p_i[1] + eps), theta_i, v_i, p_j, theta_j, v_j, safe_dist)
-                h_ym = self._vo_barrier((p_i[0], p_i[1] - eps), theta_i, v_i, p_j, theta_j, v_j, safe_dist)
-                h_thp = self._vo_barrier(p_i, theta_i + eps, v_i, p_j, theta_j, v_j, safe_dist)
-                h_thm = self._vo_barrier(p_i, theta_i - eps, v_i, p_j, theta_j, v_j, safe_dist)
-                h_vp = self._vo_barrier(p_i, theta_i, v_i + eps, p_j, theta_j, v_j, safe_dist)
-                h_vm = self._vo_barrier(p_i, theta_i, v_i - eps, p_j, theta_j, v_j, safe_dist)
-
-                Ax[n, k] = max(-max_c, min(max_c, (h_xp - h_xm) / (2.0 * eps)))
-                Ay[n, k] = max(-max_c, min(max_c, (h_yp - h_ym) / (2.0 * eps)))
-                Ath[n, k] = max(-max_c, min(max_c, (h_thp - h_thm) / (2.0 * eps)))
-                Av[n, k] = max(-max_c, min(max_c, (h_vp - h_vm) / (2.0 * eps)))
-                Aw[n, k] = 0.0
-
-        return Ax, Ay, Av, Aw, Ath, Bh
 
     def _build_neighbor_position_matrix(self, neighbor_predictions: list[RobotPrediction]) -> np.ndarray:
         if not neighbor_predictions:
