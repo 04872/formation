@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 import sys
 
@@ -619,6 +621,47 @@ def save_animation(context: dict, output: Path, *, fps: int):
 
 # ── main ──────────────────────────────────────────────────────────
 
+def _save_metrics(
+    scenario_name: str,
+    summary: dict,
+    timeseries: dict | None,
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = out_dir / f"{scenario_name}"
+
+    # summary JSON
+    summary_path = base.with_name(f"{base.name}_metrics_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"  metrics summary → {summary_path}")
+
+    # summary CSV (single row)
+    csv_path = base.with_name(f"{base.name}_metrics_summary.csv")
+    flat = {k: v for k, v in summary.items() if not isinstance(v, (dict, list))}
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(flat.keys()))
+        w.writeheader()
+        w.writerow(flat)
+    print(f"  metrics csv → {csv_path}")
+
+    # timeseries CSV
+    if timeseries:
+        ts_path = base.with_name(f"{base.name}_timeseries.csv")
+        cols = [
+            "scenario_name", "step", "time", "formation_name",
+            "e_track", "e_dist", "e_sim",
+            "reached_goal", "obstacle_collision", "inter_robot_collision",
+        ]
+        rows = len(timeseries.get("step", []))
+        with open(ts_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for i in range(rows):
+                w.writerow([timeseries.get(c, [""] * rows)[i] for c in cols])
+        print(f"  timeseries → {ts_path}")
+
+
 def main():
     args = parse_args()
     mt = _map_type(args)
@@ -632,6 +675,12 @@ def main():
     s = trace_summary(ctx["trace"])
     print(f"goal={s['goal_distance']:.2f}m cycles={s['replanning_cycles']} "
           f"form={s['selected_formations']}")
+
+    # ── save metrics ────────────────────────────────────────────
+    trace = ctx["trace"]
+    metrics = trace.metadata.get("metrics")
+    if metrics is not None:
+        _save_metrics(mt, metrics, trace.metadata.get("metrics_timeseries"), args.out_dir)
 
     draw_trajectory(ctx, _out(args, "traj", "png"))
     draw_preview(ctx, _out(args, "preview", "png"))

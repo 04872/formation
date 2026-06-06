@@ -4,6 +4,7 @@ import math
 import time
 from typing import Any
 
+from formation.metrics import ScenarioMetricsLogger
 from formation.mpc_controller import DistributedFormationMPC, query_distance_field
 from formation.path_manager import PathManager
 from formation.types import FormationControllerReference, MapData, RobotPrediction, RobotState, SimulationTrace
@@ -122,12 +123,21 @@ class MultiRobotSimulator:
         solve_wall_time_s = 0.0
         stop_reason = "max_replans"
         cycle_idx = 0
+        robot_count = len(initial_states)
+        logger = ScenarioMetricsLogger(
+            robot_count, self.controller.config.dt, robot_radius,
+            map_data.name, map_data=map_data,
+        )
+        global_step = 0  # cumulative step counter, never resets across cycles
         print(f"[full-path] max_replans={max_replans} goal_tolerance={goal_tolerance:.2f}m", flush=True)
 
         for _ in range(max_replans):
             current_goal_distance = self._goal_distance(current_states, map_data.goal_xy)
             if current_goal_distance <= goal_tolerance:
                 stop_reason = "goal_reached"
+                if logger.T_goal is None:
+                    logger.T_goal = global_step * self.controller.config.dt
+                    logger.reached_goal = True
                 break
 
             ref_xy = self._centroid(current_states)
@@ -139,6 +149,7 @@ class MultiRobotSimulator:
             preview = preview_planner.plan(map_data, ref_xy, window)
             if not preview.points_xy:
                 stop_reason = "empty_preview"
+                logger.set_planning_failure()
                 break
             # Use swept‑band feasibility when a feasibility module is injected
             feasibility = getattr(self, "_feasibility", None)
@@ -159,6 +170,7 @@ class MultiRobotSimulator:
                     # Run full SLSQP centreline optimisation for the selected formation
                     best = feasibility.optimize_centerline(
                         map_data, preview, sel_fm, robot_radius, safety_margin)
+                    best.assignment = best_feas.assignment  # use assignment from feasibility check
                 else:
                     # All infeasible — fall back to column (narrowest, safest)
                     col_result = next((r for r in feas_results if r.formation_name == "column"), feas_results[-1])
@@ -206,6 +218,8 @@ class MultiRobotSimulator:
             per_cycle_chord_centers.append([sample.center_xy for sample in cb.samples])
             per_cycle_chord_endpoints.append([(sample.left_xy, sample.right_xy) for sample in cb.samples])
             controller_reference = reference_builder.build(selection.guide, current_states=current_states)
+            if controller_reference.sample_count == 0:
+                logger.set_planning_failure()
             plan_wall_time_s += time.perf_counter() - plan_start
             ev_lines = ", ".join(
                 f"{ev.formation_name[:6]}={'S' if ev.is_safe else 'I'}:m={ev.score_breakdown.min_corridor_margin_m:+.3f}"
@@ -241,14 +255,25 @@ class MultiRobotSimulator:
                 tracking_errors.append(self._tracking_error(current_states, reference_window))
                 min_obstacle_clearances.append(self._min_obstacle_clearance(current_states, map_data))
                 min_pairwise_distances.append(self._min_pairwise_distance(current_states))
+                # ── metrics logger ──────────────────────────────
+                for pred in predictions:
+                    if pred.metadata.get("solver_status") == "fallback_open_loop":
+                        logger.record_mpc_fallback(1)
+                sim_time = global_step * self.controller.config.dt
+                goal_now = self._goal_distance(current_states, map_data.goal_xy) <= goal_tolerance
+                logger.update(global_step, sim_time, current_states, reference_window, goal_now)
                 current_states = [
                     self.controller.propagate_state(state, command)
                     for state, command in zip(current_states, commands)
                 ]
                 state_history.append(self._clone_states(current_states))
+                global_step += 1
                 previous_predictions = predictions
                 if self._goal_distance(current_states, map_data.goal_xy) <= goal_tolerance:
                     stop_reason = "goal_reached"
+                    if logger.T_goal is None:
+                        logger.T_goal = global_step * self.controller.config.dt
+                        logger.reached_goal = True
                     break
 
             cycle_end_indices.append(len(command_history))
@@ -270,6 +295,7 @@ class MultiRobotSimulator:
         if reference_history:
             tracking_errors.append(self._tracking_error(current_states, reference_history[-1].window(reference_history[-1].sample_count - 1, 0)))
 
+        metrics_result = logger.finalize(timeout=(stop_reason == "max_replans"))
         return SimulationTrace(
             state_history=state_history,
             command_history=command_history,
@@ -300,6 +326,8 @@ class MultiRobotSimulator:
                 "per_cycle_chord_centers": per_cycle_chord_centers,
                 "per_cycle_chord_endpoints": per_cycle_chord_endpoints,
                 "per_cycle_centerline": per_cycle_centerline,
+                "metrics": metrics_result,
+                "metrics_timeseries": logger.timeseries_dict(),
             },
         )
 

@@ -1,0 +1,24 @@
+{
+  "scenario_name": "right_angle_corridor",
+  "success": false,
+  "failure_reason": "obstacle_collision",
+  "T_goal": null,
+  "num_steps": 150,
+  "e_track_mean": 0.06880087405374184,
+  "e_track_max": 0.3440529432097157,
+  "e_dist_mean": 0.02833811307260552,
+  "e_dist_max": 0.19471354156498047,
+  "e_sim_mean": 0.04536828017118883,
+  "e_sim_max": 0.327550800532638,
+  "formation_switch_count": 2,
+  "formation_usage": {
+    "t_shape": 120,
+    "square": 30
+  },
+  "obstacle_collision": true,
+  "inter_robot_collision": false,
+  "timeout": true,
+  "planning_failure": false,
+  "control_failure": false,
+  "mpc_fallback_count": 0
+}
