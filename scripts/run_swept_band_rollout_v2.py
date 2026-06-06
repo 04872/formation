@@ -637,7 +637,7 @@ def main():
     draw_preview(ctx, _out(args, "preview", "png"))
     draw_cycle_robot_references(ctx, _out(args, "robot_refs", "png"))
     draw_band_recenter(ctx, _out(args, "band_recenter", "png"))
-    draw_swept_band(ctx, _out(args, "band", "png"))
+    # draw_swept_band(ctx, _out(args, "band", "png"))
     if not args.no_mp4:
         save_animation(ctx, _out(args, "rollout", "mp4"), fps=max(1, args.fps))
 
