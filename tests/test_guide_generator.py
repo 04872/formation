@@ -39,16 +39,16 @@ class GuideGeneratorTest(unittest.TestCase):
 
     def test_guide_applies_target_slots_immediately_when_switching(self) -> None:
         square = self.library.get("square")
-        compact = self.library.get("compact")
+        t_shape = self.library.get("t_shape")
         assignment = AssignmentResult(assignment=(0, 1, 2, 3), total_cost=1.0, max_cost=0.4)
         centers = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0)]
         headings = [0.0, 0.0, 0.0]
         slot_points = [
-            [(center[0] + float(slot[0]), center[1] + float(slot[1])) for slot in compact.slots]
+            [(center[0] + float(slot[0]), center[1] + float(slot[1])) for slot in t_shape.slots]
             for center in centers
         ]
         evaluation = FormationCandidateEvaluation(
-            formation_name=compact.name,
+            formation_name=t_shape.name,
             band_feasible=True,
             is_safe=True,
             score_breakdown=FormationScoreBreakdown(total_score=1.0),
@@ -58,7 +58,7 @@ class GuideGeneratorTest(unittest.TestCase):
             assignment=assignment,
         )
 
-        guide = self.generator.build(evaluation, compact, current_formation=square)
+        guide = self.generator.build(evaluation, t_shape, current_formation=square)
 
         self.assertTrue(guide.switched)
         self.assertEqual(guide.transition_alphas, [1.0, 1.0, 1.0])

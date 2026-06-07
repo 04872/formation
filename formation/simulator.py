@@ -117,7 +117,7 @@ class MultiRobotSimulator:
         per_cycle_centerline: list[list[tuple[float, float]]] = []
         total_polyline_length = self._polyline_length(global_path.waypoints_xy)
         total_steps_needed = int(math.ceil(total_polyline_length / (self.controller.config.v_max * self.controller.config.dt * 0.6)))
-        default_replans = max(1, int(math.ceil(total_steps_needed / max(replan_interval, 1))))
+        default_replans = max(1, int(math.ceil(total_steps_needed / max(replan_interval, 1)))) + 2
         max_replans = max_replans if max_replans is not None else default_replans
         plan_wall_time_s = 0.0
         solve_wall_time_s = 0.0
@@ -156,12 +156,12 @@ class MultiRobotSimulator:
             if feasibility is not None:
                 from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
                 from formation.types import FormationCandidateEvaluation, FormationScoreBreakdown
-                # Build swept band + check formations
-                cb = selector.build_curve_band(map_data, preview, robot_radius, safety_margin)
+                # v2 builds its own band internally; skip expensive CurveBandBuilder
                 feas_results = feasibility.check_multi(
-                    map_data, preview, cb, formations, robot_radius, safety_margin,
+                    map_data, preview, None, formations, robot_radius, safety_margin,
                     current_formation=current_formation, current_states=current_states,
                 )
+                cb = None
                 # Pick best (first feasible, width‑descending)
                 feasible = [r for r in feas_results if r.is_feasible]
                 if feasible:
@@ -214,12 +214,19 @@ class MultiRobotSimulator:
                 per_cycle_centerline.append([])
             per_cycle_preview_points.append(list(preview.points_xy))
             cb = selection.curve_band
-            per_cycle_strip_cells.append([cell.vertices_xy for cell in cb.strip_cells])
-            per_cycle_chord_centers.append([sample.center_xy for sample in cb.samples])
-            per_cycle_chord_endpoints.append([(sample.left_xy, sample.right_xy) for sample in cb.samples])
+            if cb is not None:
+                per_cycle_strip_cells.append([cell.vertices_xy for cell in cb.strip_cells])
+                per_cycle_chord_centers.append([sample.center_xy for sample in cb.samples])
+                per_cycle_chord_endpoints.append([(sample.left_xy, sample.right_xy) for sample in cb.samples])
+            else:
+                per_cycle_strip_cells.append([])
+                per_cycle_chord_centers.append([])
+                per_cycle_chord_endpoints.append([])
             controller_reference = reference_builder.build(selection.guide, current_states=current_states)
             if controller_reference.sample_count == 0:
                 logger.set_planning_failure()
+            if controller_reference.metadata.get("invalidate_previous_predictions", False):
+                previous_predictions = None
             plan_wall_time_s += time.perf_counter() - plan_start
             ev_lines = ", ".join(
                 f"{ev.formation_name[:6]}={'S' if ev.is_safe else 'I'}:m={ev.score_breakdown.min_corridor_margin_m:+.3f}"

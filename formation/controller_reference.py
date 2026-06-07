@@ -73,29 +73,64 @@ class ControllerReferenceBuilder:
                 wy = c_xy[1, k] + sh * lx + ch * ly
                 positions_xy.append((wx, wy))
 
-            # v_ref: projection of slot displacement onto formation heading
-            # ω_ref: formation heading rate (same for all robots)
-            v_refs: list[float] = []
-            omega_refs: list[float] = []
+            # ── per-robot yaw from own slot trajectory ───────────
+            robot_yaws: list[float] = []
+            for k in range(N):
+                if k == 0:
+                    d = (positions_xy[1][0] - positions_xy[0][0],
+                         positions_xy[1][1] - positions_xy[0][1])
+                elif k == N - 1:
+                    d = (positions_xy[-1][0] - positions_xy[-2][0],
+                         positions_xy[-1][1] - positions_xy[-2][1])
+                else:
+                    d = (positions_xy[k + 1][0] - positions_xy[k - 1][0],
+                         positions_xy[k + 1][1] - positions_xy[k - 1][1])
+                dn = math.hypot(d[0], d[1])
+                if dn > 1e-9:
+                    robot_yaws.append(math.atan2(d[1], d[0]))
+                elif robot_yaws:
+                    robot_yaws.append(robot_yaws[-1])
+                else:
+                    robot_yaws.append(float(psi[k]))
+            # unwrap
+            for k in range(1, len(robot_yaws)):
+                robot_yaws[k] = robot_yaws[k - 1] + wrap_to_pi(
+                    robot_yaws[k] - robot_yaws[k - 1])
+
+            # ── omega_ref from robot_yaws ────────────────────────
+            omega_raw: list[float] = []
+            for k in range(N):
+                if k < N - 1:
+                    dw = wrap_to_pi(robot_yaws[k + 1] - robot_yaws[k])
+                    omega_raw.append(dw / max(dt, 1e-9))
+                else:
+                    omega_raw.append(omega_raw[-1] if omega_raw else 0.0)
+            omega_refs = self._smooth_speeds(
+                omega_raw, dt, controller_config.omega_max,
+                rho=0.75, lam=0.4, lower=-1.0, accel_max=1.3,
+            )
+
+            # ── v_ref: projection onto robot's own heading ──────
+            v_raw: list[float] = []
             for k in range(N):
                 if k < N - 1:
                     dq = np.array(positions_xy[k + 1]) - np.array(positions_xy[k])
-                    fwd = np.array([math.cos(psi[k]), math.sin(psi[k])])
-                    v_raw = float(np.dot(dq, fwd)) / max(dt, 1e-9)
-                    v_refs.append(max(0.0, min(controller_config.v_max, v_raw)))
-                    dw = wrap_to_pi(psi[k + 1] - psi[k])
-                    omega_refs.append(max(-controller_config.omega_max,
-                                         min(controller_config.omega_max, dw / max(dt, 1e-9))))
+                    fwd = np.array([math.cos(robot_yaws[k]), math.sin(robot_yaws[k])])
+                    v_tilde = float(np.dot(dq, fwd)) / max(dt, 1e-9)
+                    v_raw.append(v_tilde)
                 else:
-                    v_refs.append(v_refs[-1] if v_refs else 0.0)
-                    omega_refs.append(omega_refs[-1] if omega_refs else 0.0)
+                    v_raw.append(v_raw[-1] if v_raw else 0.0)
+            v_refs = self._smooth_speeds(
+                v_raw, dt, controller_config.v_max,
+                rho=0.55, lam=0.4, lower=0.0, accel_max=0.20,
+            )
 
             samples: list[RobotReferenceSample] = []
             for k, (pos_xy, alpha, v_ref, w_ref) in enumerate(
                 zip(positions_xy, transition_alphas, v_refs, omega_refs)
             ):
                 samples.append(RobotReferenceSample(
-                    position_xy=pos_xy, yaw=float(psi[k]),
+                    position_xy=pos_xy, yaw=float(robot_yaws[k]),
                     v_ref=v_ref, omega_ref=w_ref,
                     alpha=alpha, t=k * dt,
                 ))
@@ -110,6 +145,7 @@ class ControllerReferenceBuilder:
             "terminal_center_heading_rad": center_heading_rads[-1],
             "robot_slots_local": slots_local,
             "terminal_center_xy": center_points_xy[-1],
+            "invalidate_previous_predictions": guide.switched,
         })
         return FormationControllerReference(
             formation_name=guide.formation_name,
@@ -121,6 +157,53 @@ class ControllerReferenceBuilder:
             horizon_steps=controller_config.horizon_steps,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _smooth_speeds(
+        raw: list[float],
+        dt: float,
+        max_val: float,
+        *,
+        rho: float = 0.7,
+        lam: float = 0.4,
+        lower: float = 0.0,
+        accel_max: float | None = None,
+    ) -> list[float]:
+        """Clip, EMA-smooth, and acceleration-limit a speed/omega profile.
+
+        Steps:
+          1. clip to [lower · max_val, rho · max_val]
+          2. forward‑backward EMA (zero‑phase)
+          3. acceleration limit (optional, absolute max change per dt)
+        """
+        lo = lower * max_val
+        hi = rho * max_val
+        N = len(raw)
+
+        # ── 1. clip ──────────────────────────────────────────────
+        clipped = [max(lo, min(hi, v)) for v in raw]
+
+        # ── 2. forward‑backward EMA ─────────────────────────────
+        fwd = [clipped[0]]
+        for k in range(1, N):
+            fwd.append(lam * clipped[k] + (1.0 - lam) * fwd[-1])
+
+        bwd = [fwd[-1]]
+        for k in range(N - 2, -1, -1):
+            bwd.insert(0, lam * fwd[k] + (1.0 - lam) * bwd[0])
+
+        smooth = [(f + b) / 2.0 for f, b in zip(fwd, bwd)]
+
+        # ── 3. acceleration limit ──────────────────────────────
+        if accel_max is None:
+            return smooth
+        out = [smooth[0]]
+        for k in range(1, N):
+            dv = smooth[k] - out[-1]
+            max_step = accel_max * dt
+            dv = max(-max_step, min(max_step, dv))
+            out.append(out[-1] + dv)
+        return out
 
     def _hermite_resample(
         self,

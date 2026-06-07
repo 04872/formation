@@ -125,7 +125,7 @@ class FormationSelectorTest(unittest.TestCase):
     def test_high_switch_cost_prefers_current_square(self) -> None:
         map_data, preview = self._build_right_angle_preview(preview_distance_m=3.5)
         square = self.library.get("square")
-        compact = self.library.get("compact")
+        column = self.library.get("column")
         selector = FormationSelector(
             SelectorConfig(
                 weights=SelectorWeights(
@@ -141,7 +141,7 @@ class FormationSelectorTest(unittest.TestCase):
         result = selector.select_target_formation(
             map_data,
             preview,
-            [square, compact],
+            [square, column],
             self.robot_radius,
             self.safety_margin,
             current_formation=square,

@@ -71,7 +71,7 @@ class EmbeddingQPSolverTest(unittest.TestCase):
 
     def test_solver_keeps_near_zero_offset_in_symmetric_corridor(self) -> None:
         _, preview, curve_band = self._build_right_angle_inputs()
-        result = self.solver.solve(preview, curve_band, self.library.get("compact"))
+        result = self.solver.solve(preview, curve_band, self.library.get("t_shape"))
 
         self.assertTrue(result.is_feasible)
         self.assertEqual(len(result.lateral_offsets_m), preview.sample_count)
@@ -80,7 +80,7 @@ class EmbeddingQPSolverTest(unittest.TestCase):
 
     def test_solver_biases_offsets_toward_open_side(self) -> None:
         _, preview, curve_band = self._build_narrowing_inputs()
-        result = self.solver.solve(preview, curve_band, self.library.get("compact"))
+        result = self.solver.solve(preview, curve_band, self.library.get("t_shape"))
 
         self.assertTrue(result.is_feasible)
         self.assertGreater(sum(abs(value) for value in result.lateral_offsets_m), 1e-3)
@@ -120,7 +120,7 @@ class EmbeddingQPSolverTest(unittest.TestCase):
 
     def test_solver_slot_points_in_step_local_corridor(self) -> None:
         map_data, preview, curve_band = self._build_right_angle_turn_inputs()
-        formation = self.library.get("compact")
+        formation = self.library.get("t_shape")
         result = self.solver.solve(preview, curve_band, formation)
 
         self.assertTrue(result.is_feasible)
@@ -130,7 +130,7 @@ class EmbeddingQPSolverTest(unittest.TestCase):
 
     def test_solver_reports_corridor_margin_from_step_local_strip_cells(self) -> None:
         _, preview, curve_band = self._build_right_angle_inputs()
-        formation = self.library.get("compact")
+        formation = self.library.get("t_shape")
         result = self.solver.solve(preview, curve_band, formation)
 
         self.assertTrue(result.is_feasible)

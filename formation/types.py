@@ -245,18 +245,18 @@ class ControlCommand:
 
 @dataclass
 class MPCWeights:
-    position: float = 80.0
-    heading: float = 1.5
-    input: float = 2.0
+    position: float = 25.0
+    heading: float = 4.0
+    input: float = 0.8
     input_smooth: float = 1.0
     initial_input_smooth: float = 1.0
     obstacle_slack: float = 800.0
-    neighbor_slack: float = 50.0
-    relative_position: float = 10.0
-    velocity_consensus: float = 4.0
-    progress_sync: float = 2.0
+    neighbor_slack: float = 1200.0
+    relative_position: float = 2.0
+    velocity_consensus: float = 0.5
+    progress_sync: float = 0.5
     progress_rate_sync: float = 0.0
-    terminal_position: float = 80.0
+    terminal_position: float = 60.0
 
 
 @dataclass

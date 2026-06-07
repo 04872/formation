@@ -360,21 +360,7 @@ class DistributedFormationMPC:
         H = matrix.shape[1]
         if H <= 1:
             return matrix
-        # Do not blend positions over a long window — only apply a very
-        # short yaw blend to avoid abrupt heading jumps. Position blending
-        # plus replacing p_ref0 causes double-editing; prefer leaving
-        # positions intact so MPC sees the true initial error via dx0.
-        orig = matrix[:, :H].copy()
-        yaw_blend_steps = min(3, H)
-        for k in range(yaw_blend_steps):
-            alpha = (k + 1.0) / yaw_blend_steps
-            th_target = state.yaw + wrap_to_pi(orig[2, k] - state.yaw)
-            matrix[2, k] = state.yaw + alpha * wrap_to_pi(th_target - state.yaw)
-        for k in range(H - 1):
-            disp = math.hypot(matrix[0, k + 1] - matrix[0, k], matrix[1, k + 1] - matrix[1, k])
-            matrix[3, k] = disp / max(self.config.dt, 1e-9)
-            dh = wrap_to_pi(matrix[2, k + 1] - matrix[2, k])
-            matrix[4, k] = dh / max(self.config.dt, 1e-9)
+        # Only clip to bounds — yaw/v/ω are generated in controller_reference.py
         matrix[3, :] = np.clip(matrix[3, :], 0.0, self.config.v_max)
         matrix[4, :] = np.clip(matrix[4, :], -self.config.omega_max, self.config.omega_max)
         return matrix

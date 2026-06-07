@@ -107,7 +107,7 @@ class FormationPipelineSmokeTest(unittest.TestCase):
         )
 
         self.assertTrue(result.selected_evaluation.is_safe)
-        self.assertIn(result.selected_formation.name, {"t_shape", "square", "compact"})
+        self.assertIn(result.selected_formation.name, {"t_shape", "square", "column"})
         self.assertLess(trace.max_tracking_error, 0.60)
         self.assertGreaterEqual(trace.min_obstacle_clearance, self.robot_radius + self.safety_margin - 0.25)
         self.assertGreaterEqual(trace.min_pairwise_distance, 2.0 * self.robot_radius + self.inter_robot_margin - 0.46)
