@@ -202,31 +202,33 @@ class MapBuilder:
         occupancy = self._make_full_occupancy(config)
         x_grid, y_grid = self._cell_centers(config)
 
-        left_room = (
-            (x_grid >= -config.width_m / 2.0 + config.resolution)
-            & (x_grid <= -config.neck_length / 2.0)
-            & (np.abs(y_grid) <= config.room_height / 2.0)
+        half_passage = config.passage_width / 2.0
+        gap_bottom = config.passage_center_y + half_passage
+        gap_top = config.passage_center_y - half_passage
+
+        # narrow passage between two obstacle rectangles
+        passage = (
+            (x_grid >= config.passage_start_x)
+            & (x_grid <= config.passage_end_x)
+            & (y_grid >= gap_top)
+            & (y_grid <= gap_bottom)
         )
-        right_room = (
-            (x_grid >= config.neck_length / 2.0)
-            & (x_grid <= config.width_m / 2.0 - config.resolution)
-            & (np.abs(y_grid) <= config.room_height / 2.0)
+        # open area on both sides of the passage
+        free_left = x_grid < config.passage_start_x
+        free_right = x_grid > config.passage_end_x
+        free_area = (free_left | free_right) & (
+            (y_grid > gap_top - config.height_m / 2.0 + config.resolution)
+            & (y_grid < gap_bottom + config.height_m / 2.0 - config.resolution)
         )
-        neck = (
-            (x_grid >= -config.neck_length / 2.0)
-            & (x_grid <= config.neck_length / 2.0)
-            & (np.abs(y_grid) <= config.neck_width / 2.0)
-        )
-        occupancy[left_room | right_room | neck] = False
+        occupancy[passage | free_area] = False
         occupancy[[0, -1], :] = True
         occupancy[:, [0, -1]] = True
+
         obstacle_primitives = [
-            {
-                "type": "narrow_entrance",
-                "room_height": config.room_height,
-                "neck_width": config.neck_width,
-                "neck_length": config.neck_length,
-            }
+            {"type": "rect", "cx": 0.0, "cy": (gap_bottom + config.height_m / 2.0) / 2.0,
+             "w": config.width_m, "h": config.height_m / 2.0 - gap_bottom},
+            {"type": "rect", "cx": 0.0, "cy": (gap_top - config.height_m / 2.0) / 2.0,
+             "w": config.width_m, "h": gap_top + config.height_m / 2.0},
         ]
         return self._finalize_map("narrow_entrance", config, occupancy, obstacle_primitives)
 

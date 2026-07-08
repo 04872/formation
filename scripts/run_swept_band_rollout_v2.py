@@ -121,7 +121,7 @@ def build_pipeline(
     formations = library.list()
 
     mpc_config = MPCConfig(
-        dt=0.2, horizon_steps=10, v_max=0.8, omega_max=1.2,
+        dt=0.2, horizon_steps=10,
         robot_radius=robot_radius, safety_margin=safety_margin,
         inter_robot_margin=inter_robot_margin,
     )
@@ -142,19 +142,24 @@ def build_pipeline(
     preview = preview_planner.plan(map_data, ref_xy, window)
     selection = selector.select_target_formation(map_data, preview, formations, robot_radius, safety_margin)
 
-    # Start from square for consistent initial state
-    square = library.get("square")
-    square_eval = next((ev for ev in selection.evaluations if ev.formation_name == "square"), None)
-    if square_eval is None:
-        square_eval = selector.evaluate_candidate_formation(
-            map_data, preview, selection.curve_band, square, robot_radius, safety_margin)
-        selection.evaluations.append(square_eval)
-    square_guide = selector.guide_generator.build(square_eval, square)
-    controller_reference = reference_builder.build(square_guide)
+    # Per‑map initial formation
+    initial_form_name = {
+        "right_angle_corridor": "t_shape",
+        "s_curve_corridor": "square",
+        "narrow_entrance": "horizontal_line",
+    }.get(map_type, "square")
+    init_fm = library.get(initial_form_name)
+    init_eval = next((ev for ev in selection.evaluations if ev.formation_name == initial_form_name), None)
+    if init_eval is None:
+        init_eval = selector.evaluate_candidate_formation(
+            map_data, preview, selection.curve_band, init_fm, robot_radius, safety_margin)
+        selection.evaluations.append(init_eval)
+    init_guide = selector.guide_generator.build(init_eval, init_fm)
+    controller_reference = reference_builder.build(init_guide)
     initial_states = simulator.initial_states_from_reference(controller_reference)
-    selection.selected_formation = square
-    selection.selected_evaluation = square_eval
-    selection.guide = square_guide
+    selection.selected_formation = init_fm
+    selection.selected_evaluation = init_eval
+    selection.guide = init_guide
 
     # Inject swept‑band feasibility
     from formation.formation_feasibility_v2 import FormationFeasibilityV2
@@ -181,28 +186,61 @@ def map_extent(map_data) -> list[float]:
     return [ox, ox + map_data.width_m, oy, oy + map_data.height_m]
 
 
-# ── trajectory plot (unchanged) ───────────────────────────────────
+# ── trajectory plot ──────────────────────────────────────────────
 
 def draw_trajectory(context: dict, output: Path):
     map_data = context["map_data"]
     trace = context["trace"]
-    fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
     extent = map_extent(map_data)
     ax.imshow(map_data.occupancy.astype(float), origin="lower", extent=extent,
               cmap="gray_r", interpolation="nearest", alpha=0.95)
+    # Evenly spaced snapshots by arc-length (avoids clustering at slow end).
+    centroids = np.array([
+        [sum(s[i].x for i in range(len(s))) / max(1, len(s)),
+         sum(s[i].y for i in range(len(s))) / max(1, len(s))]
+        for s in trace.state_history
+    ])
+    arc = np.zeros(len(centroids))
+    arc[1:] = np.cumsum(np.linalg.norm(np.diff(centroids, axis=0), axis=1))
+    n_snapshots = 5
+    target_arc = np.linspace(arc[0], arc[-1], n_snapshots)
+    snap_indices = [int(np.searchsorted(arc, a)) for a in target_arc]
+    seen: set[int] = set()
+    unique = []
+    for idx in snap_indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique.append(idx)
+    snap_indices = unique
+    # Draw trajectories + formation outlines at snapshots.
     initial_states = trace.state_history[0] if trace.state_history else []
     for ri in range(len(initial_states)):
         color = ROBOT_COLORS[ri % len(ROBOT_COLORS)]
         pts = [(s[ri].x, s[ri].y) for s in trace.state_history]
-        ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color, linewidth=2.2, label=f"robot {ri}")
-        ax.scatter(initial_states[ri].x, initial_states[ri].y, color=color, s=28, marker="o", zorder=4)
-    ax.scatter(*map_data.goal_xy, color="tab:purple", s=70, marker="*", label="goal", zorder=4)
-    s = trace_summary(trace)
-    ax.set_title(f"Trajectories — {map_data.name}\ngoal={s['goal_distance']:.2f}m cycles={s['replanning_cycles']}")
+        ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color,
+                linewidth=1.5, label=f"robot {ri}")
+        ax.scatter(initial_states[ri].x, initial_states[ri].y, color=color,
+                   s=28, marker="o", zorder=4)
+    # Formation snapshots (convex hull per frame)
+    for si in snap_indices:
+        s_list = trace.state_history[si]
+        pts = np.array([[s.x, s.y] for s in s_list])
+        if len(pts) >= 3:
+            centroid = pts.mean(axis=0)
+            angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+            order = np.argsort(angles)
+            hull = np.vstack([pts[order], pts[order[0]]])
+            ax.plot(hull[:, 0], hull[:, 1], "k--", linewidth=1.0, alpha=0.7, zorder=3)
+        for ri, s in enumerate(s_list):
+            ax.scatter(s.x, s.y, color=ROBOT_COLORS[ri % len(ROBOT_COLORS)],
+                       s=28, marker="o", zorder=4)
+
+    ax.scatter(*map_data.goal_xy, color="tab:purple", s=70, marker="*",
+               label="goal", zorder=4)
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=200, bbox_inches="tight")
+    fig.savefig(output, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"  traj → {output}")
 

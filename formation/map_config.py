@@ -83,11 +83,14 @@ class ObstacleClusterConfig(BaseMapConfig):
 
 @dataclass
 class NarrowEntranceConfig(BaseMapConfig):
-    neck_width: float = 1.1
-    left_room_width: float = 4.0
-    right_room_width: float = 4.0
-    room_height: float = 4.0
-    neck_length: float = 2.0
+    width_m: float = 16.0
+    height_m: float = 12.0
+    start_xy: Point2D = (-6.0, 3.0)
+    goal_xy: Point2D = (6.0, -3.0)
+    passage_width: float = 1.2
+    passage_center_y: float = 0.0
+    passage_start_x: float = -1.5
+    passage_end_x: float = 1.5
 
 
 @dataclass

@@ -1,2 +1,2 @@
 scenario_name,success,failure_reason,T_goal,num_steps,e_track_mean,e_track_max,e_dist_mean,e_dist_max,e_sim_mean,e_sim_max,formation_switch_count,obstacle_collision,inter_robot_collision,timeout,planning_failure,control_failure,mpc_fallback_count
-right_angle_corridor,False,inter_robot_collision,33.800000000000004,169,0.09130562614757494,0.315985468463888,0.02240401202881139,0.22561018527303242,0.033498280158760156,0.3102415314425365,2,False,True,False,False,False,0
+s_curve_corridor,True,,26.200000000000003,131,0.0748018887417389,0.16750532903514076,0.014605727512327398,0.039010249320529274,0.025950554285866546,0.09565421111794883,0,False,False,False,False,False,0
