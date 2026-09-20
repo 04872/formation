@@ -140,20 +140,20 @@ def build_pipeline(
 
     # Start from square for consistent initial state
     square = library.get("square")
-    square_eval = next((ev for ev in selection.evaluations if ev.formation_name == "square"), None)
-    if square_eval is None:
-        square_eval = selector.evaluate_candidate_formation(
-            map_data, preview, selection.curve_band, square, robot_radius, safety_margin)
-        selection.evaluations.append(square_eval)
-    square_guide = selector.guide_generator.build(square_eval, square)
+    init_eval = next((ev for ev in selection.evaluations if ev.formation_name == "square"), None)
+    if init_eval is None:
+        init_eval = selector.evaluate_candidate_formation(
+            map_data, preview, None, square, robot_radius, safety_margin)
+        selection.evaluations.append(init_eval)
+    square_guide = selector.guide_generator.build(init_eval, square)
     controller_reference = reference_builder.build(square_guide)
     initial_states = simulator.initial_states_from_reference(controller_reference)
     selection.selected_formation = square
-    selection.selected_evaluation = square_eval
+    selection.selected_evaluation = init_eval
     selection.guide = square_guide
 
     # Inject swept‑band feasibility
-    from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
+    from formation.formation_feasibility import FeasibilityConfig, FormationFeasibility
     simulator._feasibility = FormationFeasibility(FeasibilityConfig(mode="swept_band_v2"))
     trace = simulator.simulate_full_path(
         initial_states, map_data, global_path, formations,

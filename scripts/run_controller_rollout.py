@@ -133,7 +133,7 @@ def build_pipeline(
     square_eval = next((ev for ev in selection.evaluations if ev.formation_name == "square"), None)
     if square_eval is None:
         square_eval = selector.evaluate_candidate_formation(
-            map_data, preview, selection.curve_band, square, robot_radius, safety_margin,
+            map_data, preview, None, square, robot_radius, safety_margin,
         )
         selection.evaluations.append(square_eval)
     square_guide = selector.guide_generator.build(square_eval, square)
@@ -388,20 +388,16 @@ def draw_preview_curve(context: dict, output: Path) -> None:
 
 
 def draw_corridor(context: dict, output: Path) -> None:
-    """Overlay all replan cycles' chord + strip cells on a single map."""
+    """Overlay per-cycle swept-band centerlines on a single map."""
     map_data = context["map_data"]
     trace = context["trace"]
     meta = trace.metadata
-    strip_cells_list = meta.get("per_cycle_strip_cells", [])
-    chord_centers_list = meta.get("per_cycle_chord_centers", [])
-    chord_endpoints_list = meta.get("per_cycle_chord_endpoints", [])
+    centerlines = meta.get("per_cycle_centerline", [])
     selected = meta.get("selected_formations", [])
 
-    if not strip_cells_list:
-        cb = context["selection"].curve_band
-        strip_cells_list = [[cell.vertices_xy for cell in cb.strip_cells]]
-        chord_centers_list = [[s.center_xy for s in cb.samples]]
-        chord_endpoints_list = [[(s.left_xy, s.right_xy) for s in cb.samples]]
+    if not centerlines:
+        guide_pts = context["selection"].guide.guide_samples
+        centerlines = [[sample.center_xy for sample in guide_pts]]
         selected = [context["selection"].selected_formation.name]
 
     fig, ax = plt.subplots(figsize=(12, 8), constrained_layout=True)
@@ -409,24 +405,16 @@ def draw_corridor(context: dict, output: Path) -> None:
     ax.imshow(map_data.occupancy.astype(float), origin="lower", extent=extent, cmap="gray_r", interpolation="nearest", alpha=0.95)
     ax.scatter(*map_data.goal_xy, color="tab:purple", s=80, marker="*", label="goal", zorder=5)
 
-    from matplotlib.patches import Polygon
-    colors = plt.cm.tab10(np.linspace(0, 1, len(strip_cells_list)))
-    for i, (cells, centers, ends, sel) in enumerate(zip(
-        strip_cells_list, chord_centers_list, chord_endpoints_list, selected)):
+    colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(centerlines))))
+    for i, (centers, sel) in enumerate(zip(centerlines, selected)):
+        if not centers:
+            continue
         color = colors[i]
-        # Strip cells
-        for cell_verts in cells:
-            ax.add_patch(Polygon(list(cell_verts), closed=True, facecolor=color,
-                                 edgecolor=color, alpha=0.12, linewidth=0.5))
-        # Chord lines
-        for j, (left, right) in enumerate(ends):
-            if j % 3 == 0:
-                ax.plot([left[0], right[0]], [left[1], right[1]], color=color, linewidth=1.2, alpha=0.6)
-        # Centerline
-        cx = [c[0] for c in centers]; cy = [c[1] for c in centers]
+        cx = [c[0] for c in centers]
+        cy = [c[1] for c in centers]
         ax.plot(cx, cy, color=color, linewidth=2.5, alpha=0.9, label=f"cycle {i+1} [{sel}]")
 
-    ax.set_title(f"Safe Corridors: Chords + Strip Cells ({len(strip_cells_list)} cycles)\n{map_data.name}")
+    ax.set_title(f"Feasibility centerlines ({len(centerlines)} cycles)\n{map_data.name}")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
     output.parent.mkdir(parents=True, exist_ok=True)

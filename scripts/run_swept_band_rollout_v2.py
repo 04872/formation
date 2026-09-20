@@ -152,7 +152,7 @@ def build_pipeline(
     init_eval = next((ev for ev in selection.evaluations if ev.formation_name == initial_form_name), None)
     if init_eval is None:
         init_eval = selector.evaluate_candidate_formation(
-            map_data, preview, selection.curve_band, init_fm, robot_radius, safety_margin)
+            map_data, preview, None, init_fm, robot_radius, safety_margin)
         selection.evaluations.append(init_eval)
     init_guide = selector.guide_generator.build(init_eval, init_fm)
     controller_reference = reference_builder.build(init_guide)
@@ -162,9 +162,8 @@ def build_pipeline(
     selection.guide = init_guide
 
     # Inject swept‑band feasibility
-    from formation.formation_feasibility_v2 import FormationFeasibilityV2
-    from formation.formation_feasibility import FeasibilityConfig
-    simulator._feasibility = FormationFeasibilityV2(FeasibilityConfig(mode="swept_band_v2"))
+    from formation.formation_feasibility import FeasibilityConfig, FormationFeasibility
+    simulator._feasibility = FormationFeasibility(FeasibilityConfig(mode="swept_band_v2"))
     trace = simulator.simulate_full_path(
         initial_states, map_data, global_path, formations,
         preview_planner, selector, reference_builder,
@@ -219,7 +218,7 @@ def draw_trajectory(context: dict, output: Path):
         color = ROBOT_COLORS[ri % len(ROBOT_COLORS)]
         pts = [(s[ri].x, s[ri].y) for s in trace.state_history]
         ax.plot([p[0] for p in pts], [p[1] for p in pts], color=color,
-                linewidth=1.5, label=f"robot {ri}")
+                linewidth=1.5, label=f"robot {ri} trajectory")
         ax.scatter(initial_states[ri].x, initial_states[ri].y, color=color,
                    s=28, marker="o", zorder=4)
     # Formation snapshots (convex hull per frame)
@@ -231,14 +230,24 @@ def draw_trajectory(context: dict, output: Path):
             angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
             order = np.argsort(angles)
             hull = np.vstack([pts[order], pts[order[0]]])
-            ax.plot(hull[:, 0], hull[:, 1], "k--", linewidth=1.0, alpha=0.7, zorder=3)
+            ax.plot(hull[:, 0], hull[:, 1], "k--", linewidth=1.0, alpha=0.7,
+                    zorder=3, label="formation snapshot")
         for ri, s in enumerate(s_list):
             ax.scatter(s.x, s.y, color=ROBOT_COLORS[ri % len(ROBOT_COLORS)],
                        s=28, marker="o", zorder=4)
 
     ax.scatter(*map_data.goal_xy, color="tab:purple", s=70, marker="*",
                label="goal", zorder=4)
+    ax.scatter(initial_states[0].x, initial_states[0].y, color="tab:green",
+               edgecolor="k", s=80, marker="s", label="start", zorder=5)
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_aspect("equal")
+    handles, labels = ax.get_legend_handles_labels()
+    dedup = dict(zip(labels, handles))
+    legend = ax.legend(
+        dedup.values(), dedup.keys(),
+        loc="upper left", fontsize=9, frameon=True,
+    )
+    legend.set_zorder(10)
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=600, bbox_inches="tight")
     plt.close(fig)

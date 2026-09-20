@@ -1,7 +1,5 @@
 from formation.astar import AStarPlanner
 from formation.controller_reference import ControllerReferenceBuilder
-from formation.curve_band import CurveBandBuilder
-from formation.embedding_qp import EmbeddingQPSolver
 from formation.formation_feasibility import FeasibilityConfig, FormationFeasibility, FormationFeasibilityResult
 from formation.formation_library import FormationLibrary
 from formation.formation_selector import FormationSelector, SelectedFormationResult, SelectorConfig, SelectorWeights, select_target_formation
@@ -59,13 +57,11 @@ __all__ = [
     "ControlCommand",
     "ControllerReferenceBuilder",
     "CurveBand",
-    "CurveBandBuilder",
     "CurveBandSample",
     "CurveBandStripCell",
     "DistributedFormationMPC",
     "ConsensusFormationMPC",
     "EmbeddingQPResult",
-    "EmbeddingQPSolver",
     "FormationCandidateEvaluation",
     "FormationControllerReference",
     "FormationGuide",

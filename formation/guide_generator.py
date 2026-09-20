@@ -65,6 +65,8 @@ class GuideGenerator:
             "target_slots_step0": ordered_slots_local,
             "current_slots_step0": selected_formation.slots,
             "formation_name": selected_eval.formation_name,
+            "selected_formation_name": selected_formation.name,
+            "selected_evaluation_is_safe": selected_eval.is_safe,
             "band_feasible": selected_eval.band_feasible,
             "is_safe": selected_eval.is_safe,
             "min_slot_clearance_m": selected_eval.min_slot_clearance_m,
@@ -85,21 +87,25 @@ class GuideGenerator:
             "score_corridor_violation_cost": selected_eval.score_breakdown.corridor_violation_cost,
             "score_min_corridor_margin_m": selected_eval.score_breakdown.min_corridor_margin_m,
             "score_safety_margin_m": selected_eval.score_breakdown.safety_margin_m,
+            "score_terminal_alignment_error_rad": float(selected_eval.score_breakdown.metadata.get("score_terminal_alignment_error_rad", 0.0)),
+            "score_terminal_alignment_weight": float(selected_eval.score_breakdown.metadata.get("score_terminal_alignment_weight", 0.0)),
             "score_breakdown_metadata": dict(selected_eval.score_breakdown.metadata),
             "selected_evaluation_metadata": dict(selected_eval.metadata),
+            "embedding_is_feasible": bool(selected_eval.metadata.get("embedding_is_feasible", selected_eval.is_safe)),
+            "embedding_failure_reason": selected_eval.metadata.get("embedding_failure_reason", ""),
+            "offset_cost": float(selected_eval.metadata.get("offset_cost", selected_eval.score_breakdown.offset_cost)),
+            "heading_cost": float(selected_eval.metadata.get("heading_cost", selected_eval.score_breakdown.heading_cost)),
+            "min_corridor_margin_m": float(selected_eval.metadata.get("min_corridor_margin_m", selected_eval.score_breakdown.min_corridor_margin_m)),
+            "corridor_violation_cost": float(selected_eval.metadata.get("corridor_violation_cost", selected_eval.score_breakdown.corridor_violation_cost)),
         }
         if selected_eval.assignment is not None:
             guide_metadata["assignment_total_cost"] = selected_eval.assignment.total_cost
             guide_metadata["assignment_max_cost"] = selected_eval.assignment.max_cost
             guide_metadata["assignment_per_robot_costs"] = list(selected_eval.assignment.per_robot_costs)
-        if selected_eval.embedding_qp_result is not None:
-            guide_metadata["embedding_is_feasible"] = selected_eval.embedding_qp_result.is_feasible
-            guide_metadata["embedding_failure_reason"] = selected_eval.embedding_qp_result.failure_reason
-            guide_metadata["offset_cost"] = selected_eval.embedding_qp_result.offset_cost
-            guide_metadata["heading_cost"] = selected_eval.embedding_qp_result.heading_cost
-            guide_metadata["min_corridor_margin_m"] = selected_eval.embedding_qp_result.min_corridor_margin_m
-            guide_metadata["corridor_violation_cost"] = selected_eval.embedding_qp_result.corridor_violation_cost
-            guide_metadata.update(selected_eval.embedding_qp_result.metadata)
+        guide_metadata.update({
+            key: value for key, value in selected_eval.metadata.items()
+            if key not in guide_metadata
+        })
         from formation.types import AssignmentResult
         used_assignment = AssignmentResult(
             assignment=assignment_tuple,

@@ -154,9 +154,7 @@ class MultiRobotSimulator:
             # Use swept‑band feasibility when a feasibility module is injected
             feasibility = getattr(self, "_feasibility", None)
             if feasibility is not None:
-                from formation.formation_feasibility import FormationFeasibility, FeasibilityConfig
-                from formation.types import FormationCandidateEvaluation, FormationScoreBreakdown
-                # v2 builds its own band internally; skip expensive CurveBandBuilder
+                # Swept-band feasibility builds its own band internally.
                 feas_results = feasibility.check_multi(
                     map_data, preview, None, formations, robot_radius, safety_margin,
                     current_formation=current_formation, current_states=current_states,
@@ -167,7 +165,7 @@ class MultiRobotSimulator:
                 if feasible:
                     best_feas = feasible[0]
                     sel_fm = next(f for f in formations if f.name == best_feas.formation_name)
-                    # Run full SLSQP centreline optimisation for the selected formation
+                    # Run the full band-recenter optimization for the selected formation
                     best = feasibility.optimize_centerline(
                         map_data, preview, sel_fm, robot_radius, safety_margin)
                     best.assignment = best_feas.assignment  # use assignment from feasibility check
@@ -176,24 +174,13 @@ class MultiRobotSimulator:
                     col_result = next((r for r in feas_results if r.formation_name == "column"), feas_results[-1])
                     best = col_result
                     sel_fm = next(f for f in formations if f.name == best.formation_name)
-                # Build a FormationCandidateEvaluation bridge
-                eval_ev = FormationCandidateEvaluation(
-                    formation_name=best.formation_name,
-                    band_feasible=best.is_feasible, is_safe=best.is_feasible,
-                    score_breakdown=FormationScoreBreakdown(
-                        min_corridor_margin_m=best.min_corridor_margin_m,
-                        embedding_cost=0, corridor_violation_cost=0,
-                        switch_cost=0, task_utility=sel_fm.task_utility,
-                        total_score=0, offset_cost=0, heading_cost=0, metadata={},
-                    ),
-                    center_points_xy=best.center_points_xy,
-                    heading_rads=best.heading_rads,
-                    slot_points_by_step_xy=best.slot_points_by_step_xy,
-                    assignment=best.assignment,
-                    embedding_qp_result=best.embedding_qp_result,
-                    lateral_offset_m=0, heading_offset_rad=0,
-                    min_slot_clearance_m=best.min_slot_clearance_m,
-                    failure_reason=best.failure_reason, metadata=best.metadata,
+                eval_ev = selector.build_candidate_evaluation(
+                    map_data,
+                    preview,
+                    sel_fm,
+                    robot_radius,
+                    safety_margin,
+                    best,
                 )
                 guide = selector.guide_generator.build(eval_ev, sel_fm,
                     current_formation=current_formation, current_assignment=current_assignment)

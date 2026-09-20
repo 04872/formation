@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
 from formation.assignment import compute_best_assignment
-from formation.curve_band import CurveBandBuilder
-from formation.embedding_qp import EmbeddingQPSolver
 from formation.mpc_controller import query_distance_field
 from formation.swept_band import SweptBand, SweptBandBuilder
 from formation.types import (
@@ -47,75 +45,104 @@ class FormationFeasibilityResult:
 
 @dataclass
 class FeasibilityConfig:
-    # ── legacy (EmbeddingQP) ──────────────────────────────────────
     max_heading_offset_rad: float = 0.30
     heading_grid_size: int = 31
     lateral_grid_size: int = 31
-
-    # ── mode ──────────────────────────────────────────────────────
-    mode: str = "legacy"          # "legacy" | "swept_band"
-
-    # ── swept‑band ────────────────────────────────────────────────
-    feasibility_tol_m: float = 0.05      # SDF discretisation tolerance (~0.4 cell at 5cm resolution)
+    mode: str = "swept_band_v2"
+    feasibility_tol_m: float = 0.05
     bspline_control_count: int = 6
     collocation_points: int = 30
     verification_points: int = 60
-    embed_margin_m: float = 0.0           # δ_emb
-    ref_weight: float = 1.0               # w_ref
-    smooth2_weight: float = 0.5           # w₁  (c'' penalty)
-    smooth3_weight: float = 0.2           # w₂  (c''' penalty)
-    clearance_weight: float = 0.05        # w_m  (optional)
+    embed_margin_m: float = 0.0
+    ref_weight: float = 1.0
+    smooth2_weight: float = 0.5
+    smooth3_weight: float = 0.2
+    clearance_weight: float = 0.05
     max_opt_iters: int = 200
     feasibility_tol: float = 1e-4
 
 
-class FormationFeasibility:
-    """Check whether a candidate formation fits inside the curve band.
+def _make_preview_from_curve(pts_xy, source_mode: str = "v2_cr") -> LocalPreviewPath:
+    """Build a LocalPreviewPath from a polyline using its own Frenet frame."""
+    pts = np.asarray(pts_xy, dtype=float)
+    n = len(pts)
 
-    Two modes:
-      - ``legacy``      – EmbeddingQPSolver + discrete strip cells
-      - ``swept_band``  – SweptBand + B‑spline centreline optimisation
-    """
+    arc = np.zeros(n, dtype=float)
+    if n >= 2:
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        arc[1:] = np.cumsum(seg)
+
+    tangents = np.zeros_like(pts)
+    for j in range(n):
+        if n <= 1:
+            d = np.array([1.0, 0.0])
+        elif j == 0:
+            d = pts[1] - pts[0]
+        elif j == n - 1:
+            d = pts[-1] - pts[-2]
+        else:
+            d = pts[j + 1] - pts[j - 1]
+        dn = float(np.linalg.norm(d))
+        tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+
+    normals = np.column_stack((-tangents[:, 1], tangents[:, 0])) if n > 0 else np.zeros((0, 2), dtype=float)
+    normals_lp = normals.copy()
+    for j in range(n):
+        lo, hi = max(0, j - 1), min(n, j + 2)
+        avg = np.mean(normals[lo:hi], axis=0)
+        an = float(np.linalg.norm(avg))
+        if an > 1e-9:
+            normals_lp[j] = avg / an
+
+    return LocalPreviewPath(
+        points_xy=[(float(p[0]), float(p[1])) for p in pts],
+        arc_lengths=[float(s) for s in arc],
+        tangents_xy=[(float(t[0]), float(t[1])) for t in tangents],
+        normals_xy=[(float(nn[0]), float(nn[1])) for nn in normals_lp],
+        curvatures=[0.0] * n,
+        source_mode=source_mode,
+        is_safe=True,
+        min_clearance=0.5,
+    )
+
+
+class FormationFeasibility:
+    """V2-only swept-band feasibility checker."""
 
     def __init__(self, config: FeasibilityConfig | None = None) -> None:
         self.config = config or FeasibilityConfig()
-        self._embedding_solver = EmbeddingQPSolver(
-            max_heading_offset_rad=self.config.max_heading_offset_rad,
-            heading_grid_size=self.config.heading_grid_size,
-            lateral_grid_size=self.config.lateral_grid_size,
-        )
         self._swept_builder = SweptBandBuilder()
-
-    # ── public ────────────────────────────────────────────────────
+        self._v2_cache: dict[str, Any] = {}
+        self._band_recenter_history: list[list[Point2D]] = []
+        self._bezier_A_cache: dict[tuple[Any, ...], np.ndarray] = {}
 
     def check(
         self,
         map_data: MapData,
         preview_path: LocalPreviewPath,
-        curve_band: CurveBand,
+        curve_band: CurveBand | None,
         formation: FormationSpec,
         robot_radius: float,
         safety_margin: float,
         current_formation: FormationSpec | None = None,
         current_states: list[RobotState] | None = None,
     ) -> FormationFeasibilityResult:
-        if self.config.mode == "swept_band":
-            return self._check_swept(
-                map_data, preview_path, curve_band, formation,
-                robot_radius, safety_margin,
-                current_formation, current_states,
-            )
-        return self._check_legacy(
-            map_data, preview_path, curve_band, formation,
-            robot_radius, safety_margin,
-            current_formation, current_states,
+        del curve_band
+        return self._check_swept_v2(
+            map_data,
+            preview_path,
+            formation,
+            robot_radius,
+            safety_margin,
+            current_formation,
+            current_states,
         )
 
     def check_multi(
         self,
         map_data: MapData,
         preview_path: LocalPreviewPath,
-        curve_band: CurveBand,
+        curve_band: CurveBand | None,
         formations: list[FormationSpec],
         robot_radius: float,
         safety_margin: float,
@@ -125,383 +152,660 @@ class FormationFeasibility:
         preference_order: list[str] | None = None,
         stop_at_first_feasible: bool = True,
     ) -> list[FormationFeasibilityResult]:
-        """Evaluate formations in *preference_order* (or as‑given).
+        del curve_band
+        return self._check_multi_v2(
+            map_data,
+            preview_path,
+            formations,
+            robot_radius,
+            safety_margin,
+            current_formation,
+            current_states,
+            preference_order=preference_order,
+            stop_at_first_feasible=stop_at_first_feasible,
+        )
 
-        With *stop_at_first_feasible*, the first feasible formation
-        short‑circuits the remaining (lower‑priority) candidates."""
-        if preference_order is not None:
-            rank = {name: i for i, name in enumerate(preference_order)}
-            ordered = sorted(formations, key=lambda f: rank.get(f.name, 99))
-        else:
-            ordered = sorted(formations, key=lambda f: f.lateral_half_width, reverse=True)
-        results: list[FormationFeasibilityResult] = []
-        for fm in ordered:
-            r = self.check(
-                map_data, preview_path, curve_band, fm,
-                robot_radius, safety_margin,
-                current_formation, current_states,
-            )
-            results.append(r)
-            if stop_at_first_feasible and r.is_feasible:
-                break
-        return results
-
-    # ═══════════════════════════════════════════════════════════════
-    #  swept‑band implementation  (Bézier centreline)
-    # ═══════════════════════════════════════════════════════════════
-
-    def _check_swept(
+    def optimize_centerline(
         self,
         map_data: MapData,
         preview_path: LocalPreviewPath,
-        curve_band: CurveBand,
+        formation: FormationSpec,
+        robot_radius: float,
+        safety_margin: float,
+    ) -> FormationFeasibilityResult:
+        if self._v2_cache:
+            cached = self._v2_cache
+            return self._build_swept_result(
+                map_data,
+                formation.name,
+                cached["band"],
+                cached["C_star"],
+                formation,
+                robot_radius,
+                safety_margin,
+                None,
+                None,
+                metadata={
+                    "check": "v2_cached",
+                    "delta_L": cached.get("delta_L", 0.0),
+                    "delta_R": cached.get("delta_R", 0.0),
+                },
+            )
+        results = self._check_multi_v2(
+            map_data,
+            preview_path,
+            [formation],
+            robot_radius,
+            safety_margin,
+            None,
+            None,
+            stop_at_first_feasible=False,
+        )
+        if self._v2_cache:
+            cached = self._v2_cache
+            return self._build_swept_result(
+                map_data,
+                formation.name,
+                cached["band"],
+                cached["C_star"],
+                formation,
+                robot_radius,
+                safety_margin,
+                None,
+                None,
+                metadata={
+                    "check": "v2_cached",
+                    "delta_L": cached.get("delta_L", 0.0),
+                    "delta_R": cached.get("delta_R", 0.0),
+                },
+            )
+        return results[0]
+
+    def _check_swept_v2(
+        self,
+        map_data: MapData,
+        preview_path: LocalPreviewPath,
         formation: FormationSpec,
         robot_radius: float,
         safety_margin: float,
         current_formation: FormationSpec | None,
         current_states: list[RobotState] | None,
     ) -> FormationFeasibilityResult:
-        clearance_threshold = robot_radius + safety_margin
-        band = self._swept_builder.build(map_data, preview_path, clearance_threshold)
-        ref_curve = np.asarray(preview_path.points_xy, dtype=float)
-        if len(ref_curve) < 2:
+        clearance = robot_radius + safety_margin
+        band = self._swept_builder.build(map_data, preview_path, clearance)
+        C0 = np.asarray(preview_path.points_xy, dtype=float)
+        if len(C0) < 2:
             return _infeasible(formation.name, "empty_preview")
-        δ = self.config.embed_margin_m
 
-        # ── min‑violation SLSQP: determine feasibility ───────────────
-        bezier = _CenterlineBezier.from_reference(
-            ref_curve,
+        bz = _CenterlineBezier.from_reference(
+            C0,
             control_count=self.config.bspline_control_count,
             bezier_tension=0.35,
         )
-        Q_feas, _ = self._min_violation(band, bezier, formation, δ)
-        curve_feas = bezier.evaluate(Q_feas, self.config.collocation_points)
-        ok_feas, worst_feas = self._eval_slots(band, curve_feas, formation, δ - self.config.feasibility_tol_m)
-        if ok_feas:
-            return self._build_swept_result(
-                map_data, formation.name, band, curve_feas, formation,
-                robot_radius, safety_margin,
-                current_formation, current_states,
-                metadata={"check": "min_violation_pass", "worst_margin": worst_feas},
-            )
+        _, C_R = self._band_recenter_qp(map_data, band, bz, C0, clearance)
+        δL, δR = self._compute_widths(map_data, C_R, clearance)
+        δ = self.config.embed_margin_m - self.config.feasibility_tol_m
 
-        # ── infeasible ───────────────────────────────────────────────
+        preview_R = _make_preview_from_curve(C_R, source_mode="v2_cr")
+        band_star = self._swept_builder.build(map_data, preview_R, clearance)
+
+        feasible = self._check_envelope(formation, δL, δR)
+        if feasible:
+            feasible, _ = self._eval_slots_rigid(map_data, C_R, formation, clearance, δ)
+
         return self._build_swept_result(
-            map_data, formation.name, band, curve_feas, formation,
-            robot_radius, safety_margin,
-            current_formation, current_states,
-            metadata={"check": "infeasible", "worst_margin": worst_feas},
+            map_data,
+            formation.name,
+            band_star,
+            C_R,
+            formation,
+            robot_radius,
+            safety_margin,
+            current_formation,
+            current_states,
+            metadata={
+                "check": "v2_pass" if feasible else "v2_fail",
+                "delta_L": δL,
+                "delta_R": δR,
+            },
         )
 
-    def optimize_centerline(
-        self, map_data: MapData, preview_path: LocalPreviewPath,
-        formation: FormationSpec, robot_radius: float, safety_margin: float,
-    ) -> FormationFeasibilityResult:
-        """Bézier control‑point centreline optimisation.
+    def _check_multi_v2(
+        self,
+        map_data: MapData,
+        preview_path: LocalPreviewPath,
+        formations: list[FormationSpec],
+        robot_radius: float,
+        safety_margin: float,
+        current_formation: FormationSpec | None,
+        current_states: list[RobotState] | None,
+        *,
+        preference_order: list[str] | None = None,
+        stop_at_first_feasible: bool = True,
+    ) -> list[FormationFeasibilityResult]:
+        clearance = robot_radius + safety_margin
+        band = self._swept_builder.build(map_data, preview_path, clearance)
+        C0 = np.asarray(preview_path.points_xy, dtype=float)
+        if len(C0) < 2:
+            return [_infeasible(fm.name, "empty_preview") for fm in formations]
 
-        Endpoint is constrained to the transversal line at the subgoal
-        (free laterally, fixed longitudinally).  All interior control
-        points are free.  Hard constraint: all slots must stay inside the
-        swept band.
-        """
-        clearance_threshold = robot_radius + safety_margin
-        band = self._swept_builder.build(map_data, preview_path, clearance_threshold)
-        ref_curve = np.asarray(preview_path.points_xy, dtype=float)
-        bezier = _CenterlineBezier.from_reference(
-            ref_curve, control_count=self.config.bspline_control_count, bezier_tension=0.35,
+        bz = _CenterlineBezier.from_reference(
+            C0,
+            control_count=self.config.bspline_control_count,
+            bezier_tension=0.35,
         )
-        subgoal = bezier._ref[-1]
-        # terminal tangent / normal from reference curve
-        d_end = ref_curve[-1] - ref_curve[-2]
+        _, C_R = self._band_recenter_qp(map_data, band, bz, C0, clearance)
+        self._band_recenter_history.append([(float(p[0]), float(p[1])) for p in C_R])
+
+        δL, δR = self._compute_widths(map_data, C_R, clearance)
+        preview_R = _make_preview_from_curve(C_R, source_mode="v2_cr")
+        band_star = self._swept_builder.build(map_data, preview_R, clearance)
+        self._v2_cache = {
+            "C_star": C_R,
+            "C_R": C_R,
+            "band": band_star,
+            "delta_L": δL,
+            "delta_R": δR,
+        }
+        δ = self.config.embed_margin_m - self.config.feasibility_tol_m
+
+        if preference_order is not None:
+            rank = {name: i for i, name in enumerate(preference_order)}
+            ordered = sorted(formations, key=lambda f: rank.get(f.name, 99))
+        else:
+            ordered = sorted(formations, key=lambda f: f.lateral_half_width, reverse=True)
+
+        results: list[FormationFeasibilityResult] = []
+        for fm in ordered:
+            feasible = self._check_envelope(fm, δL, δR)
+            if feasible:
+                ok_s, worst_s = self._eval_slots_rigid(map_data, C_R, fm, clearance, δ)
+                if not ok_s:
+                    print(
+                        f"    [eval fail] {fm.name}: envelope_ok slot_worst={worst_s:.3f} "
+                        f"δL={δL:.3f} δR={δR:.3f}",
+                        flush=True,
+                    )
+                feasible = ok_s
+            results.append(
+                self._build_swept_result(
+                    map_data,
+                    fm.name,
+                    band_star,
+                    C_R,
+                    fm,
+                    robot_radius,
+                    safety_margin,
+                    current_formation,
+                    current_states,
+                    metadata={
+                        "check": "v2_pass" if feasible else "v2_fail",
+                        "delta_L": δL,
+                        "delta_R": δR,
+                    },
+                )
+            )
+            if stop_at_first_feasible and feasible:
+                break
+        return results
+
+    def _band_recenter_qp(
+        self,
+        map_data: MapData,
+        band: SweptBand,
+        bezier: _CenterlineBezier,
+        C_init: np.ndarray,
+        clearance: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Solve the locally convexified band-recenter problem."""
+        try:
+            import cvxpy as cp
+        except ImportError:
+            Q = bezier.initial_controls()
+            print("    [Clarabel] unavailable; keeping initial centerline", flush=True)
+            return Q, C_init
+
+        Q = bezier.initial_controls().copy()
+        M = self.config.collocation_points
+        n_free = len(bezier.free_indices)
+        N_c = bezier.control_count
+        A = self._bezier_A_matrix(bezier, M)
+
+        C_init_eval = bezier.evaluate(Q, M)
+        d_end = C_init_eval[-1] - C_init_eval[-2]
         dn = float(np.linalg.norm(d_end))
         t_T = d_end / dn if dn > 1e-9 else np.array([1.0, 0.0])
-        n_T = np.array([-t_T[1], t_T[0]])
+        z_prog = C_init_eval[-1].copy()
 
-        Q_opt, feasible = self._optimal_centerline_hard(
-            band, bezier, formation, self.config.embed_margin_m,
-            subgoal_xy=tuple(subgoal), t_T=t_T, n_T=n_T,
+        w_m = 10.0
+        w_W = 2.0
+        w_bal = 1.0
+        w_sm = 0.5
+        w_prog = 5.0
+        w_c = 5.0
+        w_b = 3.0
+        w_step = 1.0
+        ρ = clearance
+        d_max = 1.50
+        r_q = 0.15
+        r_lin = 0.12
+        l_min = 0.1
+        θ_max = 0.6
+
+        nd = n_free * 2
+        dq = cp.Variable(nd, name="dq")
+        dL = cp.Variable(name="dL")
+        dR = cp.Variable(name="dR")
+        m = cp.Variable(name="m")
+        xiL = cp.Variable(M, name="xiL")
+        xiR = cp.Variable(M, name="xiR")
+        xic = cp.Variable(M, name="xic")
+
+        q_current = cp.Parameter(2 * N_c, name="q_current")
+        left_base = cp.Parameter(M, name="left_base")
+        left_dq = cp.Parameter((M, nd), name="left_dq")
+        left_dL = cp.Parameter(M, name="left_dL")
+        right_base = cp.Parameter(M, name="right_base")
+        right_dq = cp.Parameter((M, nd), name="right_dq")
+        right_dR = cp.Parameter(M, name="right_dR")
+        center_base = cp.Parameter(M, name="center_base")
+        center_dq = cp.Parameter((M, nd), name="center_dq")
+        deltaL_current = cp.Parameter(nonneg=True, name="deltaL_current")
+        deltaR_current = cp.Parameter(nonneg=True, name="deltaR_current")
+        progress_base = cp.Parameter(name="progress_base")
+        progress_start_base = cp.Parameter(name="progress_start_base")
+        progress_dq = cp.Parameter(nd, name="progress_dq")
+        a0_base = cp.Parameter(name="a0_base")
+        a0_dq = cp.Parameter(nd, name="a0_dq")
+        b0_base = cp.Parameter(name="b0_base")
+        b0_dq = cp.Parameter(nd, name="b0_dq")
+        end_base = cp.Parameter(name="end_base")
+        end_dq = cp.Parameter(nd, name="end_dq")
+
+        control_map = np.zeros((2 * N_c, nd), dtype=float)
+        for fi, ci in enumerate(bezier.free_indices):
+            control_map[2 * ci:2 * ci + 2, 2 * fi:2 * fi + 2] = np.eye(2)
+        D2 = np.zeros((max(0, N_c - 4), N_c), dtype=float)
+        for rr, cidx in enumerate(range(2, N_c - 2)):
+            D2[rr, cidx - 2:cidx + 3] = [1.0, -4.0, 6.0, -4.0, 1.0]
+        A_rows = A.reshape(M, 2, nd)
+        u0_map = control_map[2:4, :] - control_map[0:2, :]
+        uend_map = control_map[-2:, :] - control_map[-4:-2, :]
+
+        Qp = cp.reshape(q_current + control_map @ dq, (N_c, 2), order="C")
+        dq_points = cp.reshape(dq, (n_free, 2), order="C")
+        dC = cp.reshape(A @ dq, (M, 2), order="C")
+        smooth_cost = cp.sum_squares(D2 @ Qp) if D2.shape[0] > 0 else 0.0
+        progress_cost = cp.square(progress_base + progress_dq @ dq)
+        objective = cp.Minimize(
+            -w_m * m
+            - w_W * (dL + dR)
+            + w_bal * cp.square(dL - dR)
+            + w_sm * smooth_cost
+            + w_prog * progress_cost
+            + w_step * cp.sum_squares(dq)
+            + w_c * cp.sum_squares(xic)
+            + w_b * (cp.sum_squares(xiL) + cp.sum_squares(xiR))
         )
-        curve_opt = bezier.evaluate(Q_opt, self.config.collocation_points)
-        return self._build_swept_result(
-            map_data, formation.name, band, curve_opt, formation,
-            robot_radius, safety_margin, None, None,
-            metadata={"check": "optimal_centerline" if feasible else "optimal_centerline_infeasible"},
-        )
 
-    def _optimal_centerline_beta(
-        self,
-        band: SweptBand,
-        ref_curve: np.ndarray,
-        preview_path: LocalPreviewPath,
-        formation: FormationSpec,
-        margin_req: float,
-    ) -> tuple[np.ndarray, bool]:
-        r"""Minimise lateral offsets β along the preview curve subject to
-        all slots staying inside the band.
-
-        Variable:  β[j]  (scalar lateral offset at each curve point).
-        c_j(β) = γ_j + β_j · n_j
-        q_{i,j}(β) = c(s_j + ξ_i) + η_i · n_c(s_j + ξ_i)
-
-        Objective:
-          J = w_β·Σ β² + w₁·Σ (Δβ/Δs)² + w₂·Σ (Δ²β/Δs²)²
-              + w_c·Σ [m_tar − m_B(q)]₊²
-        s.t.
-          m_B(q_{i,j}(β)) ≥ margin_req   ∀ i,j
-          |β_j| ≤ β_max
-          |β_{j+1} − β_j| ≤ d_max
-        """
-        n_full = len(ref_curve)
-        if n_full < 2:
-            return ref_curve.copy(), False
-
-        # save full‑resolution reference + normals
-        ref_full = ref_curve.copy()
-        norms_full = np.asarray(preview_path.normals_xy, dtype=float)
-
-        # ── subsample to ~18 collocation points ────────────────────
-        n = min(n_full, 18)
-        idx = np.linspace(0, n_full - 1, n).astype(int)
-        ref_curve = ref_curve[idx]
-
-        # ── pre‑compute tangents / normals / arc‑length ──────────
-        tangents = np.zeros((n, 2), dtype=float)
-        arc = np.zeros(n, dtype=float)
-        for j in range(n):
-            if j == 0:
-                d = ref_curve[1] - ref_curve[0]
-            elif j == n - 1:
-                d = ref_curve[-1] - ref_curve[-2]
-            else:
-                d = ref_curve[j + 1] - ref_curve[j - 1]
-            dn = float(np.linalg.norm(d))
-            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
-            if j > 0:
-                arc[j] = arc[j - 1] + float(np.linalg.norm(ref_curve[j] - ref_curve[j - 1]))
-        arc_total = arc[-1] if arc[-1] > 1e-6 else 1.0
-        ds = arc_total / max(n - 1, 1)
-        norms = np.column_stack([-tangents[:, 1], tangents[:, 0]])
-
-        # ── weights and bounds ────────────────────────────────────
-        w_beta = 0.05
-        w1 = 1.0
-        w2 = 2.0
-        w_c = 0.3
-        m_tar = 0.10    # target margin above the hard threshold
-        beta_max = 0.60
-        d_max = 0.20
-
-        def _slot_centers(beta: np.ndarray) -> np.ndarray:
-            """Return all slot world positions [n_slots, 2] for the current β."""
-            total_len = float(np.sum(
-                np.linalg.norm(ref_curve[i + 1] - ref_curve[i])
-                for i in range(n - 1)
-            )) or 1.0
-            # centreline: c_j = γ_j + β_j * n_j
-            cl = ref_curve + beta[:, None] * norms
-            # cl tangents for slot orientation
-            cl_tan = np.zeros_like(cl)
-            for j in range(n):
-                if j == 0:
-                    d = cl[1] - cl[0]
-                elif j == n - 1:
-                    d = cl[-1] - cl[-2]
-                else:
-                    d = cl[j + 1] - cl[j - 1]
-                dn = float(np.linalg.norm(d))
-                cl_tan[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
-            cl_n = np.column_stack([-cl_tan[:, 1], cl_tan[:, 0]])
-            positions = []
-            for j in range(n):
-                tau = j / max(n - 1, 1)
-                cj = cl[j]; ctan = cl_tan[j]; cn = cl_n[j]
-                for slot in formation.slots:
-                    te = tau + slot[0] / total_len
-                    if te < 0.0 or te > 1.0:
-                        continue
-                    jf = min(int(te * (n - 1)), n - 2)
-                    frac = te * (n - 1) - jf
-                    c_eff = cl[jf] + frac * (cl[jf + 1] - cl[jf])
-                    cn_eff = cl_n[jf] + frac * (cl_n[jf + 1] - cl_n[jf])
-                    cn_eff = cn_eff / float(np.linalg.norm(cn_eff)) if float(np.linalg.norm(cn_eff)) > 1e-9 else cn_eff
-                    q = c_eff + slot[1] * cn_eff
-                    positions.append(q)
-            return np.asarray(positions) if positions else np.zeros((0, 2))
-
-        try:
-            from scipy.optimize import minimize
-        except ImportError:
-            return ref_curve.copy(), False
-
-        x0 = np.zeros(n, dtype=float)
-        bounds = [(0.0, 0.0)] + [(-beta_max, beta_max)] * (n - 1)
-
-        def objective(x):
-            beta = np.asarray(x, dtype=float)
-            J = w_beta * float(np.sum(beta ** 2))
-            for j in range(n - 1):
-                J += w1 * ((beta[j + 1] - beta[j]) / ds) ** 2
-            for j in range(1, n - 1):
-                J += w2 * ((beta[j + 1] - 2 * beta[j] + beta[j - 1]) / (ds * ds)) ** 2
-            slots_xy = _slot_centers(beta)
-            if len(slots_xy) > 0:
-                margins = band.margin_batch(slots_xy)
-                for m in margins:
-                    deficit = float(m_tar - m)
-                    if deficit > 0:
-                        J += w_c * deficit * deficit
-            return float(J)
-
-        def constraint(x):
-            beta = np.asarray(x, dtype=float)
-            slots_xy = _slot_centers(beta)
-            if len(slots_xy) == 0:
-                return 1.0
-            margins = band.margin_batch(slots_xy)
-            return float(np.min(margins)) - margin_req  # ≥ 0
-
-        res = minimize(
-            objective, x0, method="SLSQP",
-            bounds=bounds,
-            constraints={"type": "ineq", "fun": constraint},
-            options={"maxiter": 100, "ftol": 1e-4},
-        )
-        beta_opt = np.asarray(res.x, dtype=float)
-        # Interpolate β back to full resolution
-        beta_full = np.interp(np.linspace(0, 1, n_full), np.linspace(0, 1, n), beta_opt)
-        curve_opt = (ref_full + beta_full[:, None] * norms_full)
-
-        # Check feasibility at full resolution
-        ok, _ = self._eval_slots(band, curve_opt, formation, margin_req - 1e-4)
-        return curve_opt, ok
-
-    def _optimal_centerline_hard(
-        self,
-        band: SweptBand,
-        bezier: "_CenterlineBezier",
-        formation: FormationSpec,
-        margin_req: float,
-        subgoal_xy: tuple[float, float],
-        t_T: np.ndarray | None = None,
-        n_T: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, bool]:
-        r"""Solve min_Q J_len+J_sm+J_feas+J_end s.t. all slots embeddable.
-
-        J_end = [t_T·(c(1)-subgoal)]²  (longitudinal error only)
-        Endpoint is constrained to the transversal line through subgoal:
-            t_T·(Q[-1] - subgoal) = 0
-        """
-        try:
-            from scipy.optimize import minimize
-        except ImportError:
-            return bezier.initial_controls().copy(), False
-
-        Q0 = bezier.initial_controls().copy()
-        K = self.config.collocation_points
-        bbox = bezier.bounding_box()
-        sg = np.asarray(subgoal_xy, dtype=float)
-        if t_T is None:
-            t_T = np.array([1.0, 0.0])
-
-        def objective(x):
-            Q = Q0.copy()
-            Q[bezier.free_indices] = x.reshape(-1, 2)
-            curve = bezier.evaluate(Q, K)
-            # J_end: longitudinal error only
-            J_end = float((np.dot(curve[-1] - sg, t_T)) ** 2)
-            J_sm = 0.0
-            for ci in range(bezier.control_count - 3):
-                j = Q[ci] - 3*Q[ci+1] + 3*Q[ci+2] - Q[ci+3]
-                J_sm += float(np.sum(j**2))
-            J_feas = 0.0
-            for ci in range(bezier.control_count - 1):
-                d = float(np.linalg.norm(Q[ci+1] - Q[ci]))
-                if d > 0.3: J_feas += (d - 0.3)**2
-            for ci in range(1, bezier.control_count - 1):
-                v0 = Q[ci] - Q[ci-1]; v1 = Q[ci+1] - Q[ci]
-                d0=float(np.linalg.norm(v0)); d1=float(np.linalg.norm(v1))
-                if d0<1e-6 or d1<1e-6: continue
-                cos_th = float(np.dot(v0,v1))/(d0*d1)
-                cos_th = max(-1.0, min(1.0, cos_th))
-                th = math.acos(cos_th)
-                if th > 0.5: J_feas += (th - 0.5)**2
-            J_len = float(sum(
-                np.linalg.norm(Q[ci+1] - Q[ci]) for ci in range(bezier.control_count - 1)
-            ))
-            # ── J_lat: lateral smoothness penalty ──
-            # β_j = lateral offset from straight baseline (curve[0]→[-1]).
-            J_lat = 0.0
-            c0 = curve[0]; cT = curve[-1]
-            b_vec = cT - c0
-            b_len = float(np.linalg.norm(b_vec))
-            if b_len > 1e-6:
-                n_b = np.array([-b_vec[1], b_vec[0]]) / b_len
-                betas = np.zeros(K, dtype=float)
-                for j in range(K):
-                    tau_j = j / max(K - 1, 1)
-                    b_j = c0 + tau_j * b_vec
-                    betas[j] = float(np.dot(curve[j] - b_j, n_b))
-                # Δβ: penalises rapid lateral changes
-                for j in range(K - 1):
-                    J_lat += (betas[j + 1] - betas[j]) ** 2
-                # Δ²β: penalises lateral acceleration / S-shaped wandering
-                for j in range(1, K - 1):
-                    J_lat += 2.0 * (betas[j + 1] - 2.0 * betas[j] + betas[j - 1]) ** 2
-            return float(J_end + 0.5*J_len + 2.0*J_sm + 0.5*J_feas + 1.0*J_lat)
-
-        def constraint(x):
-            Q = Q0.copy()
-            Q[bezier.free_indices] = x.reshape(-1, 2)
-            curve = bezier.evaluate(Q, K)
-            _, worst = self._eval_slots(band, curve, formation, margin_req)
-            return float(worst)  # must be >= margin_req
-
-        def endpoint_eq_constraint(x):
-            """Endpoint must stay on transversal line: t_T·(Q[-1] - sg) = 0"""
-            Q = Q0.copy()
-            Q[bezier.free_indices] = x.reshape(-1, 2)
-            return float(np.dot(Q[-1] - sg, t_T))
-
-        x0 = Q0[bezier.free_indices].ravel()
-        bounds = [(bbox[0], bbox[1]), (bbox[2], bbox[3])] * len(bezier.free_indices)
+        pred_L = left_base + left_dq @ dq + cp.multiply(left_dL, dL)
+        pred_R = right_base + right_dq @ dq + cp.multiply(right_dR, dR)
+        pred_c = center_base + center_dq @ dq
 
         constraints = [
-            {"type": "ineq", "fun": lambda x: constraint(x) - margin_req},
-            {"type": "eq", "fun": endpoint_eq_constraint},
+            dL >= m,
+            dR >= m,
+            dL >= 0.0,
+            dR >= 0.0,
+            dL <= d_max,
+            dR <= d_max,
+            dL >= deltaL_current - 0.30,
+            dL <= deltaL_current + 0.30,
+            dR >= deltaR_current - 0.30,
+            dR <= deltaR_current + 0.30,
+            xiL >= 0.0,
+            xiR >= 0.0,
+            xic >= 0.0,
+            pred_L - ρ + xiL >= 0.0,
+            pred_R - ρ + xiR >= 0.0,
+            pred_c - ρ + xic >= 0.0,
+            progress_start_base + progress_dq @ dq >= l_min,
         ]
-
-        res = minimize(
-            objective, x0, method="SLSQP", bounds=bounds,
-            constraints=constraints,
-            options={"maxiter": 50, "ftol": 1e-6},
+        constraints.extend(
+            cp.norm2(dC[j, :]) <= r_lin
+            for j in range(M)
         )
-        Q_opt = Q0.copy()
-        Q_opt[bezier.free_indices] = res.x.reshape(-1, 2)
-        feasible = constraint(res.x) >= margin_req - 1e-4
-        return Q_opt, feasible
+        constraints.extend(
+            cp.norm2(dq_points[fi, :]) <= r_q
+            for fi in range(n_free)
+        )
 
-    # ── violation functional ──────────────────────────────────────
+        constraints.extend(
+            [
+                a0_base + a0_dq @ dq >= 0.01,
+                cp.abs(b0_base + b0_dq @ dq)
+                <= θ_max * (a0_base + a0_dq @ dq + 0.01),
+                end_base + end_dq @ dq >= 0.02,
+            ]
+        )
+
+        problem = cp.Problem(objective, constraints)
+
+        for k in range(5):
+            C = bezier.evaluate(Q, M)
+            nn = self._normals(C)
+            nn_lp = self._lowpass_normals(nn, window=3)
+            δL_cur = self._max_uniform_offset_df(map_data, C, nn_lp, +1.0, clearance)
+            δR_cur = self._max_uniform_offset_df(map_data, C, nn_lp, -1.0, clearance)
+            print(
+                f"    [Clarabel k={k}] δL={δL_cur:.3f} δR={δR_cur:.3f} "
+                f"μ={(δL_cur - δR_cur) / 2:.4f}",
+                flush=True,
+            )
+
+            e = 0.02
+            x_L = C + δL_cur * nn_lp
+            x_R = C - δR_cur * nn_lp
+            all_pts = np.empty((9 * M, 2), dtype=float)
+            all_pts[0::9] = x_L
+            all_pts[1::9] = x_L + np.array([e, 0.0])
+            all_pts[2::9] = x_L + np.array([0.0, e])
+            all_pts[3::9] = x_R
+            all_pts[4::9] = x_R + np.array([e, 0.0])
+            all_pts[5::9] = x_R + np.array([0.0, e])
+            all_pts[6::9] = C
+            all_pts[7::9] = C + np.array([e, 0.0])
+            all_pts[8::9] = C + np.array([0.0, e])
+            vals = self._bilinear_batch(map_data, all_pts).reshape(M, 9)
+            D_L = vals[:, 0]
+            g_L = np.column_stack(((vals[:, 1] - D_L) / e, (vals[:, 2] - D_L) / e))
+            D_R = vals[:, 3]
+            g_R = np.column_stack(((vals[:, 4] - D_R) / e, (vals[:, 5] - D_R) / e))
+            D_c = vals[:, 6]
+            g_c = np.column_stack(((vals[:, 7] - D_c) / e, (vals[:, 8] - D_c) / e))
+
+            if M >= 2:
+                e0 = C[1] - C[0]
+                e0n = float(np.linalg.norm(e0))
+                e0 = e0 / e0n if e0n > 1e-9 else np.array([1.0, 0.0])
+                n0 = np.array([-e0[1], e0[0]])
+                e_end = C[-1] - C[-2]
+                en = float(np.linalg.norm(e_end))
+                e_end = e_end / en if en > 1e-9 else np.array([1.0, 0.0])
+            else:
+                e0 = e_end = np.array([1.0, 0.0])
+                n0 = np.array([0.0, 1.0])
+
+            q_current.value = Q.ravel()
+            left_base.value = D_L + np.sum(g_L * (C - x_L), axis=1)
+            left_dq.value = np.einsum("mi,mij->mj", g_L, A_rows)
+            left_dL.value = np.einsum("mi,mi->m", g_L, nn_lp)
+            right_base.value = D_R + np.sum(g_R * (C - x_R), axis=1)
+            right_dq.value = np.einsum("mi,mij->mj", g_R, A_rows)
+            right_dR.value = -np.einsum("mi,mi->m", g_R, nn_lp)
+            center_base.value = D_c
+            center_dq.value = np.einsum("mi,mij->mj", g_c, A_rows)
+            deltaL_current.value = max(float(δL_cur), 0.0)
+            deltaR_current.value = max(float(δR_cur), 0.0)
+            progress_base.value = float(np.dot(C[-1] - z_prog, t_T))
+            progress_start_base.value = float(np.dot(C[-1] - C_init_eval[0], t_T))
+            progress_dq.value = t_T @ A[-2:, :]
+            a0_current = Q[1] - Q[0]
+            a0_base.value = float(np.dot(a0_current, e0))
+            a0_dq.value = e0 @ u0_map
+            b0_base.value = float(np.dot(a0_current, n0))
+            b0_dq.value = n0 @ u0_map
+            end_current = Q[-1] - Q[-2]
+            end_base.value = float(np.dot(end_current, e_end))
+            end_dq.value = e_end @ uend_map
+
+            if k == 0:
+                shift_init = min(0.5 * abs((δL_cur - δR_cur) / 2), 0.06)
+                direction = np.sign((δL_cur - δR_cur) / 2)
+                dc_d = np.zeros(M * 2)
+                for j in range(M):
+                    chi = 1.0 if j > 0 else 0.0
+                    dc_d[j * 2] = direction * shift_init * nn_lp[j, 0]
+                    dc_d[j * 2 + 1] = direction * shift_init * nn_lp[j, 1]
+                dq.value = A.T @ dc_d
+                dL.value = float(δL_cur)
+                dR.value = float(δR_cur)
+                m.value = min(float(δL_cur), float(δR_cur))
+                xiL.value = np.zeros(M)
+                xiR.value = np.zeros(M)
+                xic.value = np.zeros(M)
+
+            try:
+                problem.solve(
+                    solver=cp.CLARABEL,
+                    warm_start=True,
+                    max_iter=max(1, int(self.config.max_opt_iters)),
+                    tol_gap_abs=1e-6,
+                    tol_gap_rel=1e-6,
+                    tol_feas=1e-6,
+                    verbose=False,
+                )
+            except (cp.error.SolverError, ValueError) as exc:
+                print(f"    [Clarabel] solve failed: {exc}", flush=True)
+                break
+
+            if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or dq.value is None:
+                print(f"    [Clarabel] status={problem.status}; keeping current centerline", flush=True)
+                break
+
+            dq_solution = np.asarray(dq.value, dtype=float).reshape(n_free, 2)
+            for fi, ci in enumerate(bezier.free_indices):
+                Q[ci] += dq_solution[fi]
+            Q[0] = C_init_eval[0].copy()
+            print(
+                f"    [Clarabel] status={problem.status} dL*={float(dL.value):.3f} "
+                f"dR*={float(dR.value):.3f} |dq|={float(np.linalg.norm(dq_solution)):.3f}",
+                flush=True,
+            )
+
+        C_final = bezier.evaluate(Q, M)
+        C_i = bezier.evaluate(bezier.initial_controls(), M)
+        shift = float(np.max(np.linalg.norm(C_final - C_i, axis=1)))
+        nn_f = self._normals(C_final)
+        nn_flp = self._lowpass_normals(nn_f)
+        δL_f = self._max_uniform_offset_df(map_data, C_final, nn_flp, +1.0, clearance)
+        δR_f = self._max_uniform_offset_df(map_data, C_final, nn_flp, -1.0, clearance)
+        mg = self._margin_batch(map_data, C_final, clearance)
+        min_m = float(np.min(mg))
+        n_bad = int(np.sum(mg < -0.02))
+        has_rev = any(
+            float(np.dot(C_final[j + 1] - C_final[j], C_final[1] - C_final[0])) < -0.005
+            for j in range(M - 1)
+        ) if M >= 2 else False
+        st = "WARN" if (min_m < -0.02 or has_rev) else "OK"
+        print(
+            f"  [v2] band_recenter max_shift={shift:.3f}m final δL={δL_f:.3f} δR={δR_f:.3f} "
+            f"min_m={min_m:.3f} n_bad={n_bad} rev={has_rev} [{st}]",
+            flush=True,
+        )
+        return Q, C_final
+
+    def _bezier_A_matrix(
+        self,
+        bezier: _CenterlineBezier,
+        M: int,
+        eps: float = 0.005,
+    ) -> np.ndarray:
+        key = (id(bezier), bezier.control_count, tuple(bezier.free_indices), int(M), float(eps))
+        cached = self._bezier_A_cache.get(key)
+        if cached is not None:
+            return cached
+
+        n_free = len(bezier.free_indices)
+        Q0 = bezier.initial_controls().copy()
+        C0 = bezier.evaluate(Q0, M)
+        A = np.zeros((M * 2, n_free * 2), dtype=float)
+        for fi, ci in enumerate(bezier.free_indices):
+            for d in range(2):
+                Qp = Q0.copy()
+                Qp[ci, d] += eps
+                dC = (bezier.evaluate(Qp, M) - C0) / eps
+                A[0::2, fi * 2 + d] = dC[:, 0]
+                A[1::2, fi * 2 + d] = dC[:, 1]
+
+        self._bezier_A_cache[key] = A
+        return A
+
+    @staticmethod
+    def _normals(cc: np.ndarray) -> np.ndarray:
+        nn = np.zeros_like(cc)
+        n = len(cc)
+        for j in range(n):
+            if j == 0:
+                d = cc[1] - cc[0]
+            elif j == n - 1:
+                d = cc[-1] - cc[-2]
+            else:
+                d = cc[j + 1] - cc[j - 1]
+            dn = float(np.linalg.norm(d))
+            t = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+            nn[j] = np.array([-t[1], t[0]])
+        return nn
+
+    @staticmethod
+    def _lowpass_normals(nn: np.ndarray, window: int = 3) -> np.ndarray:
+        n_lp = nn.copy()
+        hw = window // 2
+        for j in range(len(nn)):
+            lo, hi = max(0, j - hw), min(len(nn), j + hw + 1)
+            avg = np.mean(nn[lo:hi], axis=0)
+            nrm = float(np.linalg.norm(avg))
+            if nrm > 1e-9:
+                n_lp[j] = avg / nrm
+        return n_lp
+
+    @staticmethod
+    def _bilinear_batch(map_data: MapData, pts: np.ndarray) -> np.ndarray:
+        origin_x, origin_y = map_data.origin_xy
+        res = map_data.resolution
+        grid_x = (pts[:, 0] - origin_x) / res - 0.5
+        grid_y = (pts[:, 1] - origin_y) / res - 0.5
+        x0 = np.floor(grid_x).astype(int)
+        y0 = np.floor(grid_y).astype(int)
+        x1 = np.minimum(x0 + 1, map_data.cols - 1)
+        y1 = np.minimum(y0 + 1, map_data.rows - 1)
+        wx = grid_x - x0
+        wy = grid_y - y0
+        df = map_data.distance_field
+        valid = (grid_x >= 0) & (grid_y >= 0) & (grid_x <= map_data.cols - 1) & (grid_y <= map_data.rows - 1)
+        x0c = np.clip(x0, 0, map_data.cols - 1)
+        y0c = np.clip(y0, 0, map_data.rows - 1)
+        x1c = np.clip(x1, 0, map_data.cols - 1)
+        y1c = np.clip(y1, 0, map_data.rows - 1)
+        v00 = df[y0c, x0c]
+        v10 = df[y0c, x1c]
+        v01 = df[y1c, x0c]
+        v11 = df[y1c, x1c]
+        result = ((1 - wy) * (1 - wx) * v00 + (1 - wy) * wx * v10 + wy * (1 - wx) * v01 + wy * wx * v11)
+        result[~valid] = 0.0
+        return result
+
+    @staticmethod
+    def _margin_batch(map_data: MapData, pts: np.ndarray, clearance: float) -> np.ndarray:
+        return FormationFeasibility._bilinear_batch(map_data, pts) - clearance
+
+    @staticmethod
+    def _max_uniform_offset_df(
+        map_data: MapData,
+        cc: np.ndarray,
+        nn: np.ndarray,
+        sg: float,
+        clearance: float,
+    ) -> float:
+        ds = np.linspace(0.0, 1.50, 16)
+        pts = cc[None, :, :] + (sg * ds[:, None, None]) * nn[None, :, :]
+        margins = FormationFeasibility._margin_batch(
+            map_data,
+            pts.reshape(-1, 2),
+            clearance,
+        ).reshape(len(ds), len(cc))
+        bad = np.any(margins < -0.02, axis=1)
+        if np.any(bad):
+            d = float(ds[int(np.argmax(bad))])
+            return max(0.0, d - 0.05)
+        return 1.50
+
+    def _compute_widths(
+        self,
+        map_data: MapData,
+        curve: np.ndarray,
+        clearance: float,
+    ) -> tuple[float, float]:
+        nn = self._normals(curve)
+        nn_lp = self._lowpass_normals(nn)
+        return (
+            self._max_uniform_offset_df(map_data, curve, nn_lp, +1.0, clearance),
+            self._max_uniform_offset_df(map_data, curve, nn_lp, -1.0, clearance),
+        )
+
+    @staticmethod
+    def _eval_slots_rigid(
+        map_data: MapData,
+        centre_curve: np.ndarray,
+        formation: FormationSpec,
+        clearance: float,
+        margin_req: float,
+    ) -> tuple[bool, float]:
+        n = len(centre_curve)
+        if n < 2:
+            return False, float("-inf")
+
+        tangents = np.zeros((n, 2), dtype=float)
+        for j in range(n):
+            if j == 0:
+                d = centre_curve[1] - centre_curve[0]
+            elif j == n - 1:
+                d = centre_curve[-1] - centre_curve[-2]
+            else:
+                d = centre_curve[j + 1] - centre_curve[j - 1]
+            dn = float(np.linalg.norm(d))
+            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
+
+        positions: list[tuple[float, float]] = []
+        for j in range(n):
+            cx, cy = centre_curve[j, 0], centre_curve[j, 1]
+            tx, ty = tangents[j, 0], tangents[j, 1]
+            nx, ny = -ty, tx
+            for slot in formation.slots:
+                ell, b = slot[0], slot[1]
+                qx = cx + ell * tx + b * nx
+                qy = cy + ell * ty + b * ny
+                positions.append((float(qx), float(qy)))
+
+        if not positions:
+            return True, 0.0
+
+        margins = FormationFeasibility._margin_batch(
+            map_data,
+            np.asarray(positions, dtype=float),
+            clearance,
+        )
+        worst = float(np.min(margins))
+        return worst >= margin_req, worst
+
+    @staticmethod
+    def _check_envelope(formation: FormationSpec, δL: float, δR: float) -> bool:
+        slots = formation.slots
+        B_L = max(s[1] for s in slots)
+        B_R = max(-s[1] for s in slots)
+        return B_L <= δL and B_R <= δR
 
     @staticmethod
     def _eval_slots(
         band: SweptBand,
-        centre_curve: np.ndarray,   # [N, 2]  centreline c(τ)
+        centre_curve: np.ndarray,
         formation: FormationSpec,
         margin_req: float,
     ) -> tuple[bool, float]:
-        r"""Check whether all formation slots stay inside the band.
-
-        Each slot is evaluated at its true longitudinal position
-        τ_eff = τ + ξ/L, using the curve tangent at τ_eff.
-        """
         n = len(centre_curve)
         if n < 2:
             return False, float("-inf")
-        total_len = float(sum(
-            np.linalg.norm(centre_curve[i+1] - centre_curve[i])
-            for i in range(n - 1)
-        )) or 1.0
-        # Pre‑compute tangents (unit) at each curve point
+        total_len = float(sum(np.linalg.norm(centre_curve[i + 1] - centre_curve[i]) for i in range(n - 1))) or 1.0
         tangents = np.zeros((n, 2), dtype=float)
         for j in range(n):
             if j == 0:
@@ -536,237 +840,6 @@ class FormationFeasibility:
         worst = float(np.min(band.margin_batch(np.asarray(positions, dtype=float)))) if positions else float("inf")
         return worst >= margin_req, float(worst)
 
-    @staticmethod
-    def _violation(
-        band: SweptBand,
-        centre_curve: np.ndarray,
-        formation: FormationSpec,
-        margin_req: float,
-    ) -> float:
-        r"""Robust interval-based violation.
-
-            m̄_{i,j} = (m_{i,j} + m_{i,j+1} − ℓ_{i,j}) / 2 − ε_sdf
-
-        Only margins at τ_j are batch‑queried; midpoints are computed solely
-        for ℓ_{i,j} (no extra SDF look‑ups).
-        """
-        n = len(centre_curve)
-        if n < 2:
-            return 0.0
-        total_len = float(sum(
-            np.linalg.norm(centre_curve[i+1] - centre_curve[i])
-            for i in range(n - 1)
-        )) or 1.0
-        tangents = np.zeros((n, 2), dtype=float)
-        for j in range(n):
-            if j == 0: d = centre_curve[1] - centre_curve[0]
-            elif j == n - 1: d = centre_curve[-1] - centre_curve[-2]
-            else: d = centre_curve[j + 1] - centre_curve[j - 1]
-            dn = float(np.linalg.norm(d))
-            tangents[j] = d / dn if dn > 1e-9 else np.array([1.0, 0.0])
-
-        eps_sdf = 0.05
-        slots = formation.slots
-        n_slots = len(slots)
-
-        # ── slot positions at τ_j (batch margin query) ─────────────
-        q_j: list[list[np.ndarray | None]] = []
-        all_q: list[np.ndarray] = []
-        for slot in slots:
-            row: list[np.ndarray | None] = []
-            for j in range(n):
-                tau = j / max(n - 1, 1)
-                tau_eff = tau + slot[0] / total_len
-                if tau_eff < 0.0 or tau_eff > 1.0:
-                    row.append(None); continue
-                jf = tau_eff * (n - 1)
-                j0 = max(0, min(int(jf), n - 2)); j1 = j0 + 1
-                frac = jf - j0
-                c = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
-                t = tangents[j0] + frac * (tangents[j1] - tangents[j0])
-                tn = float(np.linalg.norm(t))
-                if tn < 1e-9: row.append(None); continue
-                t /= tn; n_f = np.array([-t[1], t[0]])
-                p = c + slot[1] * n_f
-                row.append(p); all_q.append(p)
-            q_j.append(row)
-
-        if not all_q:
-            return 0.0
-
-        margins = band.margin_batch(np.asarray(all_q, dtype=float))
-        idx = 0
-        m_j: list[list[float | None]] = [[None] * n for _ in range(n_slots)]
-        for si in range(n_slots):
-            for j in range(n):
-                if q_j[si][j] is not None:
-                    m_j[si][j] = float(margins[idx]); idx += 1
-
-        # ── midpoint positions (ℓ only, no margin query) ────────────
-        def _midpt(slot_idx: int, j: int) -> np.ndarray | None:
-            slot = slots[slot_idx]
-            tau = (j + 0.5) / max(n - 1, 1)
-            tau_eff = tau + slot[0] / total_len
-            if tau_eff < 0.0 or tau_eff > 1.0:
-                return None
-            jf = tau_eff * (n - 1)
-            j0 = max(0, min(int(jf), n - 2)); j1 = j0 + 1
-            frac = jf - j0
-            c = centre_curve[j0] + frac * (centre_curve[j1] - centre_curve[j0])
-            t = tangents[j0] + frac * (tangents[j1] - tangents[j0])
-            tn = float(np.linalg.norm(t))
-            if tn < 1e-9: return None
-            t /= tn; n_f = np.array([-t[1], t[0]])
-            return c + slot[1] * n_f
-
-        # ── robust interval violation ──
-        total = 0.0
-        for si in range(n_slots):
-            for j in range(n - 1):
-                qa = q_j[si][j]; qb = q_j[si][j+1]
-                ma = m_j[si][j]; mb = m_j[si][j+1]
-                if qa is None or qb is None or ma is None or mb is None:
-                    continue
-                qm = _midpt(si, j)
-                if qm is None:
-                    continue
-                ell = float(np.linalg.norm(qa - qm)) + float(np.linalg.norm(qm - qb))
-                m_bar = (ma + mb - ell) / 2.0 - eps_sdf
-                deficit = margin_req - m_bar
-                if deficit > 0:
-                    total += deficit * deficit
-        return total
-
-    # ── min‑violation ─────────────────────────────────────────────
-
-    def _min_violation(
-        self,
-        band: SweptBand,
-        bezier: "_CenterlineBezier",
-        formation: FormationSpec,
-        margin_req: float,
-    ) -> tuple[np.ndarray, float]:
-        r"""Solve  inf_Q  V_k[Q]  via SLSQP.
-
-        Variables: free Bézier control points (2·(M−2) scalars).
-        Objective:  V_k[Q] = Σ_{τ,i} [δ − m_B(q_i)]_+²  (sum of squares,
-        smooth and differentiable).
-        """
-        try:
-            from scipy.optimize import minimize
-        except ImportError:
-            return bezier.initial_controls().copy(), float("inf")
-
-        Q0 = bezier.initial_controls().copy()
-        K = self.config.collocation_points
-        free_flat = Q0[bezier.free_indices].ravel()
-        bbox = bezier.bounding_box()
-
-        ref_curve = bezier.evaluate(Q0, K)
-        sg = bezier._ref[-1]  # subgoal = last reference point
-
-        def objective(x: np.ndarray) -> float:
-            Q = Q0.copy()
-            Q[bezier.free_indices] = x.reshape(-1, 2)
-            curve = bezier.evaluate(Q, K)
-            viol = FormationFeasibility._violation(band, curve, formation, margin_req)
-            end_err = float(np.sum((curve[-1] - sg) ** 2))
-            # Jerk smoothness (same as preview planner)
-            J_sm = 0.0
-            for ci in range(bezier.control_count - 3):
-                j = Q[ci] - 3*Q[ci+1] + 3*Q[ci+2] - Q[ci+3]
-                J_sm += float(np.sum(j**2))
-            # Feasibility: spacing + turning
-            J_feas = 0.0
-            for ci in range(bezier.control_count - 1):
-                d = float(np.linalg.norm(Q[ci+1] - Q[ci]))
-                if d > 0.3: J_feas += (d - 0.3)**2
-            for ci in range(1, bezier.control_count - 1):
-                v0 = Q[ci] - Q[ci-1]; v1 = Q[ci+1] - Q[ci]
-                d0=float(np.linalg.norm(v0)); d1=float(np.linalg.norm(v1))
-                if d0<1e-6 or d1<1e-6: continue
-                cos_th = float(np.dot(v0,v1))/(d0*d1)
-                cos_th = max(-1.0, min(1.0, cos_th))
-                th = math.acos(cos_th)
-                if th > 0.5: J_feas += (th - 0.5)**2
-            return 10.0 * viol + 0.5*end_err + 0.5*J_sm + 0.3*J_feas
-
-        res = minimize(
-            objective, free_flat, method="SLSQP",
-            bounds=[(bbox[0], bbox[1]), (bbox[2], bbox[3])] * len(bezier.free_indices),
-            options={"maxiter": 80, "ftol": 1e-6},
-        )
-        Q_opt = Q0.copy()
-        Q_opt[bezier.free_indices] = res.x.reshape(-1, 2)
-        return Q_opt, float(res.fun)
-
-    # ── optimal centreline ────────────────────────────────────────
-
-    def _optimal_centerline(
-        self,
-        band: SweptBand,
-        bezier: "_CenterlineBezier",
-        formation: FormationSpec,
-        margin_req: float,
-        warm_start: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, bool]:
-        r"""Solve  min_Q  J[Q]  s.t.  V_k[Q] ≤ 0.
-
-        J = w_ref·Σ|c − γ_ref|²  +  w_sm·Σ‖LQ‖²
-
-        Uses SLSQP with a constraint that all slots stay inside the band.
-        """
-        try:
-            from scipy.optimize import NonlinearConstraint, minimize
-        except ImportError:
-            Q = warm_start if warm_start is not None else bezier.initial_controls().copy()
-            return Q, False
-
-        Q0 = warm_start if warm_start is not None else bezier.initial_controls().copy()
-        K = self.config.collocation_points
-        bbox = bezier.bounding_box()
-        ref_curve = bezier.evaluate(bezier.initial_controls(), K)
-
-        def objective(x):
-            Q = Q0.copy()
-            Q[bezier.free_indices] = x.reshape(-1, 2)
-            curve = bezier.evaluate(Q, K)
-            # J = w_ref·|c−γ_ref|² + w_sm·Σ‖LQ‖²
-            J_ref = self.config.ref_weight * float(np.sum((curve - ref_curve) ** 2)) / K
-            J_sm = 0.0
-            for ci in range(bezier.control_count):
-                residual = np.zeros(2)
-                stencil = [(ci - 2, 1.0), (ci - 1, -4.0), (ci, 6.0),
-                           (ci + 1, -4.0), (ci + 2, 1.0)]
-                for ri, coeff in stencil:
-                    clamped = min(max(ri, 0), bezier.control_count - 1)
-                    residual += coeff * Q[clamped]
-                J_sm += float(np.sum(residual ** 2))
-            return float(J_ref + self.config.smooth2_weight * J_sm)
-
-        def constraint(x):
-            Q = Q0.copy()
-            Q[bezier.free_indices] = x.reshape(-1, 2)
-            curve = bezier.evaluate(Q, K)
-            _, worst = self._eval_slots(band, curve, formation, margin_req)
-            return float(worst)  # must be ≥ margin_req
-
-        x0 = Q0[bezier.free_indices].ravel()
-        bounds = [(bbox[0], bbox[1]), (bbox[2], bbox[3])] * len(bezier.free_indices)
-
-        res = minimize(
-            objective, x0, method="SLSQP", bounds=bounds,
-            constraints={"type": "ineq", "fun": lambda x: constraint(x) - margin_req},
-            options={"maxiter": 30, "ftol": 1e-6},
-        )
-        Q_opt = Q0.copy()
-        Q_opt[bezier.free_indices] = res.x.reshape(-1, 2)
-        curve_opt = bezier.evaluate(Q_opt, K)
-        feasible = constraint(res.x) >= margin_req - 1e-4
-        return Q_opt, feasible
-
-    # ── build result from swept‑band output ────────────────────────
-
     def _build_swept_result(
         self,
         map_data: MapData,
@@ -778,7 +851,7 @@ class FormationFeasibility:
         safety_margin: float,
         current_formation: FormationSpec | None,
         current_states: list[RobotState] | None,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> FormationFeasibilityResult:
         n = len(centre_curve)
         if n < 2:
@@ -786,18 +859,9 @@ class FormationFeasibility:
 
         required = robot_radius + safety_margin
         headings, slot_pts_by_step = self._compute_slots(centre_curve, formation)
-        # Use the same longitudinal check for feasibility
         ok_swept, worst_m = self._eval_slots(band, centre_curve, formation, -self.config.feasibility_tol_m)
         min_margin = worst_m
-        # Fallback mean margin from all sampled slots (for metadata)
-        margin_samples = [
-            band.margin(slot_pt)
-            for step_slots in slot_pts_by_step
-            for slot_pt in step_slots
-        ]
-        mean_margin = sum(margin_samples) / len(margin_samples) if margin_samples else 0.0
 
-        # Ground-truth clearance via distance field (for metadata / downstream)
         cl_samples = [
             float(query_distance_field(map_data, slot_pt))
             for step_slots in slot_pts_by_step
@@ -810,7 +874,9 @@ class FormationFeasibility:
         n_robots = len(formation.slots)
         if current_formation is None or current_formation.name == formation.name:
             assignment = AssignmentResult(
-                assignment=tuple(range(n_robots)), total_cost=0.0, max_cost=0.0,
+                assignment=tuple(range(n_robots)),
+                total_cost=0.0,
+                max_cost=0.0,
                 per_robot_costs=[0.0] * n_robots,
             )
         else:
@@ -859,84 +925,27 @@ class FormationFeasibility:
                 d = centre_curve[j + 1] - centre_curve[j - 1]
             dn = float(np.linalg.norm(d))
             if dn < 1e-9:
-                d = np.array([1.0, 0.0]); dn = 1.0
+                d = np.array([1.0, 0.0])
+                dn = 1.0
             t = d / dn
             h = math.atan2(t[1], t[0])
             headings.append(h)
             cos_h, sin_h = math.cos(h), math.sin(h)
             step_slots: list[Point2D] = []
             for slot in formation.slots:
-                step_slots.append((
-                    c[0] + cos_h * slot[0] - sin_h * slot[1],
-                    c[1] + sin_h * slot[0] + cos_h * slot[1],
-                ))
+                step_slots.append(
+                    (
+                        c[0] + cos_h * slot[0] - sin_h * slot[1],
+                        c[1] + sin_h * slot[0] + cos_h * slot[1],
+                    )
+                )
             slots.append(step_slots)
         return headings, slots
 
-    # ── legacy implementation (unchanged) ──────────────────────────
-
-    def _check_legacy(
+    def _slot_clearance_stats(
         self,
         map_data: MapData,
-        preview_path: LocalPreviewPath,
-        curve_band: CurveBand,
-        formation: FormationSpec,
-        robot_radius: float,
-        safety_margin: float,
-        current_formation: FormationSpec | None,
-        current_states: list[RobotState] | None,
-    ) -> FormationFeasibilityResult:
-        if not preview_path.points_xy or not curve_band.samples:
-            return _infeasible(formation.name, "empty_preview_or_band")
-        embedding = self._embedding_solver.solve(preview_path, curve_band, formation)
-        if not embedding.is_feasible:
-            return _infeasible(formation.name, embedding.failure_reason or "embedding_infeasible", embedding=embedding)
-        min_cl, mean_cl = self._slot_clearance_stats(map_data, embedding.slot_points_by_step_xy)
-        required = robot_radius + safety_margin
-        safety_m = min_cl - required
-        feasible = (
-            embedding.min_corridor_margin_m >= -1e-9
-            and embedding.corridor_violation_cost <= 1e-9
-        )
-        if current_formation is None or current_formation.name == formation.name:
-            n = len(embedding.slot_points_by_step_xy[0])
-            assignment = AssignmentResult(
-                assignment=tuple(range(n)), total_cost=0.0, max_cost=0.0,
-                per_robot_costs=[0.0] * n,
-            )
-        else:
-            if current_states:
-                current_slots_xy = [(s.x, s.y) for s in current_states]
-            else:
-                current_slots_xy = _nominal_slots(
-                    current_formation,
-                    embedding.center_points_xy[0],
-                    embedding.heading_rads[0],
-                )
-            assignment = compute_best_assignment(current_slots_xy, embedding.slot_points_by_step_xy[0])
-        return FormationFeasibilityResult(
-            formation_name=formation.name, is_feasible=feasible,
-            center_points_xy=embedding.center_points_xy,
-            heading_rads=embedding.heading_rads,
-            slot_points_by_step_xy=embedding.slot_points_by_step_xy,
-            min_corridor_margin_m=embedding.min_corridor_margin_m,
-            corridor_violation_cost=embedding.corridor_violation_cost,
-            min_slot_clearance_m=min_cl, mean_clearance_m=mean_cl,
-            safety_margin_m=safety_m,
-            offset_cost=embedding.offset_cost, heading_cost=embedding.heading_cost,
-            lateral_offsets_m=list(embedding.lateral_offsets_m),
-            heading_offsets_rad=list(embedding.heading_offsets_rad),
-            assignment=assignment, embedding_qp_result=embedding,
-            failure_reason="" if feasible else _failure_reason(feasible, safety_m),
-            metadata={
-                "inside_slot_count": int(embedding.metadata.get("inside_slot_count", 0)),
-                "total_slot_count": int(embedding.metadata.get("total_slot_count", 0)),
-                "inside_slot_ratio": float(embedding.metadata.get("inside_slot_ratio", 0.0)),
-            },
-        )
-
-    def _slot_clearance_stats(
-        self, map_data: MapData, slot_points_by_step: list[list[Point2D]],
+        slot_points_by_step: list[list[Point2D]],
     ) -> tuple[float, float]:
         clearances = [
             float(query_distance_field(map_data, slot))
@@ -948,63 +957,57 @@ class FormationFeasibility:
         return min(clearances), sum(clearances) / len(clearances)
 
 
-# ── helpers ────────────────────────────────────────────────────────
-
 def _infeasible(
-    name: str, reason: str, embedding: EmbeddingQPResult | None = None,
+    name: str,
+    reason: str,
+    embedding: EmbeddingQPResult | None = None,
 ) -> FormationFeasibilityResult:
     return FormationFeasibilityResult(
-        formation_name=name, is_feasible=False,
-        center_points_xy=[], heading_rads=[], slot_points_by_step_xy=[],
+        formation_name=name,
+        is_feasible=False,
+        center_points_xy=[],
+        heading_rads=[],
+        slot_points_by_step_xy=[],
         min_corridor_margin_m=0.0 if embedding is None else embedding.min_corridor_margin_m,
         corridor_violation_cost=0.0 if embedding is None else embedding.corridor_violation_cost,
-        min_slot_clearance_m=0.0, mean_clearance_m=0.0, safety_margin_m=0.0,
+        min_slot_clearance_m=0.0,
+        mean_clearance_m=0.0,
+        safety_margin_m=0.0,
         offset_cost=0.0 if embedding is None else embedding.offset_cost,
         heading_cost=0.0 if embedding is None else embedding.heading_cost,
-        lateral_offsets_m=[], heading_offsets_rad=[],
-        assignment=None, embedding_qp_result=embedding,
+        lateral_offsets_m=[],
+        heading_offsets_rad=[],
+        assignment=None,
+        embedding_qp_result=embedding,
         failure_reason=reason,
     )
 
 
-def _failure_reason(band_feasible: bool, safety_margin_m: float) -> str:
-    if not band_feasible:
-        return "slot_outside_safe_corridor"
-    if safety_margin_m < -1e-9:
-        return "slot_clearance_below_threshold"
-    return ""
-
-
 def _nominal_slots(
-    formation: FormationSpec, center: Point2D, heading: float,
+    formation: FormationSpec,
+    center: Point2D,
+    heading: float,
 ) -> list[Point2D]:
-    cos_h = math.cos(heading); sin_h = math.sin(heading)
+    cos_h = math.cos(heading)
+    sin_h = math.sin(heading)
     return [
-        (center[0] + cos_h * s[0] - sin_h * s[1],
-         center[1] + sin_h * s[0] + cos_h * s[1])
+        (
+            center[0] + cos_h * s[0] - sin_h * s[1],
+            center[1] + sin_h * s[0] + cos_h * s[1],
+        )
         for s in formation.slots
     ]
 
 
-# ── Bézier centreline ────────────────────────────────────────────
-
 class _CenterlineBezier:
-    """Piecewise cubic Bézier centreline  c(τ; Q),  τ ∈ [0, 1].
-
-    Control points  Q = [q_0, …, q_{M−1}]  where
-      q_0 = start (fixed),   q_{M−1} = end (fixed),
-      interior controls are the free optimisation variables.
-
-    Uses the same cubic‑Bézier evaluator as the preview planner,
-    keeping the representation consistent across the frontend.
-    """
+    """Piecewise cubic Bézier centreline  c(τ; Q),  τ ∈ [0, 1]."""
 
     def __init__(
         self,
         control_count: int,
         start_xy: np.ndarray,
         end_xy: np.ndarray,
-        ref_curve: np.ndarray,           # [N, 2]
+        ref_curve: np.ndarray,
         bezier_tension: float = 0.35,
     ) -> None:
         self.control_count = max(control_count, 3)
@@ -1020,7 +1023,7 @@ class _CenterlineBezier:
         ref_curve: np.ndarray,
         control_count: int,
         bezier_tension: float = 0.35,
-    ) -> "_CenterlineBezier":
+    ) -> _CenterlineBezier:
         return cls(
             control_count=control_count,
             start_xy=ref_curve[0].copy(),
@@ -1030,7 +1033,6 @@ class _CenterlineBezier:
         )
 
     def initial_controls(self) -> np.ndarray:
-        """Subsample the reference curve to get M initial control points."""
         Q = np.zeros((self.control_count, 2), dtype=float)
         Q[0] = self.start
         Q[-1] = self.end
@@ -1042,16 +1044,13 @@ class _CenterlineBezier:
         return Q
 
     def evaluate(self, Q: np.ndarray, num_points: int) -> np.ndarray:
-        """Evaluate the Bézier spline at *num_points* uniformly‑spaced τ.
-
-        Returns [num_points, 2] array of curve positions."""
         M = self.control_count
         if M <= 2:
             ts = np.linspace(0.0, 1.0, num_points)
             return np.outer(1 - ts, Q[0]) + np.outer(ts, Q[-1])
 
         tangents = _compute_tangents(Q)
-        segs_per_step = max(1, 4)  # fixed steps per segment, resample after
+        segs_per_step = max(1, 4)
         raw: list[tuple[float, float]] = []
         for seg_idx in range(M - 1):
             p0, p3 = Q[seg_idx], Q[seg_idx + 1]
@@ -1069,29 +1068,7 @@ class _CenterlineBezier:
             raw = [(float(Q[0, 0]), float(Q[0, 1])), (float(Q[-1, 0]), float(Q[-1, 1]))]
         return _resample_polyline(np.asarray(raw, dtype=float), num_points)
 
-    def _sample_at(self, Q: np.ndarray, tau: float) -> np.ndarray:
-        """Evaluate a single point at parameter τ ∈ [0, 1]."""
-        M = self.control_count
-        if M <= 2 or tau <= 0.0:
-            return Q[0].copy()
-        if tau >= 1.0:
-            return Q[-1].copy()
-        tangents = _compute_tangents(Q)
-        seg_float = tau * (M - 1)
-        seg_idx = min(int(seg_float), M - 2)
-        local_t = seg_float - seg_idx
-        p0, p3 = Q[seg_idx], Q[seg_idx + 1]
-        seg_len = float(np.linalg.norm(p3 - p0))
-        if seg_len < 1e-9:
-            return p0.copy()
-        cs = self.tension * seg_len
-        p1 = p0 + tangents[seg_idx] * cs
-        p2 = p3 - tangents[seg_idx + 1] * cs
-        t = local_t; omt = 1.0 - t
-        return omt**3 * p0 + 3.0 * omt**2 * t * p1 + 3.0 * omt * t**2 * p2 + t**3 * p3
-
     def bounding_box(self) -> tuple[float, float, float, float]:
-        """Return (x_min, x_max, y_min, y_max) for control clamping."""
         margin = 0.80
         return (
             float(min(self.start[0], self.end[0]) - margin),
@@ -1101,20 +1078,7 @@ class _CenterlineBezier:
         )
 
 
-# ── helpers ──────────────────────────────────────────────────────
-
-def _sample_ref(ref: np.ndarray, tau: float) -> np.ndarray:
-    """Sample the reference curve at parameter τ ∈ [0, 1]."""
-    n = len(ref)
-    idx = tau * (n - 1)
-    i0 = min(int(idx), n - 1)
-    i1 = min(i0 + 1, n - 1)
-    t = idx - i0
-    return ref[i0] * (1.0 - t) + ref[i1] * t
-
-
 def _compute_tangents(Q: np.ndarray) -> np.ndarray:
-    """Compute unit tangent vectors for each control point."""
     M = len(Q)
     tangents = np.zeros_like(Q)
     for i in range(M):
@@ -1130,37 +1094,23 @@ def _compute_tangents(Q: np.ndarray) -> np.ndarray:
 
 
 def _sample_cubic_bezier(
-    p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, steps: int,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    p2: np.ndarray,
+    p3: np.ndarray,
+    steps: int,
 ) -> np.ndarray:
     ts = np.linspace(0.0, 1.0, steps + 1)
     omt = 1.0 - ts
     return (
-        (omt**3)[:, None] * p0
-        + (3.0 * omt**2 * ts)[:, None] * p1
-        + (3.0 * omt * ts**2)[:, None] * p2
-        + (ts**3)[:, None] * p3
+        (omt ** 3)[:, None] * p0
+        + (3.0 * omt ** 2 * ts)[:, None] * p1
+        + (3.0 * omt * ts ** 2)[:, None] * p2
+        + (ts ** 3)[:, None] * p3
     )
 
 
-def _polyline_len(Q: np.ndarray) -> float:
-    return float(sum(np.linalg.norm(Q[i + 1] - Q[i]) for i in range(len(Q) - 1)))
-
-
-def _curve_to_bezier_controls(
-    curve: np.ndarray, bezier: "_CenterlineBezier",
-) -> np.ndarray:
-    """Fit Bézier controls to a dense centreline curve."""
-    Q = bezier.initial_controls().copy()
-    K = len(curve)
-    for k in range(1, bezier.control_count - 1):
-        t = k / (bezier.control_count - 1)
-        idx = min(int(t * (K - 1)), K - 1)
-        Q[k] = curve[idx]
-    return Q
-
-
 def _resample_polyline(pts: np.ndarray, num_points: int) -> np.ndarray:
-    """Resample a polyline to exactly *num_points* uniformly‑spaced points."""
     if len(pts) <= 1:
         return pts
     seg_vecs = pts[1:] - pts[:-1]
