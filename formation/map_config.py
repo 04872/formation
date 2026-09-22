@@ -10,6 +10,7 @@ MapType = Literal[
     "obstacle_cluster",
     "narrow_entrance",
     "narrowing_corridor",
+    "random_circles",
 ]
 
 
@@ -91,6 +92,17 @@ class NarrowEntranceConfig(BaseMapConfig):
     passage_center_y: float = 0.0
     passage_start_x: float = -1.5
     passage_end_x: float = 1.5
+
+
+@dataclass
+class RandomCirclesConfig(BaseMapConfig):
+    seed: int = 7
+    obstacle_count: int = 12
+    radius_min: float = 0.12
+    radius_max: float = 0.28
+    start_clearance_radius: float = 1.25
+    goal_clearance_radius: float = 1.25
+    obstacle_clearance: float = 0.08
 
 
 @dataclass

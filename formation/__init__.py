@@ -12,6 +12,7 @@ from formation.map_config import (
     NarrowingCorridorConfig,
     ObstacleClusterConfig,
     PlannerConfig,
+    RandomCirclesConfig,
     RightAngleCorridorConfig,
     SCurveCorridorConfig,
     ScenarioConfig,
@@ -22,6 +23,14 @@ from formation.path_manager import PathManager
 from formation.preview_curve import PreviewCurvePlanner
 from formation.simulator import MultiRobotSimulator, trace_summary
 from formation.swept_band import SweptBand, SweptBandBuilder
+from formation.tube_rrt import (
+    TubeRRTConfig,
+    TubeRRTNode,
+    TubeRRTPlanner,
+    TubeRRTResult,
+    project_robot_paths,
+    transform_slots,
+)
 from formation.types import (
     AssignmentResult,
     ControlCommand,
@@ -41,6 +50,7 @@ from formation.types import (
     MapData,
     MPCConfig,
     MPCWeights,
+    Pose2D,
     PreviewCurveConfig,
     RobotPrediction,
     RobotReferenceSample,
@@ -86,6 +96,8 @@ __all__ = [
     "ObstacleClusterConfig",
     "PathManager",
     "PlannerConfig",
+    "RandomCirclesConfig",
+    "Pose2D",
     "PreviewCurveConfig",
     "PreviewCurvePlanner",
     "RightAngleCorridorConfig",
@@ -100,5 +112,11 @@ __all__ = [
     "SelectorWeights",
     "SimulationTrace",
     "select_target_formation",
+    "TubeRRTConfig",
+    "TubeRRTNode",
+    "TubeRRTPlanner",
+    "TubeRRTResult",
+    "project_robot_paths",
+    "transform_slots",
     "wrap_to_pi",
 ]

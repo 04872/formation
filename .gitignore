@@ -7,3 +7,7 @@ __pycache__/
 
 **/results/
 **/paper/   
+**/.codex/**
+**/.claude/**
+**/.agents/**
+**/openspec/**

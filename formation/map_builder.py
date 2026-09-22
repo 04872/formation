@@ -10,6 +10,7 @@ from formation.map_config import (
     NarrowEntranceConfig,
     NarrowingCorridorConfig,
     ObstacleClusterConfig,
+    RandomCirclesConfig,
     RightAngleCorridorConfig,
     SCurveCorridorConfig,
 )
@@ -24,6 +25,7 @@ class MapBuilder:
             "obstacle_cluster": self._build_obstacle_cluster,
             "narrow_entrance": self._build_narrow_entrance,
             "narrowing_corridor": self._build_narrowing_corridor,
+            "random_circles": self._build_random_circles,
         }
         if map_type not in builders:
             raise ValueError(f"Unsupported map type: {map_type}")
@@ -83,6 +85,8 @@ class MapBuilder:
             goal_xy=config.goal_xy,
             obstacle_primitives=obstacle_primitives,
             inflation_radius=inflation_radius,
+            robot_radius=config.robot_radius,
+            safety_margin=config.safety_margin,
         )
         self._validate_start_goal(map_data)
         return map_data
@@ -231,6 +235,42 @@ class MapBuilder:
              "w": config.width_m, "h": gap_top + config.height_m / 2.0},
         ]
         return self._finalize_map("narrow_entrance", config, occupancy, obstacle_primitives)
+
+    def _build_random_circles(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, RandomCirclesConfig):
+            config = RandomCirclesConfig(**config.__dict__)
+        if config.radius_min <= 0.0 or config.radius_max < config.radius_min:
+            raise ValueError("Random circle radii must be positive and ordered.")
+        if config.obstacle_count < 0:
+            raise ValueError("Random circle obstacle_count must be non-negative.")
+        occupancy = self._make_free_map(config)
+        rng = np.random.default_rng(config.seed)
+        origin_x, origin_y = self._origin_xy(config)
+        circles: list[tuple[tuple[float, float], float]] = []
+        attempts = 0
+        max_attempts = max(100, 100 * config.obstacle_count)
+        while len(circles) < config.obstacle_count and attempts < max_attempts:
+            attempts += 1
+            radius = float(rng.uniform(config.radius_min, config.radius_max))
+            center = (
+                float(rng.uniform(origin_x + radius, origin_x + config.width_m - radius)),
+                float(rng.uniform(origin_y + radius, origin_y + config.height_m - radius)),
+            )
+            if np.linalg.norm(np.asarray(center) - config.start_xy) < config.start_clearance_radius + radius:
+                continue
+            if np.linalg.norm(np.asarray(center) - config.goal_xy) < config.goal_clearance_radius + radius:
+                continue
+            if any(np.linalg.norm(np.asarray(center) - old_center) < radius + old_radius + config.obstacle_clearance
+                   for old_center, old_radius in circles):
+                continue
+            circles.append((center, radius))
+        if len(circles) != config.obstacle_count:
+            raise ValueError("Could not place requested random circles with the configured clearances.")
+        primitives: list[dict[str, object]] = []
+        for center, radius in circles:
+            self._rasterize_circle(occupancy, config, center, radius)
+            primitives.append({"type": "circle", "center_xy": center, "radius": radius})
+        return self._finalize_map("random_circles", config, occupancy, primitives)
 
     def _build_narrowing_corridor(self, config: BaseMapConfig) -> MapData:
         if not isinstance(config, NarrowingCorridorConfig):

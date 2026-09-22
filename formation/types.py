@@ -37,6 +37,8 @@ class MapData:
     goal_xy: Point2D
     obstacle_primitives: list[dict[str, Any]] = field(default_factory=list)
     inflation_radius: float = 0.0
+    robot_radius: float = 0.09
+    safety_margin: float = 0.06
 
     @property
     def rows(self) -> int:

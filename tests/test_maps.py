@@ -11,6 +11,7 @@ from formation import (
     NarrowingCorridorConfig,
     ObstacleClusterConfig,
     RightAngleCorridorConfig,
+    RandomCirclesConfig,
     SCurveCorridorConfig,
 )
 
@@ -26,6 +27,7 @@ class MapBuilderTest(unittest.TestCase):
             "obstacle_cluster": ObstacleClusterConfig(),
             "narrow_entrance": NarrowEntranceConfig(),
             "narrowing_corridor": NarrowingCorridorConfig(),
+            "random_circles": RandomCirclesConfig(seed=31, obstacle_count=8),
         }
 
         for name, config in scenarios.items():
@@ -48,6 +50,29 @@ class MapBuilderTest(unittest.TestCase):
 
                 self.assertTrue(np.all(map_data.distance_field[map_data.occupancy] == 0.0))
                 self.assertGreater(float(np.max(map_data.distance_field[~map_data.occupancy])), 0.0)
+
+    def test_random_circles_are_deterministic_bounded_and_clear_of_terminals(self) -> None:
+        config = RandomCirclesConfig(seed=31, obstacle_count=8)
+        first = self.builder.build("random_circles", config)
+        second = self.builder.build("random_circles", config)
+        self.assertEqual(first.obstacle_primitives, second.obstacle_primitives)
+        self.assertEqual(len(first.obstacle_primitives), config.obstacle_count)
+        self.assertGreater(
+            len({round(float(primitive["radius"]), 12) for primitive in first.obstacle_primitives}),
+            1,
+        )
+        for primitive in first.obstacle_primitives:
+            self.assertEqual(primitive["type"], "circle")
+            center = np.asarray(primitive["center_xy"], dtype=float)
+            radius = float(primitive["radius"])
+            self.assertGreaterEqual(radius, config.radius_min)
+            self.assertLessEqual(radius, config.radius_max)
+            self.assertGreaterEqual(center[0] - radius, -config.width_m / 2.0)
+            self.assertLessEqual(center[0] + radius, config.width_m / 2.0)
+            self.assertGreaterEqual(center[1] - radius, -config.height_m / 2.0)
+            self.assertLessEqual(center[1] + radius, config.height_m / 2.0)
+            self.assertGreater(np.linalg.norm(center - config.start_xy), config.start_clearance_radius + radius - 1e-12)
+            self.assertGreater(np.linalg.norm(center - config.goal_xy), config.goal_clearance_radius + radius - 1e-12)
 
     def test_right_angle_corridor_legs_and_corner_are_free(self) -> None:
         config = RightAngleCorridorConfig()
