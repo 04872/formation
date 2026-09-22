@@ -1,0 +1,13 @@
+# Distributions installed by pip and not owned by conda-meta in the source environment.
+cffi==2.1.1
+clarabel==0.11.1
+cvxpy==1.7.5
+exceptiongroup==1.3.1
+iniconfig==2.3.0
+pluggy==1.6.0
+pycparser==3.0
+Pygments==2.20.0
+pytest==9.1.1
+scs==3.3.1
+tomli==2.4.1
+typing_extensions==4.16.0
