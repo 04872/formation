@@ -11,6 +11,8 @@ MapType = Literal[
     "narrow_entrance",
     "narrowing_corridor",
     "random_circles",
+    "post_fence",
+    "single_post",
 ]
 
 
@@ -103,6 +105,28 @@ class RandomCirclesConfig(BaseMapConfig):
     start_clearance_radius: float = 1.25
     goal_clearance_radius: float = 1.25
     obstacle_clearance: float = 0.08
+
+
+@dataclass
+class PostFenceConfig(BaseMapConfig):
+    """A row of thin circular posts across the map at x = fence_x.
+
+    With the default spacing a 2x-scaled square formation cannot fit between two posts as a whole
+    (needs spacing > 1.46 m) and must let a post pass between its robots.
+    """
+
+    fence_x: float = 0.0
+    post_spacing: float = 1.1
+    post_radius: float = 0.08
+    post_offset_y: float = 0.0
+
+
+@dataclass
+class SinglePostConfig(BaseMapConfig):
+    """One circular post on the start-goal line; the shortest path straddles it if the formation gap allows."""
+
+    post_xy: Point2D = (0.0, 0.0)
+    post_radius: float = 0.15
 
 
 @dataclass

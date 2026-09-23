@@ -10,9 +10,11 @@ from formation import (
     NarrowEntranceConfig,
     NarrowingCorridorConfig,
     ObstacleClusterConfig,
+    PostFenceConfig,
     RightAngleCorridorConfig,
     RandomCirclesConfig,
     SCurveCorridorConfig,
+    SinglePostConfig,
 )
 
 
@@ -28,6 +30,8 @@ class MapBuilderTest(unittest.TestCase):
             "narrow_entrance": NarrowEntranceConfig(),
             "narrowing_corridor": NarrowingCorridorConfig(),
             "random_circles": RandomCirclesConfig(seed=31, obstacle_count=8),
+            "post_fence": PostFenceConfig(),
+            "single_post": SinglePostConfig(),
         }
 
         for name, config in scenarios.items():
@@ -73,6 +77,20 @@ class MapBuilderTest(unittest.TestCase):
             self.assertLessEqual(center[1] + radius, config.height_m / 2.0)
             self.assertGreater(np.linalg.norm(center - config.start_xy), config.start_clearance_radius + radius - 1e-12)
             self.assertGreater(np.linalg.norm(center - config.goal_xy), config.goal_clearance_radius + radius - 1e-12)
+
+    def test_post_fence_spans_map_and_single_post_blocks_straight_line(self) -> None:
+        config = PostFenceConfig()
+        fence = self.builder.build("post_fence", config)
+        ys = sorted(float(p["center_xy"][1]) for p in fence.obstacle_primitives)
+        self.assertTrue(all(p["type"] == "circle" and p["center_xy"][0] == config.fence_x for p in fence.obstacle_primitives))
+        np.testing.assert_allclose(np.diff(ys), config.post_spacing)
+        self.assertIn(0.0, ys)
+        self.assertLess(ys[0] + config.height_m / 2.0, config.post_spacing)
+        self.assertLess(config.height_m / 2.0 - ys[-1], config.post_spacing)
+
+        post = self.builder.build("single_post", SinglePostConfig())
+        self.assertEqual(post.obstacle_primitives, [{"type": "circle", "center_xy": (0.0, 0.0), "radius": 0.15}])
+        self.assertTrue(post.is_occupied(post.world_to_grid((0.0, 0.0))))
 
     def test_right_angle_corridor_legs_and_corner_are_free(self) -> None:
         config = RightAngleCorridorConfig()

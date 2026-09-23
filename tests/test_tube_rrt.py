@@ -69,6 +69,34 @@ class TubeRRTTest(unittest.TestCase):
         self.assertAlmostEqual(nearest.y, 0.0)
         self.assertGreater(planner.clearance(nearest), 0.0)
 
+    def test_step_backoff_enters_narrow_passage_between_slots(self):
+        obstacle = [{"type": "circle", "center_xy": (0.0, 0.0), "radius": 0.2}]
+        fixed = self.planner(obstacle, goal_connect_distance=0.25, max_iterations=300, step_backoff=False)
+        fixed._sample_pose = lambda: Pose2D(8.0, 0.0, 0.0)
+        self.assertFalse(fixed.plan().success)
+
+        backoff = self.planner(obstacle, goal_connect_distance=0.25, max_iterations=300, record_trace=True)
+        backoff._sample_pose = lambda: Pose2D(8.0, 0.0, 0.0)
+        result = backoff.plan()
+        self.assertTrue(result.success)
+        self.assertTrue(any(event.attempts > 1 for event in result.trace if event.status == "added"))
+        straddling = [p for p in result.path_poses if abs(p.x) < 0.5 and abs(p.y) < 1e-9]
+        self.assertTrue(straddling)
+        for a, b, ra, rb in zip(result.path_poses, result.path_poses[1:], result.path_radii, result.path_radii[1:]):
+            self.assertLess(backoff.metric(a, b), ra + rb)
+
+    def test_margin_weight_edge_cost(self):
+        planner = self.planner(margin_weight=0.1)
+        a = TubeRRTNode(Pose2D(0, 0), 0.5, None, 0)
+        b = TubeRRTNode(Pose2D(0.4, 0), 0.2, None, 0)
+        self.assertAlmostEqual(planner.edge_cost(a, b), 0.4 * (1.0 + 0.1 / 0.2))
+        self.assertAlmostEqual(self.planner().edge_cost(a, b), 0.4)
+        result = self.planner(seed=4, max_iterations=600, margin_weight=0.1).plan()
+        self.assertTrue(result.success)
+        nodes = result.tree_nodes
+        for index, parent in result.tree_edges:
+            self.assertAlmostEqual(nodes[index].cost, nodes[parent].cost + planner.edge_cost(nodes[parent], nodes[index]))
+
     def test_progress_reporting_and_default_silence(self):
         planner = self.planner(metric_step=0.2, goal_connect_distance=0.25, max_iterations=100, progress_interval=2)
         planner._sample_pose = lambda: Pose2D(8.0, 0.0, 0.0)
@@ -117,6 +145,21 @@ class TubeRRTTest(unittest.TestCase):
                 first.tree_nodes[index].cost,
                 first.tree_nodes[parent].cost + planner.metric(first.tree_nodes[parent].pose, first.tree_nodes[index].pose),
             )
+        anytime = self.planner(seed=4, max_iterations=1800, metric_step=0.6, goal_bias=0.2,
+                               stop_on_first_goal=False, record_trace=True)
+        best = anytime.plan()
+        self.assertTrue(best.success)
+        self.assertEqual(best.iterations, 1800)
+        self.assertEqual(best.first_goal_iteration, first.first_goal_iteration)
+        self.assertLessEqual(best.path_cost, first.path_cost + 1e-9)
+        self.assertEqual(best.cost_history[-1][1], best.path_cost)
+        costs = [cost for _, cost in best.cost_history]
+        self.assertTrue(all(b < a for a, b in zip(costs, costs[1:])))
+        self.assertEqual(len(best.trace), 1800 + sum(event.status == "goal" for event in best.trace))
+        self.assertEqual((best.path_poses[-1].x, best.path_poses[-1].y), (8.0, 0.0))
+        for a, b, ra, rb in zip(best.path_poses, best.path_poses[1:], best.path_radii, best.path_radii[1:]):
+            self.assertLess(anytime.metric(a, b), ra + rb)
+
         failed = self.planner(seed=4, max_iterations=0).plan()
         self.assertFalse(failed.success)
         self.assertEqual(failed.failure_reason, "iteration budget exhausted")

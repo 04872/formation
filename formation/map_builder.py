@@ -10,7 +10,9 @@ from formation.map_config import (
     NarrowEntranceConfig,
     NarrowingCorridorConfig,
     ObstacleClusterConfig,
+    PostFenceConfig,
     RandomCirclesConfig,
+    SinglePostConfig,
     RightAngleCorridorConfig,
     SCurveCorridorConfig,
 )
@@ -26,6 +28,8 @@ class MapBuilder:
             "narrow_entrance": self._build_narrow_entrance,
             "narrowing_corridor": self._build_narrowing_corridor,
             "random_circles": self._build_random_circles,
+            "post_fence": self._build_post_fence,
+            "single_post": self._build_single_post,
         }
         if map_type not in builders:
             raise ValueError(f"Unsupported map type: {map_type}")
@@ -271,6 +275,36 @@ class MapBuilder:
             self._rasterize_circle(occupancy, config, center, radius)
             primitives.append({"type": "circle", "center_xy": center, "radius": radius})
         return self._finalize_map("random_circles", config, occupancy, primitives)
+
+    def _build_circles(self, name: str, config: BaseMapConfig,
+                       circles: list[tuple[tuple[float, float], float]]) -> MapData:
+        occupancy = self._make_free_map(config)
+        primitives: list[dict[str, object]] = []
+        for center, radius in circles:
+            self._rasterize_circle(occupancy, config, center, radius)
+            primitives.append({"type": "circle", "center_xy": center, "radius": radius})
+        return self._finalize_map(name, config, occupancy, primitives)
+
+    def _build_post_fence(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, PostFenceConfig):
+            config = PostFenceConfig(**config.__dict__)
+        if config.post_spacing <= 2.0 * config.post_radius or config.post_radius <= 0.0:
+            raise ValueError("Post fence requires positive radius and spacing larger than the post diameter.")
+        half_height = config.height_m / 2.0
+        count = int(math.floor(half_height / config.post_spacing)) + 1
+        circles = []
+        for k in range(-count, count + 1):
+            y = config.post_offset_y + k * config.post_spacing
+            if abs(y) <= half_height - config.post_radius:
+                circles.append(((config.fence_x, float(y)), config.post_radius))
+        return self._build_circles("post_fence", config, circles)
+
+    def _build_single_post(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, SinglePostConfig):
+            config = SinglePostConfig(**config.__dict__)
+        if config.post_radius <= 0.0:
+            raise ValueError("Single post radius must be positive.")
+        return self._build_circles("single_post", config, [(tuple(config.post_xy), config.post_radius)])
 
     def _build_narrowing_corridor(self, config: BaseMapConfig) -> MapData:
         if not isinstance(config, NarrowingCorridorConfig):
