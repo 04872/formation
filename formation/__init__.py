@@ -26,6 +26,8 @@ from formation.preview_curve import PreviewCurvePlanner
 from formation.simulator import MultiRobotSimulator, trace_summary
 from formation.swept_band import SweptBand, SweptBandBuilder
 from formation.tube_rrt import (
+    EdgeCertificate,
+    OrientationSafeCell,
     TubeRRTConfig,
     TubeRRTNode,
     TubeRRTPlanner,
@@ -118,6 +120,8 @@ __all__ = [
     "SimulationTrace",
     "select_target_formation",
     "TubeRRTConfig",
+    "OrientationSafeCell",
+    "EdgeCertificate",
     "TubeRRTNode",
     "TubeRRTPlanner",
     "TubeRRTResult",

@@ -57,11 +57,10 @@ FIGURE_FILES = {
     "overview": ("overview.png", "总览：搜索树、joint tube、编队投影、tube 宽度四宫格"),
     "tree": ("1_tree.png", "最终搜索树 (x, y) 投影，颜色 = 节点插入顺序，短线 = yaw；叠加被拒绝的 steer 点、"
                            "rewire 移除的边，粉色圈 = 障碍夹在机器人之间的节点"),
-    "growth": ("2_growth.png", "由 trace 回放的树生长快照：sample、nearest、q_new 及其安全球 xy 截面"),
-    "tube": ("3_tube.png", "joint tube：安全球 xy 截面、SE(2) 双锥、rho 沿路径曲线、相邻球严格重叠检查"),
+    "growth": ("2_growth.png", "由 trace 回放的树生长快照：sample、nearest、q_new 及其安全 cell anchor-yaw 截面。"),
+    "tube": ("3_tube.png", "joint tube：orientation-sliced safe cell disks and certified portal routes"),
     "formation": ("4_formation.png", "沿路径等间距采样的编队姿态：每个姿态一种颜色并编号，轮廓线连接各机器人"
-                                     "（粉色填充 = 障碍夹在机器人之间）；机器人轨迹、瓶颈处 r + margin + rho 圆，"
-                                     "以及 theta 曲线"),
+                                     "（粉色填充 = 障碍夹在机器人之间）；机器人轨迹、局部 guarded clearance 圆"),
     "frames": ("5_formation_frames.png", "关键帧放大：障碍夹在机器人之间（或瓶颈）附近的连续 tube 节点；每个子图以"
                                          "“上一节点 + 当前节点”为中心、比例尺相同，虚线为上一节点姿态，黑箭头为中心位移"),
     "convergence": ("6_convergence.png", "最优路径代价随迭代下降曲线，以及节点 / 拒绝 / rewire 累计数"),
@@ -364,7 +363,7 @@ def draw_growth(figure, result: TubeRRTResult, map_data, goal_connect: float) ->
         Line2D([], [], marker="o", color="none", markeredgecolor="tab:red", linestyle="", markersize=9, label="nearest node"),
         Line2D([], [], marker="o", color="tab:blue", markeredgecolor="k", linestyle="", markersize=6, label="steered q_new"),
         Line2D([], [], marker="o", color="tab:cyan", alpha=0.5, linestyle="", markersize=12,
-               label="xy-slice of new safety ball (radius rho)"),
+               label="anchor-yaw safe slice of accepted cell"),
         Line2D([], [], marker="x", color="#e41a1c", linestyle="", markersize=6, label="rejected so far"),
         Line2D([], [], color=PATH_COLOR, linewidth=2.4, label="current best path"),
     ]
@@ -373,44 +372,83 @@ def draw_growth(figure, result: TubeRRTResult, map_data, goal_connect: float) ->
 
 def draw_tube_xy(axis, result: TubeRRTResult, map_data, rho_norm: Normalize) -> None:
     draw_map(axis, map_data)
-    for pose, radius in zip(result.path_poses, result.path_radii):
-        axis.add_patch(Circle((pose.x, pose.y), radius, facecolor=RHO_CMAP(rho_norm(radius)), alpha=0.35,
-                              edgecolor=RHO_CMAP(rho_norm(radius)), linewidth=1.2, zorder=4))
-    draw_path(axis, result.path_poses)
+    # path_radii are direct guarded clearances at expanded waypoints.  A
+    # fixed-yaw disk is safe, but it is not an SE(2) scalar ball.
+    for pose, clearance in zip(result.path_poses, result.path_radii):
+        axis.add_patch(Circle((pose.x, pose.y), clearance, facecolor=RHO_CMAP(rho_norm(clearance)), alpha=0.25,
+                              edgecolor=RHO_CMAP(rho_norm(clearance)), linewidth=1.0, zorder=4))
     if result.path_radii:
         k = int(np.argmin(result.path_radii))
         pose = result.path_poses[k]
-        axis.annotate(f"bottleneck rho={result.path_radii[k]:.3f}", (pose.x, pose.y), xytext=(0, 55),
+        axis.annotate(f"local guarded clearance={result.path_radii[k]:.3f}", (pose.x, pose.y), xytext=(0, 55),
                       textcoords="offset points", ha="center", fontsize=9,
                       bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.6"),
                       arrowprops=dict(arrowstyle="->", color="k"), zorder=10)
-    axis.set_title("joint tube, xy slice: disk = {c : d_G((c, theta_k), q_k) < rho_k}", fontsize=10)
+    draw_path(axis, result.path_poses)
+    axis.set_title("expanded route: fixed-yaw safe disk at each waypoint", fontsize=10)
 
 
-def draw_tube_3d(axis, result: TubeRRTResult, formation_radius: float, rho_norm: Normalize) -> None:
+def _path_safe_cells(result: TubeRRTResult, max_cells: int = 12) -> list:
+    """Return only the safe cells on the final path, sampled for legibility."""
     if not result.path_poses:
-        return
-    yaws = np.unwrap([p.yaw for p in result.path_poses])
+        return []
+
+    # _path() writes every tree-node endpoint into path_poses exactly.  The
+    # final endpoint therefore identifies the selected goal node even when
+    # TubeRRTResult does not retain its index; following parent links then
+    # recovers precisely the final goal's ancestor chain after rewiring.
+    path_poses = set(result.path_poses)
+    goal_indices = [index for index, node in enumerate(result.tree_nodes)
+                    if node.pose == result.path_poses[-1]]
+    if goal_indices:
+        indices = []
+        index = goal_indices[-1]
+        while index is not None:
+            indices.append(index)
+            index = result.tree_nodes[index].parent
+        indices.reverse()
+    else:
+        # Keep this fallback for result-like objects whose path endpoint was
+        # reconstructed rather than copied from a tree node.
+        indices = [index for index, node in enumerate(result.tree_nodes) if node.pose in path_poses]
+
+    cells = [result.tree_nodes[index].cell for index in indices
+             if hasattr(result.tree_nodes[index].cell, "yaw_slices")]
+    if len(cells) <= 20:
+        return cells
+    picks = np.linspace(0, len(cells) - 1, min(max_cells, len(cells)), dtype=int)
+    return [cells[index] for index in np.unique(picks)]
+
+
+def draw_tube_3d(axis, result: TubeRRTResult, rho_norm: Normalize) -> None:
+    """Draw sampled safe cells on the final path, not the full search tree."""
+    cells = _path_safe_cells(result)
     phi = np.linspace(0.0, 2.0 * math.pi, 28)
-    for pose, yaw, radius in zip(result.path_poses, yaws, result.path_radii):
-        height = radius / formation_radius
-        dtheta = np.linspace(-height, height, 15)
-        ring = radius - formation_radius * np.abs(dtheta)
-        xs = pose.x + np.outer(ring, np.cos(phi))
-        ys = pose.y + np.outer(ring, np.sin(phi))
-        zs = np.degrees(yaw + np.repeat(dtheta[:, None], phi.size, axis=1))
-        axis.plot_surface(xs, ys, zs, color=RHO_CMAP(rho_norm(radius)), alpha=0.2, linewidth=0, shade=True)
-    tree = result.tree_nodes
-    axis.scatter([n.pose.x for n in tree], [n.pose.y for n in tree], np.degrees([n.pose.yaw for n in tree]),
-                 s=3, color="0.5", alpha=0.35, depthshade=False)
-    axis.plot([p.x for p in result.path_poses], [p.y for p in result.path_poses], np.degrees(yaws),
-              color=PATH_COLOR, linewidth=2.0, marker="o", markersize=3)
+    cell_norm = Normalize(0, max(1, len(cells) - 1))
+    for index, cell in enumerate(cells):
+        yaws = np.unwrap(np.asarray(cell.yaw_slices, dtype=float))
+        radii = np.asarray(cell.radius(yaws), dtype=float)
+        xs = cell.center[0] + np.outer(radii, np.cos(phi))
+        ys = cell.center[1] + np.outer(radii, np.sin(phi))
+        display_yaws = np.asarray([wrap_to_pi(float(yaw)) for yaw in yaws], dtype=float)
+        zs = np.repeat(display_yaws[:, None], phi.size, axis=1)
+        color = TREE_CMAP(cell_norm(index))
+        axis.plot_surface(xs, ys, zs, color=color, alpha=0.08, edgecolor=color,
+                          linewidth=0.25, shade=False, antialiased=True)
+    if result.path_poses:
+        yaws = np.asarray([wrap_to_pi(p.yaw) for p in result.path_poses], dtype=float)
+        axis.plot([p.x for p in result.path_poses], [p.y for p in result.path_poses], yaws,
+                  color=PATH_COLOR, linewidth=2.0, marker="o", markersize=3)
+    theta_ticks = [-math.pi, -math.pi / 2.0, 0.0, math.pi / 2.0, math.pi]
     axis.set_xlabel("x [m]")
     axis.set_ylabel("y [m]")
-    axis.set_zlabel("theta [deg]")
+    axis.set_zlabel("theta [rad]")
+    axis.set_zlim(-math.pi, math.pi)
+    axis.set_zticks(theta_ticks)
+    axis.set_zticklabels([r"$-\pi$", r"$-\pi/2$", "0", r"$\pi/2$", r"$\pi$"])
     axis.set_box_aspect((3, 2, 1.8), zoom=1.15)
     axis.view_init(elev=22, azim=-58)
-    axis.set_title("safety balls in SE(2): bicones\n||dc|| + R_F |dtheta| < rho", fontsize=10)
+    axis.set_title("path safe cells: orientation-sliced yaw envelopes", fontsize=10)
 
 
 def path_arclength(poses: list[Pose2D], metric) -> np.ndarray:
@@ -421,37 +459,43 @@ def draw_rho_profile(axis, result: TubeRRTResult, metric, rho_norm: Normalize) -
     if not result.path_poses:
         return
     s = path_arclength(result.path_poses, metric)
-    radii = np.asarray(result.path_radii)
-    axis.fill_between(s, 0.0, radii, color=RHO_CMAP(0.55), alpha=0.25)
-    axis.plot(s, radii, color="k", linewidth=1.0)
-    axis.scatter(s, radii, c=radii, cmap=RHO_CMAP, norm=rho_norm, s=30, edgecolor="k", zorder=5)
+    clearances = np.asarray(result.path_radii)
+    axis.fill_between(s, 0.0, clearances, color=RHO_CMAP(0.55), alpha=0.25)
+    axis.plot(s, clearances, color="k", linewidth=1.0)
+    axis.scatter(s, clearances, c=clearances, cmap=RHO_CMAP, norm=rho_norm, s=30, edgecolor="k", zorder=5)
     axis.axhline(result.bottleneck, color=PATH_COLOR, linestyle="--", linewidth=1.2,
-                 label=f"bottleneck = {result.bottleneck:.3f}")
-    axis.set_xlabel("joint-path length along d_G")
-    axis.set_ylabel("rho_k (safety radius)")
+                 label=f"minimum guarded clearance = {result.bottleneck:.3f}")
+    axis.set_xlabel("expanded route length along d_G")
+    axis.set_ylabel("direct guarded clearance (local)")
     axis.set_ylim(bottom=0.0)
     axis.grid(True, color="0.9")
     axis.legend(fontsize=8, loc="upper right")
-    axis.set_title("tube width along the path", fontsize=10)
+    axis.set_title("local clearance along certified portal route", fontsize=10)
 
 
 def draw_overlap_check(axis, result: TubeRRTResult, metric) -> None:
-    poses, radii = result.path_poses, result.path_radii
-    if len(poses) < 2:
+    """Compare certified route lengths with d_G; never infer an edge from radii."""
+    entries = []
+    for child, parent in result.tree_edges:
+        certificate = result.tree_nodes[child].certificate
+        if certificate is not None:
+            entries.append((metric(result.tree_nodes[parent].pose, result.tree_nodes[child].pose),
+                            certificate.route_length))
+    if not entries:
+        axis.text(0.5, 0.5, "no edge certificates", transform=axis.transAxes, ha="center")
+        axis.set_axis_off()
         return
-    edges = np.arange(len(poses) - 1)
-    distance = np.asarray([metric(a, b) for a, b in zip(poses, poses[1:])])
-    allowed = np.asarray(radii[:-1]) + np.asarray(radii[1:])
-    axis.bar(edges, allowed, color="tab:cyan", alpha=0.45, label="rho_k + rho_{k+1}")
-    axis.bar(edges, distance, width=0.45, color="tab:blue", label="d_G(q_k, q_{k+1})")
-    axis.set_xlabel("path edge k")
-    axis.set_ylabel("metric distance")
-    axis.set_xticks(edges)
+    edges = np.arange(len(entries))
+    d_g = np.asarray([entry[0] for entry in entries])
+    routes = np.asarray([entry[1] for entry in entries])
+    axis.bar(edges, routes, color="tab:cyan", alpha=0.55, label="certified portal route length")
+    axis.plot(edges, d_g, color="tab:blue", linewidth=1.0, label="search metric d_G")
+    axis.set_xlabel("certified tree edge")
+    axis.set_ylabel("length")
     axis.tick_params(axis="x", labelsize=7)
     axis.grid(True, axis="y", color="0.9")
     axis.legend(fontsize=8, loc="upper right")
-    axis.set_title(f"strict ball overlap d_G < rho_k + rho_(k+1): min margin {np.min(allowed - distance):.3f}",
-                   fontsize=10)
+    axis.set_title("certificate route length (not scalar-ball overlap)", fontsize=10)
 
 
 def dense_path(poses: list[Pose2D], per_edge: int = 12) -> list[Pose2D]:
@@ -544,7 +588,7 @@ def draw_formation(axis, result: TubeRRTResult, map_data, slots: np.ndarray, pla
     reach = planner.robot_radius + planner.safety_margin + result.path_radii[k]
     for x, y in transform_slots(poses[k], slots):
         axis.add_patch(Circle((x, y), reach, fill=False, edgecolor=PATH_COLOR, linestyle="--", linewidth=1.0, zorder=200))
-    axis.plot([], [], color=PATH_COLOR, linestyle="--", label="bottleneck: r + margin + rho")
+    axis.plot([], [], color=PATH_COLOR, linestyle="--", label="minimum local clearance + robot/safety radius")
     xlim, ylim = path_view_limits(poses, slots, map_data, pad=0.8)
     axis.set_xlim(*xlim)
     axis.set_ylim(*ylim)
@@ -595,8 +639,8 @@ def draw_formation_frames(figure, result: TubeRRTResult, map_data, slots: np.nda
         axis.set_xlim(*xlim)
         axis.set_ylim(*ylim)
         move = (f", step d_G={planner.metric(poses[k - 1], poses[k]):.2f}" if k > 0 else "")
-        axis.set_title(f"node {k}/{len(poses) - 1}: theta={math.degrees(poses[k].yaw):.1f} deg, "
-                       f"rho={result.path_radii[k]:.3f}{move}", fontsize=9)
+        axis.set_title(f"node {k}/{len(poses) - 1}: theta={wrap_to_pi(poses[k].yaw):.3f} rad, "
+                       f"guarded clearance={result.path_radii[k]:.3f}{move}", fontsize=9)
     for axis in list(axes)[len(frames):]:
         axis.set_visible(False)
     handles = [
@@ -614,9 +658,14 @@ def draw_yaw_profile(axis, result: TubeRRTResult) -> None:
     if not poses:
         return
     s = np.concatenate([[0.0], np.cumsum([math.hypot(b.x - a.x, b.y - a.y) for a, b in zip(poses, poses[1:])])])
-    axis.plot(s, np.degrees(np.unwrap([p.yaw for p in poses])), color="k", marker="o", markersize=3)
+    yaws = np.asarray([wrap_to_pi(p.yaw) for p in poses], dtype=float)
+    axis.plot(s, yaws, color="k", marker="o", markersize=3)
+    theta_ticks = [-math.pi, -math.pi / 2.0, 0.0, math.pi / 2.0, math.pi]
     axis.set_xlabel("center arc length [m]")
-    axis.set_ylabel("theta [deg]")
+    axis.set_ylabel("theta [rad]")
+    axis.set_ylim(-math.pi, math.pi)
+    axis.set_yticks(theta_ticks)
+    axis.set_yticklabels([r"$-\pi$", r"$-\pi/2$", "0", r"$\pi/2$", r"$\pi$"])
     axis.grid(True, color="0.9")
     axis.set_title("formation heading along the joint path", fontsize=10)
 
@@ -670,7 +719,7 @@ def summary_line(result: TubeRRTResult) -> str:
     status = "success" if result.success else result.failure_reason
     cost = f", path cost {result.path_cost:.2f}" if result.success else ""
     return (f"Joint Tube-RRT ({status}): {result.iterations} iterations, {len(result.tree_nodes)} nodes, "
-            f"{len(result.path_poses)} path nodes{cost}, bottleneck rho = {result.bottleneck:.3f}")
+            f"{len(result.path_poses)} expanded route waypoints{cost}, minimum local guarded clearance = {result.bottleneck:.3f}")
 
 
 def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner: TubeRRTPlanner) -> dict[str, plt.Figure]:
@@ -686,13 +735,13 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner: T
     axis.set_title("1. search tree (color = insertion order)", fontsize=11)
     axis = overview.add_subplot(grid[0, 1])
     draw_tube_xy(axis, result, map_data, rho_norm)
-    axis.set_title("2. joint tube (xy slice of each safety ball)", fontsize=11)
+    axis.set_title("2. expanded route (fixed-yaw safe disk slices)", fontsize=11)
     axis = overview.add_subplot(grid[1, 0])
     draw_formation(axis, result, map_data, slots, planner)
     axis.set_title("3. per-robot projection of the joint path", fontsize=11)
     axis = overview.add_subplot(grid[1, 1])
     draw_rho_profile(axis, result, planner.metric, rho_norm)
-    axis.set_title("4. tube width rho_k along the path", fontsize=11)
+    axis.set_title("4. direct guarded clearance along the expanded route", fontsize=11)
     for axis in overview.axes:
         if axis.get_label() != "<colorbar>" and axis.get_legend_handles_labels()[0] and axis.get_legend() is None:
             axis.legend(fontsize=7, loc="upper left", framealpha=0.85)
@@ -708,7 +757,7 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner: T
 
     growth = plt.figure(figsize=(16, 8.6))
     draw_growth(growth, result, map_data, goal_connect)
-    growth.suptitle("tree growth: sample -> nearest -> steer -> safety ball -> overlap check -> choose parent / rewire",
+    growth.suptitle("tree growth: sample -> nearest -> steer -> safe cell -> portal certificate -> choose parent / rewire",
                     fontsize=12)
     figures["growth"] = growth
 
@@ -717,7 +766,7 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner: T
     axis = tube.add_subplot(grid[0, 0])
     draw_tube_xy(axis, result, map_data, rho_norm)
     axis.legend(fontsize=8, loc="upper left")
-    draw_tube_3d(tube.add_subplot(grid[0, 1], projection="3d"), result, planner.formation_radius, rho_norm)
+    draw_tube_3d(tube.add_subplot(grid[0, 1], projection="3d"), result, rho_norm)
     draw_rho_profile(tube.add_subplot(grid[1, 0]), result, planner.metric, rho_norm)
     draw_overlap_check(tube.add_subplot(grid[1, 1]), result, planner.metric)
     tube.suptitle(f"joint tube U_0 -> ... -> U_M  (R_F = {planner.formation_radius:.3f} m)", fontsize=12)
@@ -770,7 +819,7 @@ def variant_name(args) -> str:
         parts.append(f"obs{args.obstacle_radius.replace(':', '-')}")
     if args.obstacle_count is not None:
         parts.append(f"n{args.obstacle_count}")
-    parts.append("first_goal" if args.first_goal else f"anytime_it{args.iterations}")
+    parts.append(f"anytime_it{args.iterations}" if args.anytime else "first_goal")
     if args.margin_weight > 0.0:
         parts.append(f"wm{number_tag(args.margin_weight)}")
     if args.no_step_backoff:
@@ -806,9 +855,10 @@ def write_path_csv(path: Path, result: TubeRRTResult, slots: np.ndarray) -> None
     robots = project_robot_paths(result.path_poses, slots)
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["k", "cx", "cy", "theta_rad", "rho"] + [f"robot{i}_{axis}" for i in range(len(robots)) for axis in "xy"])
-        for k, (pose, radius) in enumerate(zip(result.path_poses, result.path_radii)):
-            row = [k, f"{pose.x:.6f}", f"{pose.y:.6f}", f"{pose.yaw:.6f}", f"{radius:.6f}"]
+        writer.writerow(["k", "cx", "cy", "theta_rad", "guarded_clearance"] +
+                        [f"robot{i}_{axis}" for i in range(len(robots)) for axis in "xy"])
+        for k, (pose, clearance) in enumerate(zip(result.path_poses, result.path_radii)):
+            row = [k, f"{pose.x:.6f}", f"{pose.y:.6f}", f"{pose.yaw:.6f}", f"{clearance:.6f}"]
             row += [f"{value:.6f}" for robot in robots for value in robot[k]]
             writer.writerow(row)
 
@@ -844,7 +894,7 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         f"{stats['straddle_path_nodes']}（路径共 {summary['path_nodes']} 个节点） |",
         f"| 路径代价（含 J_margin）：首次 → 最终 | {summary['first_goal_cost']} → {summary['path_cost']} |",
         f"| 路径 d_G 长度 | {summary['path_length']} |",
-        f"| tube 瓶颈 rho_min | {summary['bottleneck']:.3f} |",
+        f"| tube minimum local guarded clearance | {summary['bottleneck']:.3f} |",
         "",
         "## 配置",
         "",
@@ -877,7 +927,7 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
     lines += [
         "## 其他文件",
         "",
-        "- `path.csv`：联合路径节点（cx, cy, theta, rho）及各机器人投影坐标。",
+        "- `path.csv`：展开后的联合安全路线（cx, cy, theta, guarded_clearance）及各机器人投影坐标。",
         "- `summary.json`：本次运行的机器可读摘要，`results/tube_rrt/README.md` 索引由它生成。",
         "",
         "## 控制台输出",
@@ -907,7 +957,7 @@ def write_index(out_dir: Path) -> Path:
         "",
         "“可穿过障碍”指半径小于“相邻机器人间隙允许的障碍半径上限”的障碍个数；为 0 时规划器只能绕行。",
         "",
-        "| 运行 | 成功 | 节点 | 首次到达迭代 | 代价 首次→最终 | d_G 长度 | 瓶颈 rho | 可穿过障碍 / 上限 m | "
+        "| 运行 | 成功 | 节点 | 首次到达迭代 | 代价 首次→最终 | d_G 长度 | 最小 guarded clearance | 可穿过障碍 / 上限 m | "
         "夹障碍节点 / 路径节点 | 规划耗时 s | 运行时间 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
@@ -953,10 +1003,14 @@ def main() -> None:
     parser.add_argument("--obstacle-count", type=int, default=None, help="number of random circles")
     parser.add_argument("--seed", type=int, default=7, help="planner seed; also the map seed for random_circles")
     parser.add_argument("--iterations", type=int, default=2500, help="Tube-RRT iteration budget (max_iterations)")
-    parser.add_argument("--first-goal", action="store_true",
-                        help="stop at the first goal connection instead of running the full budget")
+    parser.add_argument("--anytime", action="store_true",
+                        help="run the full iteration budget and keep the best goal path found")
     parser.add_argument("--margin-weight", type=float, default=0.0,
-                        help="J_margin weight w: edge cost = d_G * (1 + w / min(rho_a, rho_b))")
+                        help="J_margin weight w on certified route length")
+    parser.add_argument("--yaw-slices", type=int, default=16,
+                        help="equal yaw slices used to build each analytic safe cell")
+    parser.add_argument("--cell-shrink", type=float, default=0.98,
+                        help="eta shrink applied to analytic cell radii")
     parser.add_argument("--no-step-backoff", action="store_true",
                         help="disable step backoff (always steer by the fixed metric_step)")
     parser.add_argument("--progress-interval", type=int, default=500)
@@ -970,6 +1024,10 @@ def main() -> None:
         parser.error("--slot-scale must be positive")
     if args.margin_weight < 0.0:
         parser.error("--margin-weight must be non-negative")
+    if args.yaw_slices < 3:
+        parser.error("--yaw-slices must be at least 3")
+    if not 0.0 < args.cell_shrink <= 1.0:
+        parser.error("--cell-shrink must lie in (0, 1]")
     if args.robot_radius <= 0.0 or args.safety_margin < 0.0:
         parser.error("--robot-radius must be positive and --safety-margin non-negative")
     if args.obstacle_count is not None and args.obstacle_count < 0:
@@ -994,8 +1052,9 @@ def main() -> None:
         print("note: every obstacle is larger than the pass-through bound, so none can pass between robots "
               "(try --obstacle-radius auto or a larger --slot-scale)", flush=True)
     config = TubeRRTConfig(seed=args.seed, max_iterations=args.iterations, progress_interval=args.progress_interval,
-                           record_trace=True, stop_on_first_goal=args.first_goal, margin_weight=args.margin_weight,
-                           step_backoff=not args.no_step_backoff)
+                           record_trace=True, stop_on_first_goal=not args.anytime, margin_weight=args.margin_weight,
+                           step_backoff=not args.no_step_backoff, yaw_slices=args.yaw_slices,
+                           cell_eta=args.cell_shrink)
     planner = TubeRRTPlanner(map_data, slots, Pose2D(*map_data.start_xy, 0.0), config=config)
     print("planning...", flush=True)
     planning_start = time.perf_counter()
@@ -1004,7 +1063,7 @@ def main() -> None:
     print(f"timing tube_rrt={timing['tube_rrt']:.3f}s", flush=True)
     print(
         f"planning result: success={result.success} iterations={result.iterations} nodes={len(result.tree_nodes)} "
-        f"path_nodes={len(result.path_poses)} path_cost={result.path_cost:.3f} tube_bottleneck={result.bottleneck:.3f}",
+        f"path_nodes={len(result.path_poses)} path_cost={result.path_cost:.3f} min_guarded_clearance={result.bottleneck:.3f}",
         flush=True,
     )
 
@@ -1046,7 +1105,7 @@ def main() -> None:
         "passable_obstacles": passable,
         "obstacle_count": len(obstacle_radii),
         "seed": args.seed,
-        "mode": "first_goal" if args.first_goal else f"anytime_it{args.iterations}",
+        "mode": f"anytime_it{args.iterations}" if args.anytime else "first_goal",
         "success": result.success,
         "failure_reason": result.failure_reason,
         "iterations": result.iterations,
