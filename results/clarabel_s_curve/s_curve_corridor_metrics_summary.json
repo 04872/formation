@@ -1,0 +1,23 @@
+{
+  "scenario_name": "s_curve_corridor",
+  "success": true,
+  "failure_reason": null,
+  "T_goal": 26.200000000000003,
+  "num_steps": 131,
+  "e_track_mean": 0.07641140398583461,
+  "e_track_max": 0.17010449216812895,
+  "e_dist_mean": 0.015362537652024173,
+  "e_dist_max": 0.042396207459385514,
+  "e_sim_mean": 0.028492038871574508,
+  "e_sim_max": 0.09542422177044795,
+  "formation_switch_count": 0,
+  "formation_usage": {
+    "square": 131
+  },
+  "obstacle_collision": false,
+  "inter_robot_collision": false,
+  "timeout": false,
+  "planning_failure": false,
+  "control_failure": false,
+  "mpc_fallback_count": 0
+}

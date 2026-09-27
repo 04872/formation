@@ -1,0 +1,25 @@
+{
+  "scenario_name": "narrow_entrance",
+  "success": true,
+  "failure_reason": null,
+  "T_goal": 31.8,
+  "num_steps": 159,
+  "e_track_mean": 0.11422226979497864,
+  "e_track_max": 0.3957751453893723,
+  "e_dist_mean": 0.05223953218216335,
+  "e_dist_max": 0.3430759417486487,
+  "e_sim_mean": 0.06799714043679311,
+  "e_sim_max": 0.3916602954516612,
+  "formation_switch_count": 3,
+  "formation_usage": {
+    "horizontal_line": 89,
+    "square": 60,
+    "t_shape": 10
+  },
+  "obstacle_collision": false,
+  "inter_robot_collision": false,
+  "timeout": false,
+  "planning_failure": false,
+  "control_failure": false,
+  "mpc_fallback_count": 1
+}

@@ -1,0 +1,26 @@
+{
+  "scenario_name": "obstacle_cluster",
+  "success": false,
+  "failure_reason": "obstacle_collision",
+  "T_goal": null,
+  "num_steps": 130,
+  "e_track_mean": 0.42888832233628366,
+  "e_track_max": 0.9680259494596434,
+  "e_dist_mean": 0.3009141031684596,
+  "e_dist_max": 0.8163156532469955,
+  "e_sim_mean": 0.32396413131260005,
+  "e_sim_max": 0.7671055701047228,
+  "formation_switch_count": 4,
+  "formation_usage": {
+    "horizontal_line": 60,
+    "t_shape": 20,
+    "square": 40,
+    "column": 10
+  },
+  "obstacle_collision": true,
+  "inter_robot_collision": true,
+  "timeout": true,
+  "planning_failure": false,
+  "control_failure": false,
+  "mpc_fallback_count": 73
+}

@@ -5,9 +5,10 @@ __pycache__/
 *.pyd
 
 
-**/results/
+# **/results/
 **/paper/   
 **/.codex/**
 **/.claude/**
 **/.agents/**
 **/openspec/**
+**/.pytest_cache/**

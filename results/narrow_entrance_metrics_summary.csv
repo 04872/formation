@@ -1,0 +1,2 @@
+scenario_name,success,failure_reason,T_goal,num_steps,e_track_mean,e_track_max,e_dist_mean,e_dist_max,e_sim_mean,e_sim_max,formation_switch_count,obstacle_collision,inter_robot_collision,timeout,planning_failure,control_failure,mpc_fallback_count
+narrow_entrance,True,,31.8,159,0.11422226979497864,0.3957751453893723,0.05223953218216335,0.3430759417486487,0.06799714043679311,0.3916602954516612,3,False,False,False,False,False,1
