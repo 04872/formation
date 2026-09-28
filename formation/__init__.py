@@ -25,6 +25,9 @@ from formation.path_manager import PathManager
 from formation.preview_curve import PreviewCurvePlanner
 from formation.simulator import MultiRobotSimulator, trace_summary
 from formation.swept_band import SweptBand, SweptBandBuilder
+from formation.tube_cell_first_order import FirstOrderCellModel, PortalCertificate, TubeCell
+from formation.tube_cell_second_order import SecondOrderCellModel
+from formation.tube_rrt_chart import CELL_MODELS, ChartCellTubeRRTPlanner, make_tube_rrt_planner
 from formation.tube_rrt import (
     EdgeCertificate,
     OrientationSafeCell,
@@ -122,6 +125,13 @@ __all__ = [
     "TubeRRTConfig",
     "OrientationSafeCell",
     "EdgeCertificate",
+    "TubeCell",
+    "PortalCertificate",
+    "FirstOrderCellModel",
+    "SecondOrderCellModel",
+    "CELL_MODELS",
+    "ChartCellTubeRRTPlanner",
+    "make_tube_rrt_planner",
     "TubeRRTNode",
     "TubeRRTPlanner",
     "TubeRRTResult",

@@ -28,6 +28,8 @@ class TubeRRTConfig:
     cell_eta: float = 0.98
     yaw_slice_count: int | None = None
     cell_shrink: float | None = None
+    cell_model: str = "orientation"
+    route_check_step: float = 0.02
 
     def __post_init__(self) -> None:
         if self.yaw_slice_count is not None:
@@ -305,7 +307,9 @@ class TubeRRTNode:
     @property
     def radius(self) -> float:
         # Backward-readable local value, intentionally not a scalar edge ball.
-        return self.cell.anchor_radius() if isinstance(self.cell, OrientationSafeCell) else max(0.0, float(self.cell))
+        if isinstance(self.cell, OrientationSafeCell):
+            return self.cell.anchor_radius()
+        return self.cell.radius if hasattr(self.cell, "radius") else max(0.0, float(self.cell))
 
     @property
     def safe_cell(self) -> OrientationSafeCell | float:
@@ -342,6 +346,8 @@ class TubeRRTResult:
     first_goal_iteration: int | None = None
     path_cost: float = 0.0
     cost_history: list[tuple[int, float]] = field(default_factory=list)
+    path_nodes: list[int] = field(default_factory=list)
+    overlap_stats: dict[str, int] = field(default_factory=dict)
 
 
 def transform_slots(pose: Pose2D, slots: np.ndarray) -> np.ndarray:
@@ -371,6 +377,9 @@ class TubeRRTPlanner:
         self.start = start
         self.goal_xy = map_data.goal_xy if goal_xy is None else tuple(goal_xy)
         self.config = config or TubeRRTConfig()
+        if self.config.cell_model != "orientation":
+            raise ValueError("TubeRRTPlanner implements the orientation cell; use make_tube_rrt_planner for "
+                             f"cell_model={self.config.cell_model!r}")
         self.robot_radius = float(map_data.robot_radius)
         self.safety_margin = self.config.safety_margin + float(map_data.safety_margin)
         self.formation_radius = float(np.max(np.linalg.norm(self.slots, axis=1)))

@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-09-27 14:28:17",
-  "git": "767aa3f (有未提交改动)",
-  "command": "MPLBACKEND=Agg ../env/bin/python scripts/visualize_tube_rrt.py --map random_circles --seed 7 --slot-scale 2 --anytime",
+  "timestamp": "2026-09-28 17:58:01",
+  "git": "be68102 (有未提交改动)",
+  "command": "MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map random_circles --seed 7 --slot-scale 2 --anytime",
   "run_dir": "results/tube_rrt/random_circles_seed7/square_x2_anytime_it2500",
   "map": "random_circles",
   "variant": "square_x2_anytime_it2500",
@@ -35,11 +35,12 @@
     "goal_nodes": 4,
     "rejected_collision": 267,
     "rejected_no_overlap": 95,
-    "rewires": 970,
+    "rewires": 972,
     "backoff_nodes": 793,
     "straddle_tree_nodes": 55,
     "straddle_path_nodes": 0
   },
+  "overlap_stats": {},
   "config": {
     "max_iterations": 2500,
     "metric_step": 0.45,
@@ -56,14 +57,16 @@
     "yaw_slices": 16,
     "cell_eta": 0.98,
     "yaw_slice_count": null,
-    "cell_shrink": null
+    "cell_shrink": null,
+    "cell_model": "orientation",
+    "route_check_step": 0.02
   },
   "timing": {
-    "startup_imports": 0.8603048780933022,
-    "map_build": 0.6157635031268001,
-    "tube_rrt": 4.636656473856419,
-    "plot_build": 144.96523210871965,
-    "save": 10.158013869076967,
-    "total": 161.23847476020455
+    "startup_imports": 0.22557326802052557,
+    "map_build": 0.08786756289191544,
+    "tube_rrt": 0.6340048820711672,
+    "plot_build": 2.117180482018739,
+    "save": 1.5544669621158391,
+    "total": 4.619864766020328
   }
 }
