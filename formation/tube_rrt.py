@@ -329,6 +329,7 @@ class TubeRRTTraceEvent:
     rewires: list[tuple[int, int, int]] = field(default_factory=list)
     attempts: int = 1
     cell: OrientationSafeCell | None = None
+    mode: str = ""
 
 
 @dataclass

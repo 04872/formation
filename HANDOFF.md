@@ -11,12 +11,15 @@
 - `formation/tube_rrt.py`：原实现（默认 `cell_model="orientation"`）。`TubeRRTConfig`、节点 / trace / 结果结构、`OrientationSafeCell`（yaw 切片 cell）、`EdgeCertificate`（公共 yaw witness + portal）、`TubeRRTPlanner`、`transform_slots`、`interpolate_pose`、`project_robot_paths`。相对 `HEAD` 只增加了 `cell_model` / `route_check_step` 配置、结果的 `path_nodes` / `overlap_stats` 字段和非 orientation 时的报错，搜索逻辑未改。
 - `formation/tube_cell_first_order.py`：一阶近似 cell。`TubeCell`（节点位姿、`d_obs`、半径）、`PortalCertificate`（portal、相对 slack、路线长度）、`interpolate_pose`，以及 `FirstOrderCellModel`：chart 范数 `||.||_F`、批量 nearest 距离、位似 overlap、固定 yaw 截面（绘图用）。
 - `formation/tube_cell_second_order.py`：二阶 cell。`SecondOrderCellModel` 继承一阶模型，加入 `beta_i phi^2` 项、射线内步长、必要条件快速拒绝、候选 portal 快速接受和 Clarabel SOCP overlap。
-- `formation/tube_rrt_chart.py`：`ChartCellTubeRRTPlanner`（一阶 / 二阶 cell 共用的 RRT*：逐机器人 guarded clearance、nearest、父节点选择、rewire、认证路线与稠密 clearance 检查）、`CELL_MODELS`，以及工厂函数 `make_tube_rrt_planner`：`cell_model="orientation"` 返回原 `TubeRRTPlanner`，其余返回 `ChartCellTubeRRTPlanner`。
+- `formation/tube_rrt_chart.py`：`ChartCellTubeRRTPlanner`（一阶 / 二阶 cell 共用的 RRT*：逐机器人 guarded clearance、nearest、父节点选择、rewire、认证路线与稠密 clearance 检查）、`CELL_MODELS`，以及工厂函数 `make_tube_rrt_planner`：`cell_model="orientation"` 返回原 `TubeRRTPlanner`，`"polyhedral"` 返回 `PolyhedralFrontierPlanner`（可选参数 `frontier_config`），其余返回 `ChartCellTubeRRTPlanner`。
+- `formation/polyhedral_cell.py`：polyhedral cell。`PolyhedralCell`（seed 位姿、行矩阵 `normals / kappa / offsets`、`guard_rows`、active `pairs`、guard 半径 `G`、yaw 上限 `L`、准随机内部样本与体积估计）和 `PolyhedralCellModel`：proximity query（4 面墙 + 圆障碍）、建 cell、成员判定 / slack、`translational_extent`（ℓ_i(u, Δθ)）、`ray_extent`、`slice_polygon`（固定 yaw 截面多边形及每条边所属约束）、overlap（快速拒绝 / 线段候选快速接受 / Clarabel LP）。
+- `formation/tube_rrt_frontier.py`：`FrontierConfig` 与 `PolyhedralFrontierPlanner`（exposed frontier 候选、分数 S、J_expand、uniform 混合、父节点选择 / rewire、认证路线）。`frontier_snapshot()` 和 `expansion_log` 供绘图使用。
 - `formation/map_config.py`、`formation/map_builder.py`：地图配置与构造（`random_circles`、`post_fence`、`single_post` 等）。
 - `formation/__init__.py`：公开导出。
 - `scripts/visualize_tube_rrt.py`：CLI、规划、绘图、计时、报告和结果索引。
 - `tests/test_tube_rrt.py`：工厂分派（默认 orientation）、原 orientation 实现复现旧运行（random_circles seed 7、square×2、anytime：2143 节点、首次 236 次迭代、代价 12.406），以及 chart 范数定义、一阶位似 overlap、portal 同属两个 cell、一阶 / 二阶 cell 对真实机器人位移的界、二阶 overlap 与暴力采样一致、射线内步长、两种 cell 的确定性规划、二阶路线认证与无碰撞、rewire 后代价一致、非法 cell 名和起点碰撞。
 - `tests/test_maps.py`：全部地图字段、随机圆确定性 / 边界、各类走廊和起终点验证。
+- `tests/test_polyhedral_frontier.py`：公共旋转半径 ρ、约束行与 proximity query / guard 一致、cell 内任意构型真实 clearance ≥ d_s（蒙特卡洛）、ℓ 恰好落在边界、射线步长、截面多边形与成员判定一致、portal 严格在两 cell 内且与暴力采样一致、φ 形状、规划确定性与认证路线、live frontier 恰在所属 cell 边界且不被其他 cell 覆盖、纯 uniform 退化、起点碰撞。
 
 ## 当前算法与安全语义
 
@@ -35,6 +38,12 @@
 一阶 / 二阶 cell 共有：半径上限 `pi * spread / 2`（`spread` 为最大槽位间距），保证 cell 的 yaw 范围在 `(-pi, pi)` chart 内、在 chart 中是凸集。相邻节点的认证路线是 `q_a -> portal -> q_b`，两段各位于一个凸 cell 内；`result.path_poses` 就是这条路线（节点与 portal 交替），`path_nodes` 为树节点下标，`bottleneck` 为沿路线按 `route_check_step`（0.02）稠密采样的最小 guarded clearance（负值即碰撞）。边代价为 portal 路线长度 `||q_p - q_a||_{F,a} + ||q_b - q_p||_{F,b}`，`margin_weight = w > 0` 时乘 `1 + w / min(radius_a, radius_b)`（J_margin）。
 
 **搜索（一阶 / 二阶）**：seeded SE(2) 采样（goal bias 0.12），按 `||.||_F` 找最近节点并 steer（`metric_step` 0.45）；步长回退时每次减半，下限为 `0.9 * inner_step`：一阶取 `rho_near`，二阶取射线上 `s + beta_max (c s)^2 < d` 的解（`c` 为单位 F 长度的转角），保证新节点落在最近 cell 内部，所以最后一次尝试必然 overlap。之后按“邻居代价 + 距离”升序做父节点选择（下界不优即停止），再 rewire 并更新后代代价。`stop_on_first_goal=True`（库默认）时首次到达即返回；`False` 为 anytime：跑满迭代，只保留更优的 goal 节点。`result.overlap_stats` 记录 overlap 调用、快速拒绝 / 接受、SOCP 次数和 SOCP 接受数。
+
+**polyhedral cell + frontier 搜索（`cell_model="polyhedral"`，`polyhedral_cell.py` / `tube_rrt_frontier.py`，分支 `polyhedral-frontier`）**：要求所有槽位到编队中心距离相同 `||s_i|| = ρ`（square × 2 即相邻机器人 1 m、ρ = 0.707 m；实现取 `ρ = max ||s_i||`，对不等距编队也保守）。对 seed `q_0`，逐机器人对障碍 component（4 面墙 + 每个圆）做 proximity query 得 guarded clearance `d_ij` 与分离方向 `n_ij`；每个机器人取 clearance ≤ `active_range`（1.0 m）的最近至多 `max_active_per_robot`（3）个 component 为 active pair，约束 `n_ij^T Δc − ρ|Δθ| ≥ −(d_ij − d_s)`（`d_s` = `safety_distance`，默认 0.02 m，另加在机器人半径和安全余量之上）。其余 pair 的最小 clearance 为 `d_inactive`，guard `||Δc|| + ρ|Δθ| ≤ G = min(d_inactive − d_s, max_extent)` 用内接正 `guard_facets`（12）边形表示（`κ = cos(π/M)`），所以整个 cell 是 chart `(Δc, Δθ)` 中的凸多面体 `n_k^T Δc − κ_k ρ|Δθ| + e_k ≥ 0`，再加 `|Δθ| ≤ L = min(π/2, G/ρ)`。因为每个机器人位移 ≤ `||Δc|| + 2ρ sin(|Δθ|/2)`，cell 内任意构型的真实 clearance ≥ d_s（严格证书，测试用蒙特卡洛验证）。`radius` 为 Δθ = 0 截面的内切半径 `min_k e_k`。
+
+cell overlap：`|δθ| ≥ L_a + L_b` 或中心距 ≥ `G_a + G_b` 时快速拒绝；节点连线上 5 个候选点（t = 1, 0, .5, .25, .75）有严格正 slack 则快速接受；否则在 a 的 chart 中解 LP `max t`（变量 `u, φ, w_a ≥ |φ|, w_b ≥ |φ − δ|, t`，Clarabel），`t* > 0` 即 overlap、最优点为 portal，再用精确 slack 复核。两 cell 都凸，路线 `q_a → q_p → q_b` 每段位于一个 cell 内，因此认证路线处处 clearance ≥ d_s。度量 / 边长为 `d_G = ||Δc|| + ρ|Δθ|`。
+
+搜索：每个节点保存 `(q_i, C_i)`。节点插入后，在 `yaw_slice_fractions`（0, ±0.5, ±0.9 倍 `yaw_reach`）个 yaw 上用 `slice_polygon` 求截面 `P_i(Δθ)`，沿每条边按 `frontier_spacing`（0.3 m）取点作为候选 `(i, u, Δθ)`，`ℓ = ||点||`（凸截面含原点时即 ℓ_i(u, Δθ)）；被其他 cell 覆盖的点不在 `F_i` 上，直接丢弃。`U` = 边界外 `probe_count`（3）个步长 `probe_step`（0.25 m）的探针中“无碰撞且不在 union 内”的比例；`G = (d_goal(c_i) − d_goal(b)) / ℓ ∈ [−1, 1]`。分数 `S = α min(ℓ/ℓ_ref, 1) + β U + γ (G+1)/2`（默认 α=β=γ=1），按 `exp(S/τ)`（τ = 0.15）加权抽样；每次失败分数减半，失败 3 次丢弃。新 cell 插入时，被它覆盖的候选点失效，被覆盖的探针关闭（U 与 S 随之更新）。选中候选后生成 `step_scales`（0.8, 1.2, 1.6，各乘 [0.9, 1.1] 抖动）倍 ℓ 的 seed `q_i + (sℓu, Δθ)`；每个 seed 建 cell，要求与 parent overlap，frontier 模式还要求 `ρ_new ≥ min_new_ratio`（0.05，否则记为 `redundant`），在合格 seed 中取 `J = w1 ρ_new + w2 φ(ρ_overlap) + w3 Δd_goal/ℓ_ref`（默认 1, 0.5, 0.5；`φ` 在 `overlap_band` (0.1, 0.5) 内为 1，向 0 和 1 线性下降）最大者。`ρ_new`、`ρ_overlap` 用每个 cell 的 128 个 Halton 盒内样本估计（体积按 `(x, y, ρθ)` 计）。以概率 `uniform_probability`（0.15，或 frontier 为空时）改用普通 SE(2) 采样（goal bias 0.12）：取 d_G 最近节点，沿 chart 射线走到其 cell 边界的 0.8 / 1.2 / 1.6 倍（不超过样本），这些 seed 不受 `ρ_new` 下限限制，用来给 union 内部加密，使 rewire 能缩短路径。插入后在“可能与新 cell 重叠”（guard 圆与 yaw 区间相交）的至多 12 个最近节点中重选父节点并 rewire；目标连接、anytime 语义与 chart 版本相同。`result.overlap_stats` 同时记录 cell / overlap / LP 计数和采样统计（frontier / uniform 迭代数与接受节点数、候选生成 / 覆盖 / 丢弃 / 剩余、redundant 拒绝）。
 
 ## 可视化与计时
 
@@ -55,6 +64,7 @@
 - `--yaw-slices N`：orientation cell 的 yaw 切片数，默认 16（只对 orientation 生效）。
 - `--margin-weight W`：J_margin 权重，默认 0。
 - `--no-step-backoff`：关闭步长回退（旧的固定步长行为）。
+- `--cell polyhedral` 时另有：`--uniform-prob P`（默认 0.15，非默认时变体名加 `u<P>`）、`--safety-distance D_S`（0.02）、`--active-range R`（1.0）、`--score-weights A B G`（1 1 1）、`--expand-weights W1 W2 W3`（1 0.5 0.5）、`--overlap-band MIN MAX`（0.1 0.5）。变体名标记为 `cellP`；多出 `7_frontier.png`（全部 cell 的节点 yaw 截面构成的 union、仍 exposed 的 frontier 候选按 S 着色、ρ_new / ρ_overlap 直方图、frontier / uniform 接受节点累计数）；`3_tube.png` 画截面多边形（实线边 = active 障碍平面，虚线边 = guard）；`run.md` 额外列出 LP、redundant、采样来源和 frontier 统计以及 `frontier.*` 配置。
 - `--progress-interval INT`，非负，默认 500；传 0 关闭搜索进度输出。
 - `--show`：保存后再交互式显示全部图。
 
@@ -99,19 +109,29 @@ orientation 版本的旧命令 `--map random_circles --seed 7 --slot-scale 2 --a
 | `single_post` | 11.089 / 0.012 | 11.993 / 0.179 | 11.996 / 0.179 | 14 / 0 / 0 |
 | `post_fence` | 11.363 / 0.124 | 10.806 / 0.065 | 10.802 / 0.065 | 12 / 9 / 9 |
 
+polyhedral + frontier（同一场景，square × 2 即相邻 1 m，anytime 2500 次迭代，单次实测，env-rebuilt）：
+
+| 地图 | 首次到达迭代（首次代价） | 最终代价 d_G / 最小 clearance | 节点 | 夹障碍路径节点 | Tube-RRT 耗时 |
+| --- | --- | --- | --- | --- | --- |
+| `random_circles` | 23（12.328） | 12.250 / 0.274 | 1170 | 0 / 19 | 约 5.6 s |
+| `single_post` | 18（12.607） | 11.647 / 0.045 | 918 | 0 / 14 | 约 4.4 s |
+| `post_fence` | 65（14.541） | 11.978 / 0.118 | 1051 | 3 / 20 | 约 5.0 s |
+
+首次到达目标所需迭代比 RRT* 版本少一个数量级（18–65 vs 113–236），但 anytime 改进有限：frontier 扩展只往未覆盖区域放 cell，路径附近很少新增节点，主要靠 uniform 样本加密后 rewire。每次迭代要建约 3 个 cell 并做覆盖判定，所以单次迭代比一阶 / 二阶慢约一个数量级；首次到达模式下总耗时 0.03–0.12 s。
+
 orientation 的 clearance 是展开路线上的局部 guarded clearance，一阶 / 二阶是认证路线上稠密采样的 guarded clearance，两者口径不同。对全部树边稠密检查，这些场景中一阶 cell 也没有产生碰撞边；但一阶 cell 内确实存在真实位移超过 `rho` 的构型，只有二阶 cell 是证书。`formation/distance_field.py:61-68` 的纯 Python 行列扫描约 0.6s，是独立热点，当前未改。
 
 ## 验证命令与最近记录
 
-最近验证记录：focused 20 tests（`test_tube_rrt` 12 + `test_maps` 8），完整 67 tests；这些是最近一次验证记录，不是永久保证。
+最近验证记录：focused 33 tests（`test_polyhedral_frontier` 13 + `test_tube_rrt` 12 + `test_maps` 8），完整 80 tests；这些是最近一次验证记录，不是永久保证。
 
 项目使用的 Conda 环境是 `../env-rebuilt`（即 `/home/eai/projects/env-rebuilt`，可用 `conda activate /home/eai/projects/env-rebuilt` 激活）。
 
 ```bash
-../env-rebuilt/bin/python -m unittest tests.test_tube_rrt tests.test_maps
+../env-rebuilt/bin/python -m unittest tests.test_polyhedral_frontier tests.test_tube_rrt tests.test_maps
 ../env-rebuilt/bin/python -m unittest discover -s tests
 for map in random_circles single_post post_fence; do
-  for cell in orientation first_order second_order; do
+  for cell in orientation first_order second_order polyhedral; do
     MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map $map --slot-scale 2 --anytime --cell $cell
   done
 done
@@ -140,6 +160,8 @@ conda env create --prefix ../env-rebuilt-fallback --file environment-linux-64.ym
 ```
 
 ## Git 交付
+
+polyhedral cell + frontier 搜索位于本地分支 `polyhedral-frontier`（基于 `path-plan` 的 `1d6ec45`），只做了本地提交，未推送。下面是更早的 `curve-band-v2` 交付说明，保留备查。
 
 当前 branch 是 `curve-band-v2`，当前基础 HEAD 为 `b9e62db`，且尚未配置 remote。以下命令只显式提交本次交付文件，不包含 `openspec/`；本地发送到远程的动作是 `push`，当前尚未执行提交或推送。
 

@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import colormaps
-from matplotlib.collections import LineCollection
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Polygon
@@ -38,6 +38,10 @@ from formation import (
     SinglePostConfig,
     TubeRRTConfig,
     ChartCellTubeRRTPlanner,
+    FrontierConfig,
+    PolyhedralCell,
+    PolyhedralCellModel,
+    PolyhedralFrontierPlanner,
     TubeRRTPlanner,
     TubeRRTResult,
     make_tube_rrt_planner,
@@ -55,8 +59,11 @@ ROBOT_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2"
 MAP_NAMES = ("post_fence", "random_circles", "single_post")
 TURTLEBOT3_BURGER_RADIUS = 0.113  # circumscribed circle of the 138 mm x 178 mm TurtleBot3 Burger footprint
 DEFAULT_SAFETY_MARGIN = 0.06
-CELL_TAGS = {"orientation": None, "first_order": "cell1", "second_order": "cell2"}
+CELL_TAGS = {"orientation": None, "first_order": "cell1", "second_order": "cell2", "polyhedral": "cellP"}
 CELL_DESCRIPTIONS = {
+    "polyhedral": "polyhedral cell + frontier 搜索：active robot-obstacle 支撑平面 n^T dc - rho|dtheta| >= -(d - d_s) "
+                  "与 validity guard ||dc|| + rho|dtheta| <= d_inactive - d_s（内接多边形）之交；从 exposed frontier "
+                  "按 S = alpha l + beta U + gamma G 采样 (i, u, dtheta)，按 J_expand 选 seed，混合少量 uniform SE(2) 采样",
     "orientation": "orientation-sliced cell：按 yaw 切片的 guarded clearance 下包络，公共 yaw witness + portal 认证（原实现）",
     "first_order": "一阶近似 cell：max_i ||u + J a_i phi|| < rho_k，rho_k = eta d_obs；overlap 用同 chart 位似判据的推广 "
                    "rho_a/n_a + rho_b/n_b > 1（portal 在两节点连线上）",
@@ -65,6 +72,9 @@ CELL_DESCRIPTIONS = {
 }
 CHART_TUBE_DESCRIPTION = ("joint tube：路径 cell 的节点 yaw 截面与 portal、(x, y, theta) 中的 cell 形状、"
                           "沿认证路线的稠密 clearance、最紧 portal 处两个 cell 的固定 yaw 截面（圆盘交集）")
+POLY_TUBE_DESCRIPTION = ("joint tube：路径 polyhedral cell 的 dtheta = 0 截面 P_i(0) 与 portal、(x, y, theta) 中叠起来的 "
+                         "yaw 截面多边形、沿认证路线的稠密 clearance、最紧 portal 处两个 cell 在 portal yaw 下的截面"
+                         "（实线边 = active 障碍支撑平面，虚线边 = validity guard）")
 FIGURE_FILES = {
     "overview": ("overview.png", "总览：搜索树、joint tube、编队投影、tube 宽度四宫格"),
     "tree": ("1_tree.png", "最终搜索树 (x, y) 投影，颜色 = 节点插入顺序，短线 = yaw；叠加被拒绝的 steer 点、"
@@ -76,6 +86,9 @@ FIGURE_FILES = {
     "frames": ("5_formation_frames.png", "关键帧放大：障碍夹在机器人之间（或瓶颈）附近的连续 tube 节点；每个子图以"
                                          "“上一节点 + 当前节点”为中心、比例尺相同，虚线为上一节点姿态，黑箭头为中心位移"),
     "convergence": ("6_convergence.png", "最优路径代价随迭代下降曲线，以及节点 / 拒绝 / rewire 累计数"),
+    "frontier": ("7_frontier.png", "（仅 polyhedral）certified union：全部 cell 的节点 yaw 截面、仍 exposed 的 frontier "
+                                   "候选（颜色 = 采样分数 S）；新 cell 的 rho_new / rho_overlap 分布；frontier 与 uniform "
+                                   "两种采样来源的累计接受节点数"),
 }
 
 
@@ -252,6 +265,11 @@ def draw_tree(axis, result: TubeRRTResult, map_data, goal_connect: float, slots:
         axis.scatter([p.x for p in no_overlap], [p.y for p in no_overlap], marker="o", s=10, facecolor="none",
                      edgecolor="#ff7f00", alpha=style["reject_alpha"] + 0.1, linewidth=0.7, zorder=3,
                      label=f"rejected: no tube overlap ({len(no_overlap)})")
+    redundant = [e.steered for e in result.trace if e.status == "redundant"]
+    if redundant:
+        axis.scatter([p.x for p in redundant], [p.y for p in redundant], marker=".", s=8, color="0.45",
+                     alpha=style["reject_alpha"], zorder=3, label=f"rejected: redundant cell, rho_new too small "
+                                                               f"({len(redundant)})")
 
     rewired = [(nodes[old].pose, nodes[child].pose) for e in result.trace for child, old, _ in e.rewires]
     if rewired and len(rewired) <= 300:
@@ -334,7 +352,11 @@ def draw_growth_snapshot(axis, result: TubeRRTResult, map_data, event_index: int
     axis.scatter(event.sample.x, event.sample.y, marker="P", s=70, color="tab:red", edgecolor="k", zorder=8)
     axis.plot([near.x, event.sample.x], [near.y, event.sample.y], color="tab:red", linestyle=":", linewidth=1.0, zorder=7)
     axis.scatter(near.x, near.y, s=70, facecolor="none", edgecolor="tab:red", linewidth=1.5, zorder=8)
-    if event.radius > 0.0:
+    polygon = poly_slice(event.cell, 0.0) if isinstance(event.cell, PolyhedralCell) else None
+    if polygon is not None:
+        axis.add_patch(Polygon(polygon, closed=True, facecolor="tab:cyan", alpha=0.25, edgecolor="tab:blue",
+                               linewidth=1.0, zorder=6))
+    elif event.radius > 0.0:
         axis.add_patch(Circle((event.steered.x, event.steered.y), event.radius, facecolor="tab:cyan", alpha=0.25,
                               edgecolor="tab:blue", linewidth=1.0, zorder=6))
     axis.scatter(event.steered.x, event.steered.y, s=30, color="tab:blue", edgecolor="k", zorder=9)
@@ -582,7 +604,7 @@ def draw_route_clearance(axis, result: TubeRRTResult, planner: ChartCellTubeRRTP
     axis.axhline(result.bottleneck, color=PATH_COLOR, linestyle="--", linewidth=1.2,
                  label=f"minimum guarded clearance = {result.bottleneck:.3f}")
     axis.axhline(0.0, color="0.3", linewidth=0.8)
-    axis.set_xlabel("route length ||.||_F [m]")
+    axis.set_xlabel(f"route length {metric_label(planner)} [m]")
     axis.set_ylabel("guarded clearance d_obs [m]")
     axis.grid(True, color="0.9")
     axis.legend(fontsize=8, loc="upper right")
@@ -625,6 +647,157 @@ def draw_portal_slice(axis, result: TubeRRTResult, map_data, planner: ChartCellT
     axis.legend(fontsize=7, loc="upper left", framealpha=0.85)
     axis.set_title(f"tightest portal (edge {k + 1}/{len(edges)}): theta_p = {portal.yaw:.3f} rad, "
                    f"relative slack = {certificate.slack:.3f}", fontsize=10)
+
+
+def poly_slice(cell: PolyhedralCell, dtheta: float) -> np.ndarray | None:
+    polygon, _ = PolyhedralCellModel.slice_polygon(cell, dtheta)
+    return polygon if len(polygon) else None
+
+
+def sampled_path_cells(result: TubeRRTResult, max_cells: int) -> list:
+    cells = path_cells(result)
+    if len(cells) > max_cells:
+        cells = [cells[i] for i in np.unique(np.linspace(0, len(cells) - 1, max_cells, dtype=int))]
+    return cells
+
+
+def draw_poly_tube_xy(axis, result: TubeRRTResult, map_data, rho_norm: Normalize) -> None:
+    """Path cells sliced at their own yaw (the polygon P_i(0)) and the portals between them."""
+    draw_map(axis, map_data)
+    cells = path_cells(result)
+    for cell in cells:
+        polygon = poly_slice(cell, 0.0)
+        if polygon is not None:
+            color = RHO_CMAP(rho_norm(cell.radius))
+            axis.add_patch(Polygon(polygon, closed=True, facecolor=color, alpha=0.18, edgecolor=color, linewidth=1.0,
+                                   zorder=4))
+    portals = [result.tree_nodes[index].certificate.portal for index in result.path_nodes[1:]]
+    if portals:
+        axis.scatter([p.x for p in portals], [p.y for p in portals], marker="D", s=18, color="tab:cyan",
+                     edgecolor="k", linewidth=0.5, zorder=9, label="portal q_p")
+    if cells:
+        cell = min(cells, key=lambda c: c.radius)
+        axis.annotate(f"smallest in-radius = {cell.radius:.3f}", (cell.pose.x, cell.pose.y), xytext=(0, 55),
+                      textcoords="offset points", ha="center", fontsize=9,
+                      bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.6"),
+                      arrowprops=dict(arrowstyle="->", color="k"), zorder=10)
+    draw_path(axis, result.path_poses, label="certified route q_k -> q_p -> q_k+1")
+    axis.set_title("path cells: translational section P_i(dtheta = 0) and portals", fontsize=10)
+
+
+def draw_poly_tube_3d(axis, result: TubeRRTResult, max_cells: int = 12) -> None:
+    """Path cells in (x, y, theta): the yaw-dependent polygons P_i(dtheta) stacked at theta_i + dtheta."""
+    cells = sampled_path_cells(result, max_cells)
+    all_yaws = np.unwrap([cell.pose.yaw for cell in path_cells(result)]) if result.path_nodes else []
+    lifted = {id(cell): yaw for cell, yaw in zip(path_cells(result), all_yaws)}
+    cell_norm = Normalize(0, max(1, len(cells) - 1))
+    for index, cell in enumerate(cells):
+        color = TREE_CMAP(cell_norm(index))
+        for dtheta in np.linspace(-cell.yaw_limit, cell.yaw_limit, 9)[1:-1]:
+            polygon = poly_slice(cell, float(dtheta))
+            if polygon is None:
+                continue
+            closed = np.vstack((polygon, polygon[:1]))
+            axis.plot(closed[:, 0], closed[:, 1], np.full(len(closed), lifted[id(cell)] + dtheta), color=color,
+                      linewidth=0.7, alpha=0.75)
+    if result.path_poses:
+        yaws = np.unwrap([p.yaw for p in result.path_poses])
+        axis.plot([p.x for p in result.path_poses], [p.y for p in result.path_poses], yaws,
+                  color=PATH_COLOR, linewidth=2.0, marker="o", markersize=3)
+    axis.set_xlabel("x [m]")
+    axis.set_ylabel("y [m]")
+    axis.set_zlabel("theta [rad]")
+    axis.set_box_aspect((3, 2, 1.8), zoom=1.15)
+    axis.view_init(elev=22, azim=-58)
+    axis.set_title("path cells in (x, y, theta): yaw slices P_i(dtheta)", fontsize=10)
+
+
+def draw_poly_portal_slice(axis, result: TubeRRTResult, map_data, planner: PolyhedralFrontierPlanner) -> None:
+    """Sections of the two cells of the tightest path edge at the portal yaw; solid = obstacle plane, dashed = guard."""
+    edges = list(zip(result.path_nodes, result.path_nodes[1:]))
+    if not edges:
+        axis.text(0.5, 0.5, "no path", transform=axis.transAxes, ha="center")
+        axis.set_axis_off()
+        return
+    nodes = result.tree_nodes
+    k = int(np.argmin([nodes[child].certificate.slack for _, child in edges]))
+    parent, child = (nodes[i] for i in edges[k])
+    certificate = child.certificate
+    portal = certificate.portal
+    draw_map(axis, map_data, labels=False)
+    outlines = []
+    for node, color, name in ((parent, "tab:blue", "C_a"), (child, "tab:orange", "C_b")):
+        polygon, labels = PolyhedralCellModel.slice_polygon(node.cell, wrap_to_pi(portal.yaw - node.pose.yaw))
+        if len(polygon):
+            outlines.append(polygon)
+            axis.add_patch(Polygon(polygon, closed=True, facecolor=color, alpha=0.15, edgecolor="none", zorder=4,
+                                   label=f"{name}(theta_p)"))
+            for j, label in enumerate(labels.tolist()):
+                a, b = polygon[j], polygon[(j + 1) % len(polygon)]
+                guard = label >= 0 and bool(node.cell.guard_rows[label])
+                axis.plot([a[0], b[0]], [a[1], b[1]], color=color, linestyle="--" if guard else "-",
+                          linewidth=1.0 if guard else 2.0, zorder=5)
+        axis.scatter(node.pose.x, node.pose.y, marker="o", s=30, color=color, edgecolor="k", zorder=7)
+    draw_formation_pose(axis, portal, planner.slots, map_data, planner.robot_radius, None, ghost=True, zorder=3)
+    axis.scatter(portal.x, portal.y, marker="D", s=40, color="tab:cyan", edgecolor="k", zorder=20, label="portal q_p")
+    axis.plot([], [], color="0.3", linewidth=2.0, label="active robot-obstacle plane")
+    axis.plot([], [], color="0.3", linewidth=1.0, linestyle="--", label="validity guard facet")
+    points = np.vstack(outlines + [transform_slots(portal, planner.slots)])
+    low, high = points.min(axis=0) - 0.3, points.max(axis=0) + 0.3
+    axis.set_xlim(low[0], high[0])
+    axis.set_ylim(low[1], high[1])
+    axis.legend(fontsize=7, loc="upper left", framealpha=0.85)
+    axis.set_title(f"tightest portal (edge {k + 1}/{len(edges)}): theta_p = {portal.yaw:.3f} rad, "
+                   f"slack = {certificate.slack:.3f} m", fontsize=10)
+
+
+def draw_frontier(figure, result: TubeRRTResult, map_data, planner: PolyhedralFrontierPlanner) -> None:
+    grid = figure.add_gridspec(2, 2, width_ratios=(1.7, 1))
+    axis = figure.add_subplot(grid[:, 0])
+    draw_map(axis, map_data)
+    polygons = [p for p in (poly_slice(node.cell, 0.0) for node in result.tree_nodes) if p is not None]
+    axis.add_collection(PolyCollection(polygons, facecolors="tab:cyan", edgecolors="0.45", linewidths=0.3, alpha=0.1,
+                                       zorder=3))
+    snapshot = planner.frontier_snapshot()
+    if len(snapshot["points"]):
+        order = np.argsort(snapshot["score"])
+        points, score = snapshot["points"][order], snapshot["score"][order]
+        scatter = axis.scatter(points[:, 0], points[:, 1], c=score, cmap="magma", s=5, zorder=5, linewidth=0)
+        figure.colorbar(scatter, ax=axis, fraction=0.03, pad=0.01).set_label("frontier score S")
+    draw_path(axis, result.path_poses, nodes=False)
+    axis.set_title(f"certified union: {len(polygons)} cells (node-yaw sections), "
+                   f"{len(snapshot['points'])} exposed frontier candidates", fontsize=10)
+
+    log = planner.expansion_log
+    ratio_axis = figure.add_subplot(grid[0, 1])
+    if log:
+        bins = np.linspace(0.0, 1.0, 21)
+        ratio_axis.hist([e["new_ratio"] for e in log], bins=bins, alpha=0.6, color="tab:green", label="rho_new")
+        ratio_axis.hist([e["overlap_ratio"] for e in log], bins=bins, alpha=0.6, color="tab:purple",
+                        label="rho_overlap (with parent)")
+        low, high = planner.frontier_config.overlap_band
+        ratio_axis.axvspan(low, high, color="tab:purple", alpha=0.08, label="preferred overlap band")
+        ratio_axis.axvline(planner.frontier_config.min_new_ratio, color="tab:green", linestyle=":",
+                           label="min rho_new")
+    ratio_axis.set_xlabel("ratio")
+    ratio_axis.set_ylabel("accepted cells")
+    ratio_axis.legend(fontsize=8)
+    ratio_axis.grid(True, color="0.9")
+    ratio_axis.set_title("new coverage and parent overlap of inserted cells", fontsize=10)
+
+    mode_axis = figure.add_subplot(grid[1, 1])
+    stats = result.overlap_stats
+    for mode, color in (("frontier", "tab:blue"), ("uniform", "tab:orange")):
+        iterations = [e["iteration"] for e in log if e["mode"] == mode]
+        mode_axis.step(iterations, np.arange(1, len(iterations) + 1), where="post", color=color,
+                       label=f"{mode}: {len(iterations)} nodes / {stats.get(f'{mode}_iterations', 0)} iterations")
+    if result.first_goal_iteration is not None:
+        mode_axis.axvline(result.first_goal_iteration, color="0.4", linestyle=":", linewidth=1.0, label="first goal")
+    mode_axis.set_xlabel("iteration")
+    mode_axis.set_ylabel("accepted nodes (cumulative)")
+    mode_axis.legend(fontsize=8, loc="upper left")
+    mode_axis.grid(True, color="0.9")
+    mode_axis.set_title("sampling source of accepted nodes", fontsize=10)
 
 
 def dense_path(poses: list[Pose2D], per_edge: int = 12) -> list[Pose2D]:
@@ -801,7 +974,8 @@ def draw_yaw_profile(axis, result: TubeRRTResult) -> None:
 
 def search_counters(result: TubeRRTResult) -> dict[str, np.ndarray]:
     iterations = np.arange(1, result.iterations + 1)
-    counts = {key: np.zeros(result.iterations, dtype=int) for key in ("added", "collision", "no_overlap", "rewires")}
+    counts = {key: np.zeros(result.iterations, dtype=int)
+              for key in ("added", "collision", "no_overlap", "redundant", "rewires")}
     for event in result.trace:
         if event.status == "goal":
             continue
@@ -833,7 +1007,10 @@ def draw_convergence(figure, result: TubeRRTResult, length_label: str = "d_G") -
 
     counters = search_counters(result)
     for key, color, label in (("added", "tab:green", "accepted nodes"), ("collision", "#e41a1c", "rejected: collision"),
-                              ("no_overlap", "#ff7f00", "rejected: no tube overlap"), ("rewires", "0.4", "rewires")):
+                              ("no_overlap", "#ff7f00", "rejected: no tube overlap"),
+                              ("redundant", "tab:purple", "rejected: redundant cell"), ("rewires", "0.4", "rewires")):
+        if key == "redundant" and not counters[key][-1:].any():
+            continue
         count_axis.plot(counters["iteration"], counters[key], color=color, linewidth=1.5, label=label)
     if result.first_goal_iteration is not None:
         count_axis.axvline(result.first_goal_iteration, color="0.4", linestyle=":", linewidth=1.0)
@@ -860,7 +1037,8 @@ def metric_label(planner) -> str:
 
 def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -> dict[str, plt.Figure]:
     goal_connect = planner.config.goal_connect_distance
-    chart = isinstance(planner, ChartCellTubeRRTPlanner)
+    poly = isinstance(planner, PolyhedralFrontierPlanner)
+    chart = isinstance(planner, ChartCellTubeRRTPlanner) or poly
     if chart:
         rho_norm = Normalize(0.0, max([cell.radius for cell in path_cells(result)] + result.path_radii or [1.0]))
     else:
@@ -874,7 +1052,10 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -
     draw_tree(axis, result, map_data, goal_connect, slots)
     axis.set_title("1. search tree (color = insertion order)", fontsize=11)
     axis = overview.add_subplot(grid[0, 1])
-    if chart:
+    if poly:
+        draw_poly_tube_xy(axis, result, map_data, rho_norm)
+        axis.set_title("2. path polyhedral cells (node-yaw sections) and portals", fontsize=11)
+    elif chart:
         draw_chart_tube_xy(axis, result, map_data, rho_norm)
         axis.set_title("2. path cells (node-yaw slices) and portals", fontsize=11)
     else:
@@ -905,14 +1086,27 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -
 
     growth = plt.figure(figsize=(16, 8.6))
     draw_growth(growth, result, map_data, goal_connect)
-    growth.suptitle((f"tree growth ({planner.cells.name} cells): " if chart else "tree growth: ") +
-                    "sample -> nearest -> steer -> safe cell -> portal certificate -> choose parent / rewire", fontsize=12)
+    if poly:
+        growth.suptitle("tree growth (polyhedral cells): frontier candidate (i, u, dtheta) or uniform sample -> seeds -> "
+                        "cell -> J_expand -> portal certificate -> choose parent / rewire", fontsize=12)
+    else:
+        growth.suptitle((f"tree growth ({planner.cells.name} cells): " if chart else "tree growth: ") +
+                        "sample -> nearest -> steer -> safe cell -> portal certificate -> choose parent / rewire",
+                        fontsize=12)
     figures["growth"] = growth
 
     tube = plt.figure(figsize=(16, 10))
     grid = tube.add_gridspec(2, 2, height_ratios=(1.5, 1), width_ratios=(1.1, 1))
     axis = tube.add_subplot(grid[0, 0])
-    if chart:
+    if poly:
+        draw_poly_tube_xy(axis, result, map_data, rho_norm)
+        axis.legend(fontsize=8, loc="upper left")
+        draw_poly_tube_3d(tube.add_subplot(grid[0, 1], projection="3d"), result)
+        draw_route_clearance(tube.add_subplot(grid[1, 0]), result, planner, rho_norm)
+        draw_poly_portal_slice(tube.add_subplot(grid[1, 1]), result, map_data, planner)
+        tube.suptitle(f"joint tube C_0 -> ... -> C_M  (polyhedral cells, rho = {planner.formation_radius:.3f} m, "
+                      f"d_s = {planner.cells.safety_distance:g} m)", fontsize=12)
+    elif chart:
         draw_chart_tube_xy(axis, result, map_data, rho_norm)
         axis.legend(fontsize=8, loc="upper left")
         draw_chart_tube_3d(tube.add_subplot(grid[0, 1], projection="3d"), result, planner)
@@ -952,6 +1146,13 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -
     convergence.suptitle(summary, fontsize=11)
     figures["convergence"] = convergence
 
+    if poly:
+        frontier = plt.figure(figsize=(17, 8.5))
+        draw_frontier(frontier, result, map_data, planner)
+        frontier.suptitle("region-guided search: certified union, exposed frontier and expansion statistics",
+                          fontsize=12)
+        figures["frontier"] = frontier
+
     for name, figure in figures.items():
         if name in ("growth", "frames"):
             figure.tight_layout(rect=(0, 0.05, 1, 0.96), h_pad=2.0)
@@ -981,6 +1182,8 @@ def variant_name(args) -> str:
         parts.append(f"wm{number_tag(args.margin_weight)}")
     if args.no_step_backoff:
         parts.append("fixedstep")
+    if args.cell == "polyhedral" and args.uniform_prob != FrontierConfig.uniform_probability:
+        parts.append(f"u{number_tag(args.uniform_prob)}")
     return "_".join(parts)
 
 
@@ -990,6 +1193,7 @@ def result_stats(result: TubeRRTResult, map_data, slots: np.ndarray) -> dict[str
         "goal_nodes": sum(e.status == "goal" for e in result.trace),
         "rejected_collision": sum(e.status == "collision" for e in result.trace),
         "rejected_no_overlap": sum(e.status == "no_overlap" for e in result.trace),
+        "rejected_redundant": sum(e.status == "redundant" for e in result.trace),
         "rewires": sum(len(e.rewires) for e in result.trace),
         "backoff_nodes": sum(e.status == "added" and e.attempts > 1 for e in result.trace),
         "straddle_tree_nodes": sum(bool(straddled_obstacles(n.pose, slots, map_data)) for n in result.tree_nodes),
@@ -1025,7 +1229,26 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
     first = summary["first_goal_iteration"]
     cell_model = config.get("cell_model", "orientation")
     chart = cell_model != "orientation"
+    poly = cell_model == "polyhedral"
     overlap = summary.get("overlap_stats") or {}
+    if poly:
+        overlap_rows = [
+            f"| overlap 判定：总数 / 快速拒绝 / 快速接受 / LP（接受） | {overlap['overlap_calls']} / "
+            f"{overlap['quick_reject']} / {overlap['quick_accept']} / {overlap['lp_calls']}（{overlap['lp_accept']}） |",
+            f"| 被拒绝：冗余 cell（rho_new 过小） | {stats['rejected_redundant']} |",
+            f"| 采样来源 frontier / uniform：迭代数 | {overlap['frontier_iterations']} / {overlap['uniform_iterations']} |",
+            f"| 采样来源 frontier / uniform：接受节点数 | {overlap['frontier_nodes']} / {overlap['uniform_nodes']} |",
+            f"| frontier 候选：生成 / 被覆盖 / 多次失败丢弃 / 结束时仍 exposed | {overlap['frontier_candidates']} / "
+            f"{overlap['frontier_covered']} / {overlap['frontier_dropped']} / {overlap['frontier_alive']} |",
+            f"| 构造 cell 数 / 平均 active pair 数 | {overlap['cells_built']} / "
+            f"{overlap['active_pairs'] / max(overlap['cells_built'], 1):.2f} |",
+        ]
+    elif chart:
+        overlap_rows = [f"| overlap 判定：总数 / 快速拒绝 / 快速接受 / SOCP（接受） | {overlap['overlap_calls']} / "
+                        f"{overlap['quick_reject']} / {overlap['quick_accept']} / {overlap['socp_calls']}"
+                        f"（{overlap['socp_accept']}） |"]
+    else:
+        overlap_rows = []
     lines = [
         f"# Tube-RRT 运行记录：{summary['map']} / seed {summary['seed']} / {summary['variant']}",
         "",
@@ -1053,12 +1276,10 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         f"| 障碍夹在机器人之间的节点：树 / 路径 | {stats['straddle_tree_nodes']} / "
         f"{stats['straddle_path_nodes']}（路径共 {summary['path_nodes']} 个节点） |",
         f"| 路径代价（含 J_margin）：首次 → 最终 | {summary['first_goal_cost']} → {summary['path_cost']} |",
-        f"| 路径 {'||.||_F' if chart else 'd_G'} 长度 | {summary['path_length']} |",
+        f"| 路径 {'||.||_F' if chart and not poly else 'd_G'} 长度 | {summary['path_length']} |",
         (f"| 认证路线上稠密采样的最小 guarded clearance（<0 表示碰撞） | {summary['bottleneck']:.3f} |" if chart else
          f"| tube minimum local guarded clearance | {summary['bottleneck']:.3f} |"),
-        *([f"| overlap 判定：总数 / 快速拒绝 / 快速接受 / SOCP（接受） | {overlap['overlap_calls']} / "
-           f"{overlap['quick_reject']} / {overlap['quick_accept']} / {overlap['socp_calls']}（{overlap['socp_accept']}） |"]
-          if chart else []),
+        *overlap_rows,
         "",
         "## 配置",
         "",
@@ -1077,6 +1298,7 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         f"（= 最宽相邻间距/2 − 机器人半径 − 安全余量；小于它的障碍 {summary['passable_obstacles']}"
         f"/{summary['obstacle_count']} 个） |",
         *[f"| {key} | {value} |" for key, value in config.items()],
+        *[f"| frontier.{key} | {value} |" for key, value in (summary.get("frontier_config") or {}).items()],
         "",
         "## 耗时",
         "",
@@ -1088,8 +1310,10 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         "",
     ]
     for name, (filename, description) in FIGURE_FILES.items():
+        if name == "frontier" and not poly:
+            continue
         if chart and name == "tube":
-            description = CHART_TUBE_DESCRIPTION
+            description = POLY_TUBE_DESCRIPTION if poly else CHART_TUBE_DESCRIPTION
         lines += [f"### {filename}", "", description, "", f"![{name}]({filename})", ""]
     lines += [
         "## 其他文件",
@@ -1119,6 +1343,7 @@ def write_index(out_dir: Path) -> Path:
         "目录结构：`results/tube_rrt/<地图>_seed<seed>/<变体>/`，变体名依次由以下部分组成：编队名；`x<k>`（槽位整体放大 k 倍，"
         "k=1 时省略）；`first_goal`（首次连到目标即停止）或 `anytime_it<N>`（跑满 N 次迭代，保留代价最小的目标节点）；"
         "`wm<w>`（J_margin 权重）；`fixedstep`（关闭步长回退）。编队名后的 `cell1` / `cell2` 表示一阶 / 二阶 chart cell，"
+        "`cellP` 表示 polyhedral cell + exposed-frontier 区域引导搜索（`u<p>` 为非默认的 uniform 采样概率），"
         "没有该标记的是原来的 orientation-sliced cell。每个运行目录下的 `run.md` 是可直接阅读的运行报告。",
         "",
         "“夹障碍节点”指障碍中心落在机器人凸包内的路径节点数，用来判断规划是否利用了“障碍从机器人之间穿过”。",
@@ -1177,7 +1402,23 @@ def main() -> None:
     parser.add_argument("--margin-weight", type=float, default=0.0,
                         help="J_margin weight w on certified route length")
     parser.add_argument("--cell", default="orientation", choices=sorted(CELL_TAGS),
-                        help="cell version: orientation (original yaw-sliced cell), first_order or second_order chart cell")
+                        help="cell version: orientation (original yaw-sliced cell), first_order or second_order chart "
+                             "cell, or polyhedral (proximity-query cells with exposed-frontier guided search)")
+    parser.add_argument("--uniform-prob", type=float, default=FrontierConfig.uniform_probability,
+                        help="polyhedral only: probability of an ordinary SE(2) sample instead of a frontier candidate")
+    parser.add_argument("--safety-distance", type=float, default=FrontierConfig.safety_distance,
+                        help="polyhedral only: d_s kept inside every cell on top of robot radius and safety margin")
+    parser.add_argument("--active-range", type=float, default=FrontierConfig.active_range,
+                        help="polyhedral only: robot-obstacle pairs with guarded clearance below this are active")
+    parser.add_argument("--score-weights", type=float, nargs=3, metavar=("ALPHA", "BETA", "GAMMA"),
+                        default=FrontierConfig.score_weights,
+                        help="polyhedral only: S = alpha l + beta U + gamma G")
+    parser.add_argument("--expand-weights", type=float, nargs=3, metavar=("W1", "W2", "W3"),
+                        default=FrontierConfig.expand_weights,
+                        help="polyhedral only: J = w1 rho_new + w2 phi(rho_overlap) + w3 dd_goal")
+    parser.add_argument("--overlap-band", type=float, nargs=2, metavar=("RHO_MIN", "RHO_MAX"),
+                        default=FrontierConfig.overlap_band,
+                        help="polyhedral only: preferred parent-overlap ratio band of phi")
     parser.add_argument("--yaw-slices", type=int, default=16,
                         help="equal yaw slices used to build each analytic safe cell")
     parser.add_argument("--cell-shrink", type=float, default=0.98,
@@ -1203,6 +1444,15 @@ def main() -> None:
         parser.error("--robot-radius must be positive and --safety-margin non-negative")
     if args.obstacle_count is not None and args.obstacle_count < 0:
         parser.error("--obstacle-count must be non-negative")
+    frontier_config = None
+    if args.cell == "polyhedral":
+        try:
+            frontier_config = FrontierConfig(uniform_probability=args.uniform_prob, safety_distance=args.safety_distance,
+                                             active_range=args.active_range, score_weights=tuple(args.score_weights),
+                                             expand_weights=tuple(args.expand_weights),
+                                             overlap_band=tuple(args.overlap_band))
+        except ValueError as error:
+            parser.error(str(error))
 
     tee = Tee(sys.stdout)
     sys.stdout = tee
@@ -1226,7 +1476,8 @@ def main() -> None:
                            record_trace=True, stop_on_first_goal=not args.anytime, margin_weight=args.margin_weight,
                            step_backoff=not args.no_step_backoff, yaw_slices=args.yaw_slices,
                            cell_eta=args.cell_shrink, cell_model=args.cell)
-    planner = make_tube_rrt_planner(map_data, slots, Pose2D(*map_data.start_xy, 0.0), config=config)
+    planner = make_tube_rrt_planner(map_data, slots, Pose2D(*map_data.start_xy, 0.0), config=config,
+                                    frontier_config=frontier_config)
     print("planning...", flush=True)
     planning_start = time.perf_counter()
     result = planner.plan()
@@ -1292,6 +1543,7 @@ def main() -> None:
         "stats": result_stats(result, map_data, slots),
         "overlap_stats": result.overlap_stats,
         "config": {key: value for key, value in asdict(config).items() if key not in ("record_trace",)},
+        **({"frontier_config": asdict(frontier_config)} if frontier_config is not None else {}),
         "timing": timing,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

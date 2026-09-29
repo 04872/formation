@@ -27,6 +27,8 @@ from formation.simulator import MultiRobotSimulator, trace_summary
 from formation.swept_band import SweptBand, SweptBandBuilder
 from formation.tube_cell_first_order import FirstOrderCellModel, PortalCertificate, TubeCell
 from formation.tube_cell_second_order import SecondOrderCellModel
+from formation.polyhedral_cell import PolyhedralCell, PolyhedralCellModel
+from formation.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
 from formation.tube_rrt_chart import CELL_MODELS, ChartCellTubeRRTPlanner, make_tube_rrt_planner
 from formation.tube_rrt import (
     EdgeCertificate,
@@ -131,6 +133,10 @@ __all__ = [
     "SecondOrderCellModel",
     "CELL_MODELS",
     "ChartCellTubeRRTPlanner",
+    "PolyhedralCell",
+    "PolyhedralCellModel",
+    "FrontierConfig",
+    "PolyhedralFrontierPlanner",
     "make_tube_rrt_planner",
     "TubeRRTNode",
     "TubeRRTPlanner",
