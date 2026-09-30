@@ -11,15 +11,17 @@
 - `formation/tube_rrt.py`：原实现（默认 `cell_model="orientation"`）。`TubeRRTConfig`、节点 / trace / 结果结构、`OrientationSafeCell`（yaw 切片 cell）、`EdgeCertificate`（公共 yaw witness + portal）、`TubeRRTPlanner`、`transform_slots`、`interpolate_pose`、`project_robot_paths`。相对 `HEAD` 只增加了 `cell_model` / `route_check_step` 配置、结果的 `path_nodes` / `overlap_stats` 字段和非 orientation 时的报错，搜索逻辑未改。
 - `formation/tube_cell_first_order.py`：一阶近似 cell。`TubeCell`（节点位姿、`d_obs`、半径）、`PortalCertificate`（portal、相对 slack、路线长度）、`interpolate_pose`，以及 `FirstOrderCellModel`：chart 范数 `||.||_F`、批量 nearest 距离、位似 overlap、固定 yaw 截面（绘图用）。
 - `formation/tube_cell_second_order.py`：二阶 cell。`SecondOrderCellModel` 继承一阶模型，加入 `beta_i phi^2` 项、射线内步长、必要条件快速拒绝、候选 portal 快速接受和 Clarabel SOCP overlap。
-- `formation/tube_rrt_chart.py`：`ChartCellTubeRRTPlanner`（一阶 / 二阶 cell 共用的 RRT*：逐机器人 guarded clearance、nearest、父节点选择、rewire、认证路线与稠密 clearance 检查）、`CELL_MODELS`，以及工厂函数 `make_tube_rrt_planner`：`cell_model="orientation"` 返回原 `TubeRRTPlanner`，`"polyhedral"` 返回 `PolyhedralFrontierPlanner`（可选参数 `frontier_config`），其余返回 `ChartCellTubeRRTPlanner`。
-- `formation/polyhedral_cell.py`：polyhedral cell。`PolyhedralCell`（seed 位姿、边界行 `normals / offsets` 与对应 `pairs`、guard 半径 `guard`、由约束决定的 yaw 半宽 `yaw_limit`、S_0 内切圆 `inradius / center_offset`、`broadphase_pairs`、Halton 内部样本与体积估计）和 `PolyhedralCellModel`：proximity query（4 面墙 + 圆障碍）、两级 active pair、建 cell、成员判定 / slack、`translational_extent`（ℓ_i(u, Δθ)）、`ray_extent`、`boundary_radii`（三维边界曲面）、`slice_polygon`（固定 yaw 截面及每条边所属约束，−1 = guard 弧）、overlap（快速拒绝 / 线段候选快速接受 / 方向部分 LP / 含 guard 锥的 SOCP）。`stats` 含 `pose_queries`、`pair_queries` 等查询计数。
+- `formation/tube_rrt_chart.py`：`ChartCellTubeRRTPlanner`（一阶 / 二阶 cell 共用的 RRT*：逐机器人 guarded clearance、nearest、父节点选择、rewire、认证路线与稠密 clearance 检查）、`CELL_MODELS`，以及工厂函数 `make_tube_rrt_planner`：`cell_model="orientation"` 返回原 `TubeRRTPlanner`，`"polyhedral"` 返回 `PolyhedralFrontierPlanner`（可选参数 `frontier_config`），`"polyhedral_tube"` 返回 `RegionTubeRRTPlanner`（可选参数 `tube_config`），其余返回 `ChartCellTubeRRTPlanner`。
+- `formation/polyhedral_cell.py`：polyhedral cell。`PolyhedralCell`（seed 位姿、边界行 `normals / offsets` 与对应 `pairs`、guard 半径 `guard`、由约束决定的 yaw 半宽 `yaw_limit`、S_0 内切圆 `inradius / center_offset`、`broadphase_pairs`、Halton 内部样本与体积估计）和 `PolyhedralCellModel`：proximity query（4 面墙 + 圆障碍）、两级 active pair、建 cell、成员判定 / slack、`translational_extent`（ℓ_i(u, Δθ)）、`ray_extent`、`boundary_radii`（三维边界曲面）、`slice_polygon`（固定 yaw 截面及每条边所属约束，−1 = guard 弧）、overlap（快速拒绝 / 线段候选快速接受 / 方向部分 LP / 含 guard 锥的 SOCP）、`line_interval` / `line_witness`（两 cell 在 seed 连线上的公共区间）、`exact_overlap`（跳过线段候选直接 LP / SOCP）。内切圆在 ≤ 6 行时按 active set 解析枚举（guard；1 行 + guard；2 行 + guard 解二次方程；3 行解 3×3），更多行才用 SOCP；稀疏矩阵用 `_csc` 直接由非零元构造（比 `sp.csc_matrix(dense)` 快约 40%）。`stats` 含 `pose_queries`、`pair_queries` 等查询计数。
 - `formation/tube_rrt_frontier.py`：`FrontierConfig`（含 p_region 调度 `region_schedule` = switch / constant / exp）与 `PolyhedralFrontierPlanner`（标准 RRT* 主体 + region 采样通道、每次迭代至多 1 个 cell、父节点选择 / rewire、认证路线、T_first / N_query 统计）。`frontier_snapshot()` 和 `expansion_log` 供绘图使用。
+- `formation/tube_rrt_region.py`：`RegionTubeConfig` 与 `RegionTubeRRTPlanner`（`cell_model="polyhedral_tube"`，继承 `PolyhedralFrontierPlanner` 的 cell 存储 / 邻居 / 路径工具，但不用 region 采样）：Tube-RRT* 流程 + region-gap nearest + line TubeSteer + witness overlap，见下文。`edge_kind`（每条树边的认证方式）和 `expansion_log` 供绘图使用。
 - `scripts/ablate_region_sampling.py`：p_region 消融（常数 0 / 0.2 / … / 1.0、switch、exp；三张地图 × 多个 planner seed，并行），输出 `results/region_ablation/{runs.csv,summary.csv,README.md,ablation.png,convergence.png}`。
-- `scripts/compare_region_schemes.py`：region 采样**方案**对比（uniform、v1 `f36dc0c` 多 seed 预建、v2 `bededcf` 统一外法向、v3 `ffe0d5b` 按边界来源、v4 facet 几何；各自默认设置与统一 p=0.85），每个方案在 `/tmp/formation_schemes/<commit>` 的 detached worktree 中运行，T_first / N_query 在规划器外统一测量；输出 `results/region_schemes/{runs.csv,summary.csv,README.md,comparison.png}`，`--plot-only` 只重画。`scripts/summarize_region_ablation.py`：单方案 p_region 消融的一页汇总图 `results/region_ablation/overview.png`。
+- `scripts/compare_region_schemes.py`：region 采样**方案**对比（uniform、v1 `f36dc0c` 多 seed 预建、v2 `bededcf` 统一外法向、v3 `ffe0d5b` 按边界来源、v4 facet 几何；各自默认设置与统一 p=0.85；以及 tube gap / point / no-exact / extend 四个 `polyhedral_tube` 变体，overrides 中 `__model` 指定规划器；`--schemes` 可只跑子集，低负载耗时表 `timing_low_load.csv` 会被写进 README），每个方案在 `/tmp/formation_schemes/<commit>` 的 detached worktree 中运行，T_first / N_query 在规划器外统一测量；输出 `results/region_schemes/{runs.csv,summary.csv,README.md,comparison.png}`，`--plot-only` 只重画。`scripts/summarize_region_ablation.py`：单方案 p_region 消融的一页汇总图 `results/region_ablation/overview.png`。
 - `formation/map_config.py`、`formation/map_builder.py`：地图配置与构造（`random_circles`、`post_fence`、`single_post` 等）。
 - `formation/__init__.py`：公开导出。
 - `scripts/visualize_tube_rrt.py`：CLI、规划、绘图、计时、报告和结果索引。
 - `tests/test_tube_rrt.py`：工厂分派（默认 orientation）、原 orientation 实现复现旧运行（random_circles seed 7、square×2、anytime：2143 节点、首次 236 次迭代、代价 12.406），以及 chart 范数定义、一阶位似 overlap、portal 同属两个 cell、一阶 / 二阶 cell 对真实机器人位移的界、二阶 overlap 与暴力采样一致、射线内步长、两种 cell 的确定性规划、二阶路线认证与无碰撞、rewire 后代价一致、非法 cell 名和起点碰撞。
+- `tests/test_region_tube.py`（10 个）：解析内切圆与 SOCP 一致（≥ SOCP − 1e-7）、向量化 ℓ_i / slack / ℓ_rand 与 `ray_extent` / `slack` 一致、region-gap nearest 与暴力计算一致、所有树边 portal 严格在两 cell 内且认证路线 clearance > 0、line witness 的路线长度等于 seed 距离、工厂分派与非法配置、三张地图首解、`exact_overlap=False` 时 LP / SOCP 调用为 0、point / extend 变体、anytime 代价单调且等于路径边长之和。
 - `tests/test_maps.py`：全部地图字段、随机圆确定性 / 边界、各类走廊和起终点验证。
 - `tests/test_polyhedral_frontier.py`（19 个；另检查 `frontier_pieces` 恰在截面边界（facet 行松弛为 0、guard 弧半径 = r_g）；live 扩展方向与 facet 法向 / guard 外法向夹角 < 90°、Δθ ∈ {0, ±s} 且使旋转裕度最大、q_new 在源 cell 外且裕度 > 0、live q_new 不被任何 cell 覆盖、每个 cell 的方向数有界；region 节点离开源 cell、旋转裕度 > 0、距源 cell 中心 ≤ r_g + outer_reach）：公共旋转半径 ρ、边界行来自 broadphase 且 guard 来自其余 pair、剪枝后的 cell 是全部 broadphase 行 cell 的子集且几乎相同、cell 内任意构型真实 clearance ≥ d_s（蒙特卡洛）、yaw 半宽 = min(π/2, R_in/ρ) 且超出后截面为空、ℓ 恰好落在边界、射线步长、三维边界曲面、截面多边形与成员判定一致、portal 严格在两 cell 内且与暴力采样一致（LP / SOCP 均被调用）、p_region 三种调度、每次迭代至多 1 个 cell（`cells_built = 1 + 迭代 − no_progress`）与认证路线、p_region = 0 / 1 两个极端、post_fence 可达、起点碰撞。
 
@@ -68,6 +70,17 @@ cell overlap：yaw 区间或 guard 圆不相交时快速拒绝；节点连线上
 - 目标：目标位姿（goal_xy, θ_new）落在 C_new 内即加 goal 节点（共享 C_new，不参与父节点选择 / rewire / nearest）。anytime 语义与 chart 版本相同。
 - `result.overlap_stats`：cell / 查询计数（`pose_queries` = 构造 cell 数 = N_query，`pair_queries` = robot-obstacle 距离对数）、overlap / LP / SOCP 计数、region / uniform 迭代数与接受节点数、frontier 统计、各类拒绝，以及 `first_goal_time_s`（T_first）、`first_goal_cost`（C_first）、`first_goal_pose_queries`、`plan_time_s`。
 
+**polyhedral Tube-RRT*（`cell_model="polyhedral_tube"`，`tube_rrt_region.py`）**：与上面相同的 polyhedral cell，但保留 Tube-RRT* 流程，不做 frontier 采样 / 方向枚举。
+
+1. `q_rand ~ U(SE(2))`（goal bias 0.12），做一次 proximity query 得 `C_rand`；碰撞则丢弃（`colliding="drop"`，默认；`"extend"` 以 ℓ_rand = 0 照样扩展）。
+2. **region-gap nearest**：`v_i = q_rand ⊖ q_i`，`D_i = ||v_i||_G`，`u_i = v_i/D_i`，`g_i = D_i − ℓ_i(u_i) − ℓ_rand(−u_i)`，`i* = argmin g_i`。ℓ 为解析射线长度 `min(r_g, L/|u_θ|, min_k e_k/(ρ|u_θ| − n_k^T u_c))`，全部节点向量化计算（`nearest="point"` 为 `argmin D_i`）。
+3. **line TubeSteer**：沿 `q_i* + s u`，`s = min(D, max_step)`（`max_step` = 1.0；`s = D` 时直接复用 `C_rand`）。两 cell 在直线上的区间 `[0, ℓ_i]` 与 `[s − ℓ_new(−u), s]` 的公共部分 `w ≥ min_witness`（0.05；seed 在父 cell 内时免检）即接受；否则重试（`ℓ_i + ℓ_prev(−u) − w_min`，最后一次放在 `steer_fraction · ℓ_i` 处，共 `steer_attempts` = 3 次）。
+4. **witness 证书**：公共区间中点 `q_w` 严格在两个凸 cell 内，路线 `q_i → q_w → q_new` 长度为 s，`r_portal = min(slack_i(q_w), slack_new(q_w))` 是边宽（`margin_weight > 0` 时代价乘 `1 + w/r_portal`）。父边不解 LP。
+5. **NearConnect / rewire**：候选为 guard 圆 / yaw 区间与 C_new 相交的至多 12 个节点；先向量化求所有候选的直线 witness，再试两个内切圆心连线上的 5 个点（`center` witness）；都没有时，只有乐观代价（`cost + D`）仍可能改进父节点 / rewire 时才调用 `exact_overlap`（`exact_overlap=False` 则跳过）。
+6. 目标：目标位姿落在 C_new 内（slack > 0）即加 goal 节点。`overlap_stats` 额外记录 `samples_colliding`、`nearest_differs`、`gap_negative`、`steer_first_try`、`steer_cells`、各类拒绝、`near_* / rewire_*`（witness / center_witness / exact_calls / exact_accept / skipped_bound）、`rewires`、`portal_radius_mean`。
+
+20 seed 对比（`results/region_schemes/`）：tube gap 首解迭代 104 / 64 / 74（random_circles / single_post / post_fence 中位数；v4 为 52 / 37 / 57），首解墙钟时间与 v4 相当；C_2500 为 11.98 / 11.54 / 11.50（v4 11.68 / 11.30 / 11.43，uniform 12.58 / 11.46 / 11.15）；LP 调用少 4–6 倍；低负载 2500 次迭代 0.88–1.10 s（v4 2.26–2.78 s，uniform 2.26–2.45 s，均含解析内切圆与 `_csc` 加速）。`exact_overlap=False` 再快 7–14%，代价差 ≤ 0.17；point nearest 首解更慢、random_circles 代价高 0.35；extend 首解最快（58 / 39 / 54）但 LP 约翻倍、耗时 1.3–2.0 s。约 30–40% 的 q_rand 碰撞被丢弃，是首解迭代数多于 v4 的主要原因。
+
 ## 可视化与计时
 
 `scripts/visualize_tube_rrt.py` 支持：
@@ -88,6 +101,7 @@ cell overlap：yaw 区间或 guard 圆不相交时快速拒绝；节点连线上
 - `--margin-weight W`：J_margin 权重，默认 0。
 - `--no-step-backoff`：关闭步长回退（旧的固定步长行为）。
 - `--cell polyhedral` 时另有：`--region-schedule {switch,constant,exp}`（默认 switch）、`--region-prob P`（constant，变体名加 `p<P>`）、`--region-before / --region-after`（switch，默认 0.5 / 0.2，非默认时加 `p<before>-<after>`）、`--region-max / --region-min / --region-decay`（exp，加 `pexp<max>-<min>-k<k>`）、`--safety-distance D_S`（0.02）、`--active-range R`（1.0）、`--score-weights A B G`（1 1 1）、`--guard-weights W_T W_G W_N`（0.3 0.5 1）、`--obstacle-weights W_T W_G W_N`（1 0.3 0.2）、`--yaw-step S`（0.15）、`--sample-offset DELTA`（0.1）。变体名标记为 `cellP`；多出 `7_frontier.png`（全部 cell 的节点 yaw 截面构成的 union；已采用的 region 扩展 `b → q_new`（蓝 = guard 弧沿外法向，橙 = obstacle facet 沿切向）、仍 live 的扩展（点线）及其 Δθ 符号（▲ / ● / ▼）；ρ_new / ρ_overlap 直方图、region / uniform 接受节点累计数与 p_region 调度曲线）和 `8_tube_3d.png`（路径 cell 在 (x, y, θ) 中的三维实体，两个视角，底面为障碍投影）；`3_tube.png` 右上也画三维实体（`boundary_radii` 给出的半透明边界曲面，yaw chart 截断处加平顶），右下为最紧 portal 处的截面（实线边 = active 障碍平面，虚线边 = guard 弧）；`run.md` 额外列出 T_first / C_first / N_query、LP / SOCP、拒绝、采样通道和 frontier 统计以及 `frontier.*` 配置。
+- `--cell polyhedral_tube` 时另有：`--nearest {gap,point}`、`--max-step S`（1.0）、`--min-witness W`（0.05）、`--no-exact-overlap`、`--colliding {drop,extend}`，以及共用的 `--safety-distance` / `--active-range`。变体名标记为 `cellT`（非默认设置加 `nearestpoint` / `step<S>` / `w<W>` / `noexact` / `extend`）；多出 `7_region_tube.png`（全部 cell 的节点 yaw 截面与最终树边，边颜色 = 认证方式：TubeSteer 直线区间 / 直线 witness / 内切圆心 witness / 精确 LP-SOCP；NearConnect 与 rewire 的各类判定次数；TubeSteer 步长与 r_portal 直方图）和 `8_tube_3d.png`；`run.md` 列出 q_rand 碰撞、nearest、TubeSteer、NearConnect / rewire 统计与 `tube.*` 配置。
 - `--progress-interval INT`，非负，默认 500；传 0 关闭搜索进度输出。
 - `--show`：保存后再交互式显示全部图。
 
@@ -164,15 +178,15 @@ orientation 的 clearance 是展开路线上的局部 guarded clearance，一阶
 
 ## 验证命令与最近记录
 
-最近验证记录：focused 39 tests（`test_polyhedral_frontier` 19 + `test_tube_rrt` 12 + `test_maps` 8），完整 86 tests；这些是最近一次验证记录，不是永久保证。
+最近验证记录：focused 49 tests（`test_polyhedral_frontier` 19 + `test_region_tube` 10 + `test_tube_rrt` 12 + `test_maps` 8），完整 96 tests；这些是最近一次验证记录，不是永久保证。
 
 项目使用的 Conda 环境是 `../env-rebuilt`（即 `/home/eai/projects/env-rebuilt`，可用 `conda activate /home/eai/projects/env-rebuilt` 激活）。
 
 ```bash
-../env-rebuilt/bin/python -m unittest tests.test_polyhedral_frontier tests.test_tube_rrt tests.test_maps
+../env-rebuilt/bin/python -m unittest tests.test_polyhedral_frontier tests.test_region_tube tests.test_tube_rrt tests.test_maps
 ../env-rebuilt/bin/python -m unittest discover -s tests
 for map in random_circles single_post post_fence; do
-  for cell in orientation first_order second_order polyhedral; do
+  for cell in orientation first_order second_order polyhedral polyhedral_tube; do
     MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map $map --slot-scale 2 --anytime --cell $cell
   done
 done

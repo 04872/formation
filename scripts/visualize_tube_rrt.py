@@ -42,6 +42,8 @@ from formation import (
     PolyhedralCell,
     PolyhedralCellModel,
     PolyhedralFrontierPlanner,
+    RegionTubeConfig,
+    RegionTubeRRTPlanner,
     TubeRRTPlanner,
     TubeRRTResult,
     make_tube_rrt_planner,
@@ -60,7 +62,7 @@ ROBOT_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2"
 MAP_NAMES = ("post_fence", "random_circles", "single_post")
 TURTLEBOT3_BURGER_RADIUS = 0.113  # circumscribed circle of the 138 mm x 178 mm TurtleBot3 Burger footprint
 DEFAULT_SAFETY_MARGIN = 0.06
-CELL_TAGS = {"orientation": None, "first_order": "cell1", "second_order": "cell2", "polyhedral": "cellP"}
+CELL_TAGS = {"orientation": None, "first_order": "cell1", "second_order": "cell2", "polyhedral": "cellP", "polyhedral_tube": "cellT"}
 CELL_DESCRIPTIONS = {
     "polyhedral": "polyhedral cell + region/uniform 混合 RRT*：两级 active pair（broadphase d < d_active，再只留真正"
                   "边界行、近平行只留更紧者）的支撑平面 n^T dc - rho|dtheta| >= -(d - d_s)，validity guard "
@@ -68,6 +70,11 @@ CELL_DESCRIPTIONS = {
                   "从 S_0 的 frontier 几何直接生成的常数个扩展中按 S = alpha l + beta U + gamma G 选一个（guard 弧沿外法向，"
                   "obstacle facet 沿两个切向、不沿违反约束的法向；dtheta 取 {-s, 0, +s} 中障碍裕度最大者），"
                   "q_new 在跨出当前 cell 一小段处，否则 uniform SE(2) 采样；每次迭代只构造 1 个 cell",
+    "polyhedral_tube": "polyhedral cell + Tube-RRT*：q_rand ~ SE(2) 无碰撞则建 C_rand；region-gap nearest "
+                       "argmin D_i - l_i(u_i) - l_rand(-u_i)（l 为 cell 沿随机方向的解析径向长度）；沿 q_i + s u_i 做 "
+                       "line TubeSteer，新 cell 与父 cell 在该直线上的公共区间 >= w_min 即为 overlap witness（中点为 "
+                       "portal，两 cell 的 slack 最小值为 r_portal）；NearConnect / rewire 先用直线 witness、再用两 cell "
+                       "内切圆心连线上的点，都没有且乐观代价 cost + D 仍可能改进时才解 LP / SOCP",
     "orientation": "orientation-sliced cell：按 yaw 切片的 guarded clearance 下包络，公共 yaw witness + portal 认证（原实现）",
     "first_order": "一阶近似 cell：max_i ||u + J a_i phi|| < rho_k，rho_k = eta d_obs；overlap 用同 chart 位似判据的推广 "
                    "rho_a/n_a + rho_b/n_b > 1（portal 在两节点连线上）",
@@ -94,6 +101,10 @@ FIGURE_FILES = {
                                    "扩展 b -> q_new（蓝 = guard 弧沿外法向，橙 = obstacle facet 沿切向），点线 = 仍 live 的扩展，"
                                    "空心标记 = live q_new 的 yaw 变化（▲ +，● 0，▼ −）；新 cell 的 rho_new / rho_overlap 分布；"
                                    "region 与 uniform 两个采样通道的累计接受节点数及 p_region 调度（虚线）"),
+    "regiontube": ("7_region_tube.png", "（仅 polyhedral_tube）全部 cell 的节点 yaw 截面与最终树边，边颜色 = 该边的认证方式"
+                                        "（TubeSteer 直线区间 / NearConnect-rewire 的直线 witness / 内切圆心连线 witness / "
+                                        "精确 LP-SOCP）；NearConnect 与 rewire 各类判定次数（含被乐观代价跳过的）；"
+                                        "TubeSteer 步长 s 与 r_portal 分布"),
     "tube3d": ("8_tube_3d.png", "（仅 polyhedral）路径 cell 在 (x, y, theta) 中的三维实体，两个视角：每个 cell 是 S_0 被 "
                                 "rho|dtheta| 腐蚀后堆起来的双锥体（yaw chart 截断时有平顶），底面为障碍投影，红线为认证路线"),
 }
@@ -876,6 +887,61 @@ def draw_frontier(figure, result: TubeRRTResult, map_data, planner: PolyhedralFr
     mode_axis.set_title("sampling source of accepted nodes", fontsize=10)
 
 
+EDGE_KIND_STYLE = (("steer", "tab:blue", "TubeSteer line interval"), ("line", "tab:green", "line witness"),
+                   ("center", "tab:orange", "in-centre witness"), ("exact", "tab:red", "exact LP / SOCP"))
+
+
+def draw_region_tube(figure, result: TubeRRTResult, map_data, planner: RegionTubeRRTPlanner) -> None:
+    grid = figure.add_gridspec(2, 2, width_ratios=(1.7, 1))
+    axis = figure.add_subplot(grid[:, 0])
+    draw_map(axis, map_data)
+    nodes = result.tree_nodes
+    polygons = [p for p in (poly_slice(node.cell, 0.0) for node in nodes) if p is not None]
+    axis.add_collection(PolyCollection(polygons, facecolors="tab:cyan", edgecolors="none", alpha=0.025, zorder=3))
+    for kind, color, name in EDGE_KIND_STYLE:
+        segments = [((nodes[n.parent].pose.x, nodes[n.parent].pose.y), (n.certificate.portal.x, n.certificate.portal.y),
+                     (n.pose.x, n.pose.y)) for i, n in enumerate(nodes)
+                    if n.parent is not None and planner.edge_kind.get(i) == kind]
+        if segments:
+            axis.add_collection(LineCollection(segments, colors=color, linewidths=0.7 if kind == "steer" else 1.1,
+                                               alpha=0.75, zorder=5, label=f"{name} ({len(segments)} edges)"))
+    draw_path(axis, result.path_poses, nodes=False)
+    axis.legend(fontsize=8, loc="upper left", framealpha=0.85)
+    axis.set_title(f"{len(polygons)} cells (node-yaw sections); final tree edges by certificate", fontsize=10)
+
+    stats = result.overlap_stats
+    count_axis = figure.add_subplot(grid[0, 1])
+    labels = ("line witness", "in-centre witness", "exact accepted", "exact rejected", "skipped (optimistic cost)")
+    for offset, (kind, color) in enumerate((("near", "tab:purple"), ("rewire", "tab:olive"))):
+        values = (stats[f"{kind}_witness"], stats[f"{kind}_center_witness"], stats[f"{kind}_exact_accept"],
+                  stats[f"{kind}_exact_calls"] - stats[f"{kind}_exact_accept"], stats[f"{kind}_skipped_bound"])
+        count_axis.barh(np.arange(len(labels)) + 0.2 * (1 - 2 * offset), values, height=0.38, color=color,
+                        label="NearConnect" if kind == "near" else "rewire")
+    count_axis.set_yticks(np.arange(len(labels)), labels, fontsize=8)
+    count_axis.set_xscale("log")
+    count_axis.invert_yaxis()
+    count_axis.legend(fontsize=8)
+    count_axis.grid(True, axis="x", color="0.9")
+    count_axis.set_title(f"pair decisions: LP {stats['lp_calls']}, SOCP {stats['socp_calls']} calls in total", fontsize=10)
+
+    hist_axis = figure.add_subplot(grid[1, 1])
+    log = planner.expansion_log
+    if log:
+        steps = [e["step"] for e in log if e["parent_kind"] == "steer"]
+        radii = [e["portal_radius"] for e in log]
+        top = max(max(steps, default=0.0), max(radii, default=0.0), 1e-3)
+        bins = np.linspace(0.0, top, 30)
+        hist_axis.hist(steps, bins=bins, alpha=0.6, color="tab:blue", label="TubeSteer step s (parent kept)")
+        hist_axis.hist(radii, bins=bins, alpha=0.6, color="tab:orange", label="r_portal of the inserted edge")
+        hist_axis.axvline(planner.tube_config.max_step, color="tab:blue", linestyle=":", label="max_step")
+    hist_axis.set_xlabel("d_G [m]")
+    hist_axis.set_ylabel("inserted nodes")
+    hist_axis.legend(fontsize=8)
+    hist_axis.grid(True, color="0.9")
+    hist_axis.set_title(f"TubeSteer steps and edge widths (gap nearest != point nearest: {stats['nearest_differs']}x)",
+                        fontsize=10)
+
+
 def dense_path(poses: list[Pose2D], per_edge: int = 12) -> list[Pose2D]:
     if len(poses) < 2:
         return list(poses)
@@ -1115,6 +1181,7 @@ def metric_label(planner) -> str:
 def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -> dict[str, plt.Figure]:
     goal_connect = planner.config.goal_connect_distance
     poly = isinstance(planner, PolyhedralFrontierPlanner)
+    region_tube = isinstance(planner, RegionTubeRRTPlanner)
     chart = isinstance(planner, ChartCellTubeRRTPlanner) or poly
     if chart:
         rho_norm = Normalize(0.0, max([cell.radius for cell in path_cells(result)] + result.path_radii or [1.0]))
@@ -1163,7 +1230,10 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -
 
     growth = plt.figure(figsize=(16, 8.6))
     draw_growth(growth, result, map_data, goal_connect)
-    if poly:
+    if region_tube:
+        growth.suptitle("tree growth (polyhedral cells, Tube-RRT*): q_rand -> C_rand -> region-gap nearest -> line "
+                        "TubeSteer -> witness NearConnect -> lazy exact overlap -> rewire", fontsize=12)
+    elif poly:
         growth.suptitle("tree growth (polyhedral cells): p_region ? frontier sample : uniform sample -> steer -> "
                         "one cell -> coverage / portal certificate -> choose parent / rewire", fontsize=12)
     else:
@@ -1223,12 +1293,19 @@ def build_figures(result: TubeRRTResult, map_data, slots: np.ndarray, planner) -
     convergence.suptitle(summary, fontsize=11)
     figures["convergence"] = convergence
 
-    if poly:
+    if region_tube:
+        region = plt.figure(figsize=(17, 8.5))
+        draw_region_tube(region, result, map_data, planner)
+        region.suptitle("Tube-RRT* over polyhedral cells: certified union, edge certificates and pair decisions",
+                        fontsize=12)
+        figures["regiontube"] = region
+    elif poly:
         frontier = plt.figure(figsize=(17, 8.5))
         draw_frontier(frontier, result, map_data, planner)
         frontier.suptitle("region-guided search: certified union, exposed frontier and expansion statistics",
                           fontsize=12)
         figures["frontier"] = frontier
+    if poly:
         solids = plt.figure(figsize=(18, 8.5))
         draw_poly_tube_solids(solids, result, map_data)
         solids.suptitle("joint tube in (x, y, theta): path cells as solid regions "
@@ -1273,6 +1350,18 @@ def variant_name(args) -> str:
             parts.append(f"pexp{number_tag(args.region_max)}-{number_tag(args.region_min)}-k{number_tag(args.region_decay)}")
         elif (args.region_before, args.region_after) != (default.region_before, default.region_after):
             parts.append(f"p{number_tag(args.region_before)}-{number_tag(args.region_after)}")
+    if args.cell == "polyhedral_tube":
+        default = RegionTubeConfig()
+        if args.nearest != default.nearest:
+            parts.append(f"nearest{args.nearest}")
+        if args.max_step != default.max_step:
+            parts.append(f"step{number_tag(args.max_step)}")
+        if args.min_witness != default.min_witness:
+            parts.append(f"w{number_tag(args.min_witness)}")
+        if args.no_exact_overlap:
+            parts.append("noexact")
+        if args.colliding != default.colliding:
+            parts.append(args.colliding)
     return "_".join(parts)
 
 
@@ -1318,9 +1407,32 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
     first = summary["first_goal_iteration"]
     cell_model = config.get("cell_model", "orientation")
     chart = cell_model != "orientation"
-    poly = cell_model == "polyhedral"
+    poly = cell_model in ("polyhedral", "polyhedral_tube")
     overlap = summary.get("overlap_stats") or {}
-    if poly:
+    if cell_model == "polyhedral_tube":
+        overlap_rows = [
+            f"| T_first / C_first / 首解前 N_query | {overlap['first_goal_time_s']:.3f} s / "
+            f"{overlap['first_goal_cost']:.3f} / {overlap['first_goal_pose_queries']} |",
+            f"| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | "
+            f"{overlap['plan_time_s']:.2f} s / {overlap['pose_queries']} / {overlap['pair_queries']} |",
+            f"| q_rand 碰撞 / region-gap nearest 选中节点与点最近不同 / 选中节点 gap ≤ 0 | "
+            f"{overlap['samples_colliding']} / {overlap['nearest_differs']} / {overlap['gap_negative']} |",
+            f"| TubeSteer：插入节点 / 首次即成功（直接用 C_rand） / 额外建 cell / 失败（无进展 / 碰撞 / 无公共区间） | "
+            f"{overlap['tube_nodes']} / {overlap['steer_first_try']} / {overlap['steer_cells']} / "
+            f"{overlap['rejected_no_progress']} / {overlap['rejected_collision']} / {overlap['rejected_no_overlap']} |",
+            f"| NearConnect：直线 witness / 内切圆心 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 改进父节点 | "
+            f"{overlap['near_witness']} / {overlap['near_center_witness']} / {overlap['near_exact_calls']}"
+            f"（{overlap['near_exact_accept']}） / {overlap['near_skipped_bound']} / {overlap['near_improved']} |",
+            f"| rewire：直线 witness / 内切圆心 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 实际 rewire | "
+            f"{overlap['rewire_witness']} / {overlap['rewire_center_witness']} / {overlap['rewire_exact_calls']}"
+            f"（{overlap['rewire_exact_accept']}） / {overlap['rewire_skipped_bound']} / {overlap['rewires']} |",
+            f"| LP / SOCP 调用总数 | {overlap['lp_calls']} / {overlap['socp_calls']} |",
+            f"| 插入边的平均 r_portal | {overlap['portal_radius_mean']:.3f} m |",
+            f"| 每个 cell 平均：broadphase pair / 边界 active row | "
+            f"{overlap['broadphase_pairs'] / max(overlap['cells_built'], 1):.2f} / "
+            f"{overlap['active_pairs'] / max(overlap['cells_built'], 1):.2f} |",
+        ]
+    elif poly:
         overlap_rows = [
             f"| T_first / C_first / 首解前 N_query | {overlap['first_goal_time_s']:.3f} s / "
             f"{overlap['first_goal_cost']:.3f} / {overlap['first_goal_pose_queries']} |",
@@ -1403,6 +1515,7 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         f"/{summary['obstacle_count']} 个） |",
         *[f"| {key} | {value} |" for key, value in config.items()],
         *[f"| frontier.{key} | {value} |" for key, value in (summary.get("frontier_config") or {}).items()],
+        *[f"| tube.{key} | {value} |" for key, value in (summary.get("tube_config") or {}).items()],
         "",
         "## 耗时",
         "",
@@ -1414,7 +1527,8 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         "",
     ]
     for name, (filename, description) in FIGURE_FILES.items():
-        if name in ("frontier", "tube3d") and not poly:
+        if (name == "tube3d" and not poly) or (name == "frontier" and cell_model != "polyhedral") or (
+                name == "regiontube" and cell_model != "polyhedral_tube"):
             continue
         if chart and name == "tube":
             description = POLY_TUBE_DESCRIPTION if poly else CHART_TUBE_DESCRIPTION
@@ -1447,7 +1561,8 @@ def write_index(out_dir: Path) -> Path:
         "目录结构：`results/tube_rrt/<地图>_seed<seed>/<变体>/`，变体名依次由以下部分组成：编队名；`x<k>`（槽位整体放大 k 倍，"
         "k=1 时省略）；`first_goal`（首次连到目标即停止）或 `anytime_it<N>`（跑满 N 次迭代，保留代价最小的目标节点）；"
         "`wm<w>`（J_margin 权重）；`fixedstep`（关闭步长回退）。编队名后的 `cell1` / `cell2` 表示一阶 / 二阶 chart cell，"
-        "`cellP` 表示 polyhedral cell + region/uniform 混合 RRT*（默认 p_region 首解前 0.5、之后 0.2；`p<p>` 为常数 "
+        "`cellT` 表示 polyhedral cell + Tube-RRT*（region-gap nearest、line TubeSteer、witness overlap；`nearestpoint` / "
+        "`step<s>` / `w<w>` / `noexact` / `extend` 为非默认设置），`cellP` 表示 polyhedral cell + region/uniform 混合 RRT*（默认 p_region 首解前 0.5、之后 0.2；`p<p>` 为常数 "
         "p_region，`pexp<max>-<min>-k<k>` 为指数衰减调度，`p<before>-<after>` 为非默认切换值），"
         "没有该标记的是原来的 orientation-sliced cell。每个运行目录下的 `run.md` 是可直接阅读的运行报告。",
         "",
@@ -1543,6 +1658,16 @@ def main() -> None:
                         help="polyhedral only: an expansion turns by one of {-s, 0, +s} (largest obstacle margin)")
     parser.add_argument("--sample-offset", type=float, default=FrontierConfig.sample_offset,
                         help="polyhedral only: delta [m], how far region seeds go beyond the exit from the cell")
+    parser.add_argument("--nearest", default=RegionTubeConfig.nearest, choices=("gap", "point"),
+                        help="polyhedral_tube only: region-gap nearest argmin D - l_i - l_rand, or point nearest argmin D")
+    parser.add_argument("--max-step", type=float, default=RegionTubeConfig.max_step,
+                        help="polyhedral_tube only: largest TubeSteer advance s along the random direction (d_G)")
+    parser.add_argument("--min-witness", type=float, default=RegionTubeConfig.min_witness,
+                        help="polyhedral_tube only: w_min, shared line interval required from TubeSteer")
+    parser.add_argument("--no-exact-overlap", action="store_true",
+                        help="polyhedral_tube only: never solve LP / SOCP; pairs need a line or in-centre witness")
+    parser.add_argument("--colliding", default=RegionTubeConfig.colliding, choices=("drop", "extend"),
+                        help="polyhedral_tube only: drop a colliding q_rand (Tube-RRT*) or extend towards it")
     parser.add_argument("--yaw-slices", type=int, default=16,
                         help="equal yaw slices used to build each analytic safe cell")
     parser.add_argument("--cell-shrink", type=float, default=0.98,
@@ -1582,6 +1707,14 @@ def main() -> None:
                                              yaw_step=args.yaw_step, sample_offset=args.sample_offset)
         except ValueError as error:
             parser.error(str(error))
+    tube_config = None
+    if args.cell == "polyhedral_tube":
+        try:
+            tube_config = RegionTubeConfig(safety_distance=args.safety_distance, active_range=args.active_range,
+                                           nearest=args.nearest, max_step=args.max_step, min_witness=args.min_witness,
+                                           exact_overlap=not args.no_exact_overlap, colliding=args.colliding)
+        except ValueError as error:
+            parser.error(str(error))
 
     tee = Tee(sys.stdout)
     sys.stdout = tee
@@ -1606,7 +1739,7 @@ def main() -> None:
                            step_backoff=not args.no_step_backoff, yaw_slices=args.yaw_slices,
                            cell_eta=args.cell_shrink, cell_model=args.cell)
     planner = make_tube_rrt_planner(map_data, slots, Pose2D(*map_data.start_xy, 0.0), config=config,
-                                    frontier_config=frontier_config)
+                                    frontier_config=frontier_config, tube_config=tube_config)
     print("planning...", flush=True)
     planning_start = time.perf_counter()
     result = planner.plan()
@@ -1673,6 +1806,7 @@ def main() -> None:
         "overlap_stats": result.overlap_stats,
         "config": {key: value for key, value in asdict(config).items() if key not in ("record_trace",)},
         **({"frontier_config": asdict(frontier_config)} if frontier_config is not None else {}),
+        **({"tube_config": asdict(tube_config)} if tube_config is not None else {}),
         "timing": timing,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

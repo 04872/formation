@@ -28,6 +28,7 @@ and every configuration in it keeps clearance ``>= d_s``.  All rows share the un
 """
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 
@@ -41,6 +42,16 @@ from formation.types import MapData, Pose2D, wrap_to_pi
 _SEGMENT_CANDIDATES = (1.0, 0.0, 0.5, 0.25, 0.75)
 _INSIDE_TOL = 1e-12
 _REDUNDANCY_VERTICES = 32
+_ANALYTIC_INCIRCLE_ROWS = 6
+_ZERO_P3 = sp.csc_matrix((3, 3))
+_ZERO_P6 = sp.csc_matrix((6, 6))
+
+
+def _csc(dense: np.ndarray) -> sp.csc_matrix:
+    """CSC matrix from a small dense array without the COO round trip of ``sp.csc_matrix(dense)``."""
+    columns, rows = np.nonzero(dense.T)
+    indptr = np.concatenate(([0], np.cumsum(np.bincount(columns, minlength=dense.shape[1]))))
+    return sp.csc_matrix((dense[rows, columns], rows, indptr), shape=dense.shape)
 
 
 def halton(count: int, bases: tuple[int, ...] = (2, 3, 5)) -> np.ndarray:
@@ -270,11 +281,59 @@ class PolyhedralCellModel:
         boundary = sorted({label for label in labels if label >= 0})
         return np.asarray([kept[label] for label in boundary], dtype=int), kept_offsets[boundary]
 
+    @staticmethod
+    def _inscribed_candidates(normals: np.ndarray, offsets: np.ndarray, guard: float) -> list[tuple[np.ndarray, float]]:
+        """Candidate optima ``(x, r)`` of the in-circle program, one per possible active set.
+
+        The optimum of ``max r`` over the convex set is fixed by at most three active constraints: the guard
+        alone, one row with the guard, two rows with the guard, or three rows.
+        """
+        candidates = [(np.zeros(2), guard)]
+        count = len(offsets)
+        for k in range(count):
+            if offsets[k] < guard:
+                candidates.append((0.5 * (guard - offsets[k]) * normals[k], 0.5 * (guard + offsets[k])))
+        for i in range(count):
+            for j in range(i + 1, count):
+                matrix = normals[[i, j]]
+                det = matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0]
+                if abs(det) < 1e-12:
+                    continue
+                inverse = np.array(((matrix[1, 1], -matrix[0, 1]), (-matrix[1, 0], matrix[0, 0]))) / det
+                a, b = inverse @ np.ones(2), -(inverse @ offsets[[i, j]])
+                quadratic = (a @ a - 1.0, 2.0 * (a @ b + guard), b @ b - guard * guard)
+                if abs(quadratic[0]) < 1e-12:
+                    roots = [-quadratic[2] / quadratic[1]] if abs(quadratic[1]) > 1e-12 else []
+                else:
+                    disc = quadratic[1] ** 2 - 4.0 * quadratic[0] * quadratic[2]
+                    roots = [] if disc < 0.0 else [(-quadratic[1] + sign * math.sqrt(disc)) / (2.0 * quadratic[0])
+                                                   for sign in (1.0, -1.0)]
+                candidates += [(r * a + b, r) for r in roots if 0.0 <= r <= guard]
+        if count >= 3:
+            for combo in itertools.combinations(range(count), 3):
+                system = np.column_stack((normals[list(combo)], -np.ones(3)))
+                if abs(np.linalg.det(system)) < 1e-12:
+                    continue
+                solution = np.linalg.solve(system, -offsets[list(combo)])
+                candidates.append((solution[:2], float(solution[2])))
+        return candidates
+
     def _inscribed_circle(self, cell: PolyhedralCell) -> tuple[np.ndarray, float]:
-        """``max r`` s.t. ``n_k^T x + e_k >= r`` and ``||x|| + r <= r_g`` (a 3-variable SOCP)."""
+        """``max r`` s.t. ``n_k^T x + e_k >= r`` and ``||x|| + r <= r_g``: closed form over active sets, SOCP beyond."""
         if not len(cell.offsets):
             return np.zeros(2), cell.guard
         count = len(cell.offsets)
+        if count <= _ANALYTIC_INCIRCLE_ROWS:
+            best, best_radius = None, -math.inf
+            for center, radius in self._inscribed_candidates(cell.normals, cell.offsets, cell.guard):
+                feasible = min(float(np.min(cell.normals @ center + cell.offsets)),
+                               cell.guard - float(np.hypot(*center)))
+                value = min(radius, feasible)
+                if value > best_radius:
+                    best, best_radius = center, value
+            if best is not None and best_radius >= cell.radius:
+                return best, best_radius
+            return np.zeros(2), cell.radius
         matrix = np.zeros((count + 4, 3))
         matrix[:count, 0:2] = -cell.normals
         matrix[:count, 2] = 1.0
@@ -283,7 +342,7 @@ class PolyhedralCellModel:
         matrix[count + 2, 0] = -1.0
         matrix[count + 3, 1] = -1.0
         rhs = np.concatenate((cell.offsets, (0.0, cell.guard, 0.0, 0.0)))
-        solver = clarabel.DefaultSolver(sp.csc_matrix((3, 3)), np.array((0.0, 0.0, -1.0)), sp.csc_matrix(matrix), rhs,
+        solver = clarabel.DefaultSolver(_ZERO_P3, np.array((0.0, 0.0, -1.0)), _csc(matrix), rhs,
                                         [clarabel.NonnegativeConeT(count + 1), clarabel.SecondOrderConeT(3)],
                                         self._settings)
         solution = solver.solve()
@@ -514,6 +573,50 @@ class PolyhedralCellModel:
             return self._certificate(first, second, interpolate_pose(a, b, float(ts[best])), float(slack[best]))
         return self._solve_overlap(first, second, dx, dy, delta)
 
+    def chart_direction(self, origin: Pose2D, target: Pose2D) -> tuple[np.ndarray, float]:
+        """Unit chart direction ``u = v / ||v||_G`` from ``origin`` to ``target`` and ``D = ||v||_G``."""
+        v = np.array((target.x - origin.x, target.y - origin.y, wrap_to_pi(target.yaw - origin.yaw)))
+        length = float(math.hypot(v[0], v[1]) + self.rho * abs(v[2]))
+        return (v / length if length > 0.0 else np.zeros(3)), length
+
+    def line_interval(self, first: PolyhedralCell, second: PolyhedralCell) -> tuple[float, float, np.ndarray, float]:
+        """``[lo, hi] = C_first ∩ C_second ∩ [q_first, q_second]`` on the chart line between the seeds.
+
+        The line is ``q_first + s u`` with ``s`` in ``[0, D]``; ``hi = min(D, l_first(u))`` and
+        ``lo = max(0, D - l_second(-u))``.  ``hi > lo`` iff the seed segment carries a common point.
+        """
+        u, length = self.chart_direction(first.pose, second.pose)
+        if length <= 0.0:
+            return 0.0, 0.0, u, 0.0
+        forward = self.ray_extent(first, (u[0], u[1]), u[2])
+        backward = self.ray_extent(second, (-u[0], -u[1]), -u[2])
+        return max(0.0, length - backward), min(length, forward), u, length
+
+    def line_witness(self, first: PolyhedralCell, second: PolyhedralCell) -> PortalCertificate | None:
+        """Portal at the middle of the common seed-segment interval (no optimisation), or ``None``."""
+        if not first.valid or not second.valid:
+            return None
+        lo, hi, u, _ = self.line_interval(first, second)
+        if hi <= lo:
+            return None
+        s = 0.5 * (lo + hi)
+        a = first.pose
+        portal = Pose2D(a.x + s * u[0], a.y + s * u[1], wrap_to_pi(a.yaw + s * u[2]))
+        slack = min(self.slack(first, portal), self.slack(second, portal))
+        return self._certificate(first, second, portal, slack) if slack > _INSIDE_TOL else None
+
+    def exact_overlap(self, first: PolyhedralCell, second: PolyhedralCell) -> PortalCertificate | None:
+        """``overlap`` without the seed-segment candidates (for pairs whose line witness already failed)."""
+        self.stats["overlap_calls"] += 1
+        if not first.valid or not second.valid:
+            return None
+        a, b = first.pose, second.pose
+        dx, dy, delta = b.x - a.x, b.y - a.y, wrap_to_pi(b.yaw - a.yaw)
+        if abs(delta) >= first.yaw_limit + second.yaw_limit or math.hypot(dx, dy) >= first.guard + second.guard:
+            self.stats["quick_reject"] += 1
+            return None
+        return self._solve_overlap(first, second, dx, dy, delta)
+
     def _overlap_program(self, first: PolyhedralCell, second: PolyhedralCell, dx: float, dy: float,
                          delta: float, with_guards: bool) -> np.ndarray | None:
         """``max t`` over x = (u_x, u_y, phi, w_a, w_b, t) in the chart of ``first``; returns x or ``None``."""
@@ -550,8 +653,8 @@ class PolyhedralCellModel:
                 rhs.append(np.array((g, -gx, -gy)))
                 cones.append(clarabel.SecondOrderConeT(3))
         matrix = np.vstack(rows)
-        solver = clarabel.DefaultSolver(sp.csc_matrix((6, 6)), np.array((0.0, 0.0, 0.0, 0.0, 0.0, -1.0)),
-                                        sp.csc_matrix(matrix), np.concatenate(rhs), cones, self._settings)
+        solver = clarabel.DefaultSolver(_ZERO_P6, np.array((0.0, 0.0, 0.0, 0.0, 0.0, -1.0)),
+                                        _csc(matrix), np.concatenate(rhs), cones, self._settings)
         solution = solver.solve()
         if str(solution.status) not in ("Solved", "AlmostSolved") or -solution.obj_val <= 1e-9:
             return None

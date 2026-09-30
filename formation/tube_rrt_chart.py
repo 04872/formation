@@ -18,6 +18,7 @@ from formation.tube_rrt import (
     TubeRRTTraceEvent,
 )
 from formation.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
+from formation.tube_rrt_region import RegionTubeConfig, RegionTubeRRTPlanner
 from formation.types import FormationSpec, MapData, Pose2D
 
 CELL_MODELS = {model.name: model for model in (FirstOrderCellModel, SecondOrderCellModel)}
@@ -25,11 +26,14 @@ CELL_MODELS = {model.name: model for model in (FirstOrderCellModel, SecondOrderC
 
 def make_tube_rrt_planner(map_data: MapData, formation: FormationSpec | np.ndarray, start: Pose2D,
                           goal_xy: tuple[float, float] | None = None,
-                          config: TubeRRTConfig | None = None, frontier_config: FrontierConfig | None = None
+                          config: TubeRRTConfig | None = None, frontier_config: FrontierConfig | None = None,
+                          tube_config: RegionTubeConfig | None = None
                           ) -> TubeRRTPlanner | ChartCellTubeRRTPlanner | PolyhedralFrontierPlanner:
     config = config or TubeRRTConfig()
     if config.cell_model == "polyhedral":
         return PolyhedralFrontierPlanner(map_data, formation, start, goal_xy, config, frontier_config)
+    if config.cell_model == "polyhedral_tube":
+        return RegionTubeRRTPlanner(map_data, formation, start, goal_xy, config, tube_config)
     planner = TubeRRTPlanner if config.cell_model == "orientation" else ChartCellTubeRRTPlanner
     return planner(map_data, formation, start, goal_xy, config)
 

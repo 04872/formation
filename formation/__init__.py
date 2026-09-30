@@ -29,6 +29,7 @@ from formation.tube_cell_first_order import FirstOrderCellModel, PortalCertifica
 from formation.tube_cell_second_order import SecondOrderCellModel
 from formation.polyhedral_cell import PolyhedralCell, PolyhedralCellModel
 from formation.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
+from formation.tube_rrt_region import RegionTubeConfig, RegionTubeRRTPlanner
 from formation.tube_rrt_chart import CELL_MODELS, ChartCellTubeRRTPlanner, make_tube_rrt_planner
 from formation.tube_rrt import (
     EdgeCertificate,
@@ -136,6 +137,8 @@ __all__ = [
     "PolyhedralCell",
     "PolyhedralCellModel",
     "FrontierConfig",
+    "RegionTubeConfig",
+    "RegionTubeRRTPlanner",
     "PolyhedralFrontierPlanner",
     "make_tube_rrt_planner",
     "TubeRRTNode",
