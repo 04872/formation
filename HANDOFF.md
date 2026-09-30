@@ -22,7 +22,7 @@
 - `formation/__init__.py`：公开导出。
 - `scripts/visualize_tube_rrt.py`：CLI、规划、绘图、计时、报告和结果索引。
 - `tests/test_tube_rrt.py`：工厂分派（默认 orientation）、原 orientation 实现复现旧运行（random_circles seed 7、square×2、anytime：2143 节点、首次 236 次迭代、代价 12.406），以及 chart 范数定义、一阶位似 overlap、portal 同属两个 cell、一阶 / 二阶 cell 对真实机器人位移的界、二阶 overlap 与暴力采样一致、射线内步长、两种 cell 的确定性规划、二阶路线认证与无碰撞、rewire 后代价一致、非法 cell 名和起点碰撞。
-- `tests/test_region_tube.py`（12 个）：lazy cell 不算内切圆 / 样本，且与定义（全部 broadphase 行 ∩ guard ∩ π/2 chart）逐点相同（成员与 slack 值），yaw 上界 ≥ SOCP 求得的 R_in/ρ、近似深点严格在截面内、解析内切圆与 SOCP 一致（≥ SOCP − 1e-7）、向量化 ℓ_i / slack / ℓ_rand 与 `ray_extent` / `slack` 一致、region-gap nearest 与暴力计算一致、所有树边 portal 严格在两 cell 内且认证路线 clearance > 0、line witness 的路线长度等于 seed 距离、工厂分派与非法配置、三张地图首解、`exact_overlap=False` 时 LP / SOCP 调用为 0、point / extend 变体、anytime 代价单调且等于路径边长之和。
+- `tests/test_region_tube.py`（13 个）：分离判据从不误判（被标记的对精确 LP 必为不重叠）、单遍 `_neighbors` 与基类一致、lazy cell 不算内切圆 / 样本，且与定义（全部 broadphase 行 ∩ guard ∩ π/2 chart）逐点相同（成员与 slack 值），yaw 上界 ≥ SOCP 求得的 R_in/ρ、近似深点严格在截面内、解析内切圆与 SOCP 一致（≥ SOCP − 1e-7）、向量化 ℓ_i / slack / ℓ_rand 与 `ray_extent` / `slack` 一致、region-gap nearest 与暴力计算一致、所有树边 portal 严格在两 cell 内且认证路线 clearance > 0、line witness 的路线长度等于 seed 距离、工厂分派与非法配置、三张地图首解、`exact_overlap=False` 时 LP / SOCP 调用为 0、point / extend 变体、anytime 代价单调且等于路径边长之和。
 - `tests/test_maps.py`：全部地图字段、随机圆确定性 / 边界、各类走廊和起终点验证。
 - `tests/test_polyhedral_frontier.py`（19 个；另检查 `frontier_pieces` 恰在截面边界（facet 行松弛为 0、guard 弧半径 = r_g）；live 扩展方向与 facet 法向 / guard 外法向夹角 < 90°、Δθ ∈ {0, ±s} 且使旋转裕度最大、q_new 在源 cell 外且裕度 > 0、live q_new 不被任何 cell 覆盖、每个 cell 的方向数有界；region 节点离开源 cell、旋转裕度 > 0、距源 cell 中心 ≤ r_g + outer_reach）：公共旋转半径 ρ、边界行来自 broadphase 且 guard 来自其余 pair、剪枝后的 cell 是全部 broadphase 行 cell 的子集且几乎相同、cell 内任意构型真实 clearance ≥ d_s（蒙特卡洛）、yaw 半宽 = min(π/2, R_in/ρ) 且超出后截面为空、ℓ 恰好落在边界、射线步长、三维边界曲面、截面多边形与成员判定一致、portal 严格在两 cell 内且与暴力采样一致（LP / SOCP 均被调用）、p_region 三种调度、每次迭代至多 1 个 cell（`cells_built = 1 + 迭代 − no_progress`）与认证路线、p_region = 0 / 1 两个极端、post_fence 可达、起点碰撞。
 
@@ -80,7 +80,7 @@ cell overlap：yaw 区间或 guard 圆不相交时快速拒绝；节点连线上
 5. **NearConnect / rewire**：候选为 guard 圆 / yaw 区间与 C_new 相交的至多 12 个节点；先向量化求所有候选的直线 witness，再试两个 cell 深点连线上的 5 个点（`center` witness；深点 = 已算出的内切圆心，否则 `approximate_center`：guard 单独 / 单行 + guard 的闭式候选中真实裕度最大者，不解优化）；都没有时，只有乐观代价（`cost + D`）仍可能改进父节点 / rewire 时才调用 `exact_overlap`（`exact_overlap=False` 则跳过）。
 6. 目标：目标位姿落在 C_new 内（slack > 0）即加 goal 节点。`overlap_stats` 额外记录 `samples_colliding`、`nearest_differs`、`gap_negative`、`steer_first_try`、`steer_cells`、各类拒绝、`near_* / rewire_*`（witness / center_witness / exact_calls / exact_accept / skipped_bound）、`rewires`、`portal_radius_mean`。
 
-20 seed 对比（`results/region_schemes/`）：tube gap 首解迭代 104 / 64 / 74（random_circles / single_post / post_fence 中位数；v4 为 52 / 37 / 57），首解墙钟时间与 v4 相当；C_2500 为 11.98 / 11.54 / 11.50（v4 11.68 / 11.30 / 11.43，uniform 12.58 / 11.46 / 11.15）；LP 调用少 4–6 倍；低负载 2500 次迭代 0.88–1.10 s（v4 2.26–2.78 s，uniform 2.26–2.45 s，均含解析内切圆与 `_csc` 加速）。之后改为 lazy cell + 近似深点：seed 7 的三张地图从 1.09 / 0.86 / 1.00 s 降到 0.86 / 0.74 / 0.80 s，路径代价与首解迭代不变（LP 调用多约 5%）；`results/region_schemes/` 中的 tube 耗时是改动前的测量。`exact_overlap=False` 再快 7–14%，代价差 ≤ 0.17；point nearest 首解更慢、random_circles 代价高 0.35；extend 首解最快（58 / 39 / 54）但 LP 约翻倍、耗时 1.3–2.0 s。约 30–40% 的 q_rand 碰撞被丢弃，是首解迭代数多于 v4 的主要原因。
+20 seed 对比（`results/region_schemes/`）：tube gap 首解迭代 104 / 64 / 74（random_circles / single_post / post_fence 中位数；v4 为 52 / 37 / 57），首解墙钟时间与 v4 相当；C_2500 为 11.98 / 11.54 / 11.50（v4 11.68 / 11.30 / 11.43，uniform 12.58 / 11.46 / 11.15）；LP 调用少 4–6 倍；低负载 2500 次迭代 0.88–1.10 s（v4 2.26–2.78 s，uniform 2.26–2.45 s，均含解析内切圆与 `_csc` 加速）。之后改为 lazy cell + 近似深点：seed 7 的三张地图从 1.09 / 0.86 / 1.00 s 降到 0.86 / 0.74 / 0.80 s，路径代价与首解迭代不变（LP 调用多约 5%）；`results/region_schemes/` 中的 tube 耗时是改动前的测量。再之后三处搜索层改动（树不变，逐 seed 首解迭代与路径相同，L_G 仅末位浮点差异）：(1) region-gap nearest 用精确界 `D_i − r_g,i − r_g,rand ≤ g_i ≤ D_i − a_i − a_rand`（`a` = seed 周围包含于 cell 的 d_G 球半径）只精算下界不超过最小上界的节点（约 50 个 / 次，72 µs / 次，原 125 µs）；(2) witness 只对乐观代价可能改进的邻居计算，并改为按对的标量 Python（每节点的行另存为 Python 元组），`_neighbors` 单遍；(3) 精确 LP 前的廉价分离证明：slack 对 d_G 1-Lipschitz 且 cell ⊂ seed 周围半径 r_g 的球，`slack_A(q_B) ≤ −r_g,B` 即不相交；或 A 的某行在整个 B 上为负（上界 `n^T v − ρ|Δθ| + e + min(r_g,B, min_j e'_j + ||n + m_j|| r_g,B)`，对应“同一障碍两侧”）。精确 LP 从占测试对的 9–29% 降到 3.4–11.4%，其中 73–79% 为接受。低负载 2500 次迭代 0.54–0.63 s（`timing_low_load.csv`，6 seed）；不解 LP 为 0.52–0.53 s。`results/region_schemes/runs.csv` 的 tube 行（24 进程耗时）仍是最早的测量。`exact_overlap=False` 再快 7–14%，代价差 ≤ 0.17；point nearest 首解更慢、random_circles 代价高 0.35；extend 首解最快（58 / 39 / 54）但 LP 约翻倍、耗时 1.3–2.0 s。约 30–40% 的 q_rand 碰撞被丢弃，是首解迭代数多于 v4 的主要原因。
 
 ## 可视化与计时
 
@@ -179,7 +179,7 @@ orientation 的 clearance 是展开路线上的局部 guarded clearance，一阶
 
 ## 验证命令与最近记录
 
-最近验证记录：focused 51 tests（`test_polyhedral_frontier` 19 + `test_region_tube` 12 + `test_tube_rrt` 12 + `test_maps` 8），完整 98 tests；这些是最近一次验证记录，不是永久保证。
+最近验证记录：focused 52 tests（`test_polyhedral_frontier` 19 + `test_region_tube` 13 + `test_tube_rrt` 12 + `test_maps` 8），完整 99 tests；这些是最近一次验证记录，不是永久保证。
 
 项目使用的 Conda 环境是 `../env-rebuilt`（即 `/home/eai/projects/env-rebuilt`，可用 `conda activate /home/eai/projects/env-rebuilt` 激活）。
 

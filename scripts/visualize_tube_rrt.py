@@ -888,7 +888,7 @@ def draw_frontier(figure, result: TubeRRTResult, map_data, planner: PolyhedralFr
 
 
 EDGE_KIND_STYLE = (("steer", "tab:blue", "TubeSteer line interval"), ("line", "tab:green", "line witness"),
-                   ("center", "tab:orange", "in-centre witness"), ("exact", "tab:red", "exact LP / SOCP"))
+                   ("center", "tab:orange", "deep-point witness"), ("exact", "tab:red", "exact LP / SOCP"))
 
 
 def draw_region_tube(figure, result: TubeRRTResult, map_data, planner: RegionTubeRRTPlanner) -> None:
@@ -911,9 +911,11 @@ def draw_region_tube(figure, result: TubeRRTResult, map_data, planner: RegionTub
 
     stats = result.overlap_stats
     count_axis = figure.add_subplot(grid[0, 1])
-    labels = ("line witness", "in-centre witness", "exact accepted", "exact rejected", "skipped (optimistic cost)")
+    labels = ("line witness", "separated (cheap reject)", "deep-point witness", "exact accepted", "exact rejected",
+              "skipped (optimistic cost)")
     for offset, (kind, color) in enumerate((("near", "tab:purple"), ("rewire", "tab:olive"))):
-        values = (stats[f"{kind}_witness"], stats[f"{kind}_center_witness"], stats[f"{kind}_exact_accept"],
+        values = (stats[f"{kind}_witness"], stats[f"{kind}_separated"], stats[f"{kind}_center_witness"],
+                  stats[f"{kind}_exact_accept"],
                   stats[f"{kind}_exact_calls"] - stats[f"{kind}_exact_accept"], stats[f"{kind}_skipped_bound"])
         count_axis.barh(np.arange(len(labels)) + 0.2 * (1 - 2 * offset), values, height=0.38, color=color,
                         label="NearConnect" if kind == "near" else "rewire")
@@ -1415,16 +1417,19 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
             f"{overlap['first_goal_cost']:.3f} / {overlap['first_goal_pose_queries']} |",
             f"| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | "
             f"{overlap['plan_time_s']:.2f} s / {overlap['pose_queries']} / {overlap['pair_queries']} |",
-            f"| q_rand 碰撞 / region-gap nearest 选中节点与点最近不同 / 选中节点 gap ≤ 0 | "
-            f"{overlap['samples_colliding']} / {overlap['nearest_differs']} / {overlap['gap_negative']} |",
+            f"| q_rand 碰撞 / region-gap nearest 选中节点与点最近不同 / 选中节点 gap ≤ 0 / 每次 nearest 精算节点数 | "
+            f"{overlap['samples_colliding']} / {overlap['nearest_differs']} / {overlap['gap_negative']} / "
+            f"{overlap['nearest_exact'] / max(overlap['tube_nodes'] + overlap['rejected_collision'] + overlap['rejected_no_overlap'] + overlap['rejected_no_progress'], 1):.1f} |",
             f"| TubeSteer：插入节点 / 首次即成功（直接用 C_rand） / 额外建 cell / 失败（无进展 / 碰撞 / 无公共区间） | "
             f"{overlap['tube_nodes']} / {overlap['steer_first_try']} / {overlap['steer_cells']} / "
             f"{overlap['rejected_no_progress']} / {overlap['rejected_collision']} / {overlap['rejected_no_overlap']} |",
-            f"| NearConnect：直线 witness / 内切圆心 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 改进父节点 | "
-            f"{overlap['near_witness']} / {overlap['near_center_witness']} / {overlap['near_exact_calls']}"
+            f"| NearConnect：直线 witness / 廉价分离拒绝 / 深点 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 改进父节点 | "
+            f"{overlap['near_witness']} / {overlap['near_separated']} / {overlap['near_center_witness']} / "
+            f"{overlap['near_exact_calls']}"
             f"（{overlap['near_exact_accept']}） / {overlap['near_skipped_bound']} / {overlap['near_improved']} |",
-            f"| rewire：直线 witness / 内切圆心 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 实际 rewire | "
-            f"{overlap['rewire_witness']} / {overlap['rewire_center_witness']} / {overlap['rewire_exact_calls']}"
+            f"| rewire：直线 witness / 廉价分离拒绝 / 深点 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 实际 rewire | "
+            f"{overlap['rewire_witness']} / {overlap['rewire_separated']} / {overlap['rewire_center_witness']} / "
+            f"{overlap['rewire_exact_calls']}"
             f"（{overlap['rewire_exact_accept']}） / {overlap['rewire_skipped_bound']} / {overlap['rewires']} |",
             f"| LP / SOCP 调用总数 | {overlap['lp_calls']} / {overlap['socp_calls']} |",
             f"| 插入边的平均 r_portal | {overlap['portal_radius_mean']:.3f} m |",

@@ -50,21 +50,21 @@
 
 | 地图 | 方案 | T_first [s] | 2500 次迭代耗时 [s] | LP 调用 | C_2500 |
 | --- | --- | --- | --- | --- | --- |
-| `random_circles` | uniform | 0.174 | 2.45 [2.37, 2.49] | 1810 | 12.78 |
-| `random_circles` | v4 facet | 0.064 | 2.78 [2.69, 2.80] | 3169 | 11.94 |
-| `random_circles` | tube gap | 0.066 | 1.10 [1.09, 1.10] | 702 | 11.86 |
-| `random_circles` | tube point | 0.072 | 1.00 [0.98, 1.03] | 792 | 12.10 |
-| `random_circles` | tube no-exact | 0.048 | 0.95 [0.94, 0.95] | 0 | 11.88 |
-| `random_circles` | tube extend | 0.035 | 1.98 [1.96, 1.98] | 1530 | 11.84 |
-| `single_post` | uniform | 0.073 | 2.26 [2.25, 2.27] | 722 | 11.83 |
-| `single_post` | v4 facet | 0.031 | 2.26 [2.22, 2.28] | 1514 | 11.46 |
-| `single_post` | tube gap | 0.032 | 0.88 [0.87, 0.88] | 210 | 11.31 |
-| `single_post` | tube point | 0.033 | 0.79 [0.78, 0.80] | 260 | 11.28 |
-| `single_post` | tube no-exact | 0.024 | 0.82 [0.82, 0.83] | 0 | 11.46 |
-| `single_post` | tube extend | 0.020 | 1.33 [1.33, 1.35] | 307 | 11.65 |
-| `post_fence` | uniform | 0.101 | 2.36 [2.29, 2.38] | 1122 | 11.16 |
-| `post_fence` | v4 facet | 0.059 | 2.67 [2.65, 2.70] | 2690 | 11.46 |
-| `post_fence` | tube gap | 0.044 | 1.04 [1.02, 1.07] | 504 | 11.32 |
-| `post_fence` | tube point | 0.051 | 0.96 [0.94, 0.97] | 494 | 11.53 |
-| `post_fence` | tube no-exact | 0.034 | 0.93 [0.92, 0.96] | 0 | 11.38 |
-| `post_fence` | tube extend | 0.056 | 1.68 [1.67, 1.71] | 962 | 11.52 |
+| `random_circles` | uniform | 0.177 | 2.47 [2.37, 2.53] | 1810 | 12.78 |
+| `random_circles` | v4 facet | 0.064 | 2.79 [2.70, 2.83] | 3169 | 11.94 |
+| `random_circles` | tube gap | 0.033 | 0.63 [0.62, 0.64] | 338 | 11.71 |
+| `random_circles` | tube point | 0.032 | 0.57 [0.56, 0.57] | 340 | 12.10 |
+| `random_circles` | tube no-exact | 0.026 | 0.53 [0.53, 0.54] | 0 | 11.81 |
+| `random_circles` | tube extend | 0.018 | 1.15 [1.12, 1.16] | 947 | 11.84 |
+| `single_post` | uniform | 0.072 | 2.29 [2.28, 2.30] | 722 | 11.83 |
+| `single_post` | v4 facet | 0.031 | 2.27 [2.22, 2.32] | 1514 | 11.46 |
+| `single_post` | tube gap | 0.017 | 0.54 [0.54, 0.56] | 81 | 11.31 |
+| `single_post` | tube point | 0.016 | 0.49 [0.48, 0.50] | 96 | 11.28 |
+| `single_post` | tube no-exact | 0.015 | 0.52 [0.52, 0.53] | 0 | 11.46 |
+| `single_post` | tube extend | 0.011 | 0.84 [0.84, 0.84] | 168 | 11.65 |
+| `post_fence` | uniform | 0.102 | 2.37 [2.33, 2.40] | 1122 | 11.16 |
+| `post_fence` | v4 facet | 0.058 | 2.70 [2.67, 2.72] | 2690 | 11.46 |
+| `post_fence` | tube gap | 0.018 | 0.58 [0.56, 0.59] | 165 | 11.32 |
+| `post_fence` | tube point | 0.021 | 0.53 [0.52, 0.53] | 174 | 11.53 |
+| `post_fence` | tube no-exact | 0.016 | 0.53 [0.52, 0.54] | 0 | 11.38 |
+| `post_fence` | tube extend | 0.022 | 0.93 [0.92, 0.94] | 406 | 11.52 |

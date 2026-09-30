@@ -102,6 +102,32 @@ class RegionTubeGeometryTest(unittest.TestCase):
             compared += 1
         self.assertGreater(compared, 100)
 
+    def test_separation_flags_are_never_wrong_and_neighbors_match_the_base_planner(self) -> None:
+        from formation import PolyhedralFrontierPlanner
+        planner, flagged, checked = self.planner, 0, 0
+        for index in range(1, len(planner._nodes), 7):
+            cell = planner._nodes[index].cell
+            neighbors, distances = planner._neighbors(cell)
+            base, base_distances = PolyhedralFrontierPlanner._neighbors(planner, cell)
+            self.assertTrue(np.array_equal(neighbors, base))
+            self.assertTrue(np.allclose(distances, base_distances))
+            neighbors = neighbors[neighbors != index]
+            if not len(neighbors):
+                continue
+            witnesses, separated = planner._witnesses(neighbors, cell)
+            for k, other in enumerate(neighbors.tolist()):
+                exact = self.model.exact_overlap(planner._nodes[other].cell, cell)
+                checked += 1
+                if separated[k]:
+                    flagged += 1
+                    self.assertIsNone(exact)
+                    self.assertIsNone(witnesses[k])
+                if witnesses[k] is not None:
+                    self.assertGreater(self.model.slack(cell, witnesses[k].portal), 0.0)
+                    self.assertGreater(self.model.slack(planner._nodes[other].cell, witnesses[k].portal), 0.0)
+        self.assertGreater(checked, 200)
+        self.assertGreater(flagged, 5)
+
     def test_approximate_center_is_inside_the_section(self) -> None:
         for cell in valid_cells(self.planner, 200, seed=8):
             point = self.model.approximate_center(cell)
@@ -166,7 +192,8 @@ class RegionTubeGeometryTest(unittest.TestCase):
         planner = self.planner
         nodes = np.arange(1, min(len(planner._nodes), 60))
         cell = planner._nodes[0].cell
-        witnesses, lengths = planner._witnesses(nodes, cell)
+        witnesses, _ = planner._witnesses(nodes, cell)
+        _, lengths = planner._directions(nodes, cell.pose)
         for k, witness in enumerate(witnesses):
             if witness is None:
                 continue

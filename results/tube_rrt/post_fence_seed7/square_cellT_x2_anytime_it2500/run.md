@@ -1,7 +1,7 @@
 # Tube-RRT 运行记录：post_fence / seed 7 / square_cellT_x2_anytime_it2500
 
-- 运行时间：2026-09-30 14:14:19
-- 代码版本：`b887b1c (有未提交改动)`
+- 运行时间：2026-09-30 14:29:02
+- 代码版本：`2165d98 (有未提交改动)`
 - 结果目录：`results/tube_rrt/post_fence_seed7/square_cellT_x2_anytime_it2500`
 
 复现命令（在仓库根目录执行）：
@@ -19,19 +19,19 @@ MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map pos
 | 首次连到目标的迭代 | 53 |
 | 树节点数（含目标节点） | 1673（目标节点 2） |
 | 被拒绝：碰撞 / 安全球不重叠 | 829 / 0 |
-| rewire 次数 | 507 |
+| rewire 次数 | 501 |
 | 步长回退后才接受的节点数 | 40 |
 | 障碍夹在机器人之间的节点：树 / 路径 | 30 / 5（路径共 16 个节点） |
 | 路径代价（含 J_margin）：首次 → 最终 | 11.000 → 10.940 |
 | 路径 d_G 长度 | 10.940 |
 | 认证路线上稠密采样的最小 guarded clearance（<0 表示碰撞） | 0.053 |
-| T_first / C_first / 首解前 N_query | 0.020 s / 11.000 / 104 |
-| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | 0.85 s / 2966 / 130504 |
-| q_rand 碰撞 / region-gap nearest 选中节点与点最近不同 / 选中节点 gap ≤ 0 | 829 / 955 / 1575 |
+| T_first / C_first / 首解前 N_query | 0.013 s / 11.000 / 104 |
+| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | 0.59 s / 2966 / 130504 |
+| q_rand 碰撞 / region-gap nearest 选中节点与点最近不同 / 选中节点 gap ≤ 0 / 每次 nearest 精算节点数 | 829 / 955 / 1575 / 50.6 |
 | TubeSteer：插入节点 / 首次即成功（直接用 C_rand） / 额外建 cell / 失败（无进展 / 碰撞 / 无公共区间） | 1670 / 1630 / 465 / 1 / 0 / 0 |
-| NearConnect：直线 witness / 内切圆心 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 改进父节点 | 1343 / 159 / 412（90） / 16455 / 1440 |
-| rewire：直线 witness / 内切圆心 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 实际 rewire | 498 / 46 / 100（26） / 16318 / 507 |
-| LP / SOCP 调用总数 | 512 / 157 |
+| NearConnect：直线 witness / 廉价分离拒绝 / 深点 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 改进父节点 | 1343 / 274 / 159 / 138（90） / 16455 / 1440 |
+| rewire：直线 witness / 廉价分离拒绝 / 深点 witness / 精确 LP-SOCP（接受） / 被乐观代价跳过 / 实际 rewire | 494 / 58 / 46 / 42（26） / 16322 / 501 |
+| LP / SOCP 调用总数 | 180 / 83 |
 | 插入边的平均 r_portal | 0.441 m |
 | 每个 cell 平均：broadphase pair / 边界 active row | 3.20 / 1.79 |
 
@@ -84,12 +84,12 @@ MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map pos
 
 | 阶段 | 秒 |
 | --- | --- |
-| startup_imports | 0.227 |
+| startup_imports | 0.230 |
 | map_build | 0.082 |
-| tube_rrt | 0.853 |
-| plot_build | 1.632 |
-| save | 2.538 |
-| total | 5.332 |
+| tube_rrt | 0.588 |
+| plot_build | 1.584 |
+| save | 2.587 |
+| total | 5.071 |
 
 ## 图
 
@@ -155,14 +155,14 @@ joint tube：路径 polyhedral cell 的 dtheta = 0 截面 P_i(0) 与 portal、(x
 ## 控制台输出
 
 ```text
-timing startup_imports=0.227s
+timing startup_imports=0.230s
 timing map_build=0.082s
 geometry robot_radius=0.113 safety_margin=0.060 pass_through_bound=0.327 obstacle_radius=0.080-0.080 passable_obstacles=7/7
 planning...
-timing tube_rrt=0.853s
+timing tube_rrt=0.588s
 planning result: success=True iterations=2500 nodes=1673 path_nodes=16 path_cost=10.940 min_guarded_clearance=0.053
-overlap cells_built=2966 pose_queries=2966 pair_queries=130504 broadphase_pairs=9478 active_pairs=5306 overlap_calls=512 quick_reject=0 quick_accept=0 lp_calls=512 lp_reject=313 lp_accept=42 socp_calls=157 socp_accept=74 samples_colliding=829 gap_negative=1575 nearest_differs=955 steer_cells=465 steer_first_try=1630 rejected_no_progress=1 rejected_collision=0 rejected_no_overlap=0 parent_witness=1670 near_improved=1440 rewires=507 portal_radius_sum=735.8452951220382 near_witness=1343 near_center_witness=159 near_exact_calls=412 near_exact_accept=90 near_skipped_bound=16455 rewire_witness=498 rewire_center_witness=46 rewire_exact_calls=100 rewire_exact_accept=26 rewire_skipped_bound=16318 first_goal_time_s=0.02038966491818428 first_goal_pose_queries=104 first_goal_cost=10.999805961685958 tube_nodes=1670 portal_radius_mean=0.4406259252227774 plan_time_s=0.850918818032369
-timing plot_build=1.632s
-timing save=2.538s total=5.332s
+overlap cells_built=2966 pose_queries=2966 pair_queries=130504 broadphase_pairs=9478 active_pairs=5306 overlap_calls=180 quick_reject=0 quick_accept=0 lp_calls=180 lp_reject=55 lp_accept=42 socp_calls=83 socp_accept=74 samples_colliding=829 gap_negative=1575 nearest_differs=955 steer_cells=465 steer_first_try=1630 rejected_no_progress=1 rejected_collision=0 rejected_no_overlap=0 parent_witness=1670 near_improved=1440 rewires=501 portal_radius_sum=735.8358691160072 nearest_exact=84515 near_witness=1343 near_separated=274 near_center_witness=159 near_exact_calls=138 near_exact_accept=90 near_skipped_bound=16455 rewire_witness=494 rewire_separated=58 rewire_center_witness=46 rewire_exact_calls=42 rewire_exact_accept=26 rewire_skipped_bound=16322 first_goal_time_s=0.012923937989398837 first_goal_pose_queries=104 first_goal_cost=10.999805961685958 tube_nodes=1670 portal_radius_mean=0.4406202809077887 plan_time_s=0.5858603259548545
+timing plot_build=1.584s
+timing save=2.587s total=5.071s
 saved results/tube_rrt/post_fence_seed7/square_cellT_x2_anytime_it2500/
 ```

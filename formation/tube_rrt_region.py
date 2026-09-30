@@ -15,9 +15,14 @@ the directional cells only change which node captures a sample and how far the t
 4. The shared interval is the edge certificate: its midpoint ``q_w`` is a portal strictly inside both
    convex cells, the route ``q_i -> q_w -> q(s)`` has length ``s`` and ``min`` of the two slacks at ``q_w``
    is a d_G ball radius inside both cells (``r_portal``, the edge width).  No LP / SOCP.
-5. **NearConnect / rewire** over nodes whose guard disks and yaw ranges meet ``C_new``: line witnesses for
-   all of them first (vectorised); an exact LP / SOCP overlap only for a pair without witness whose
-   optimistic cost ``cost + D`` could still change the parent or a rewire.
+5. **NearConnect / rewire** over nodes whose guard disks and yaw ranges meet ``C_new``: pairs whose optimistic
+   cost ``cost + D`` cannot change the parent or a rewire are skipped; the rest get, in order, a line witness,
+   a cheap separation proof (Lipschitz slack at the other seed, or a row that is negative on the whole other
+   cell), a deep-point witness, and only then an exact LP / SOCP overlap.
+
+Region-gap nearest is exact but bounded: ``D_i - r_g,i - r_g,rand <= g_i <= D_i - a_i - a_rand`` with ``a`` the
+radius of the d_G ball around the seed inside the cell, so only nodes whose lower bound is below the smallest
+upper bound are evaluated.
 """
 from __future__ import annotations
 
@@ -35,6 +40,22 @@ from formation.types import FormationSpec, MapData, Pose2D, wrap_to_pi
 
 _INSIDE_TOL = 1e-12
 _CENTER_CANDIDATES = (0.5, 0.25, 0.75, 0.0, 1.0)
+
+
+def _row_separates(rows, other_rows, vx: float, vy: float, turn: float, other_guard: float) -> bool:
+    """Whether one row of the first cell is negative on the whole second cell (seed at ``(vx, vy)``, yaw offset
+    ``turn / rho`` from the first seed, guard ``other_guard``).
+
+    For ``q`` in the second cell ``n^T dc + rho |dtheta| <= h = min(r_g', min_j e'_j + ||n + m_j|| r_g')`` (guard,
+    and a row ``m_j`` of the second cell nearly opposite to ``n``), so the row is at most
+    ``n^T v - turn + e + h`` there."""
+    for nx, ny, e in rows:
+        reach = other_guard
+        for mx, my, f in other_rows:
+            reach = min(reach, f + math.hypot(nx + mx, ny + my) * other_guard)
+        if nx * vx + ny * vy - turn + e + reach < 0.0:
+            return True
+    return False
 
 
 @dataclass
@@ -104,6 +125,23 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             self._row_e = np.concatenate((self._row_e, np.zeros(len(self._row_offset) - len(self._row_e))))
         start = self._row_start[index]
         self._row_e[start:start + len(cell.offsets)] = cell.offsets
+        if len(self._inner) < len(self._x):
+            self._inner = np.concatenate((self._inner, np.zeros(len(self._x) - len(self._inner))))
+        self._inner[index] = self._inner_radius(cell)
+        rows = self._scalar_rows(cell)
+        if index < len(self._py_rows):
+            self._py_rows[index] = rows
+        else:
+            self._py_rows.append(rows)
+
+    @staticmethod
+    def _scalar_rows(cell: PolyhedralCell) -> tuple[tuple[float, float, float], ...]:
+        """Rows ``(n_x, n_y, e)`` of ``cell`` as Python floats, for the per-pair scalar tests."""
+        return tuple(zip(cell.normals[:, 0].tolist(), cell.normals[:, 1].tolist(), cell.offsets.tolist()))
+
+    def _inner_radius(self, cell: PolyhedralCell) -> float:
+        """``a`` with the d_G ball of radius ``a`` around the seed inside the cell, so ``l(u) >= a`` for every u."""
+        return min(cell.radius, self.formation_radius * cell.yaw_limit) if cell.valid else 0.0
 
     def _directions(self, nodes: np.ndarray, pose: Pose2D) -> tuple[np.ndarray, np.ndarray]:
         """Unit chart directions ``u_i`` (M, 3) from each node to ``pose`` and ``D_i = ||v_i||_G``."""
@@ -158,48 +196,108 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         return np.maximum(lengths, 0.0)
 
     def _witnesses(self, nodes: np.ndarray, cell: PolyhedralCell) -> tuple[list[PortalCertificate | None], np.ndarray]:
-        """Line witnesses between each node's cell and ``cell`` (``None`` where the seed segment has no common point)."""
-        u, length = self._directions(nodes, cell.pose)
-        forward = self._node_extents(nodes, u)
-        backward = self._cell_extents(cell, -u)
-        lo, hi = np.maximum(0.0, length - backward), np.minimum(length, forward)
-        witnesses: list[PortalCertificate | None] = [None] * len(nodes)
-        found = np.flatnonzero((hi > lo) & (length > 0.0))
-        if not len(found):
-            return witnesses, length
-        s = 0.5 * (lo[found] + hi[found])
-        points = np.column_stack((self._x[nodes[found]] + s * u[found, 0], self._y[nodes[found]] + s * u[found, 1],
-                                  wrap_array(self._yaw[nodes[found]] + s * u[found, 2])))
-        slack = np.minimum(self._node_slack(nodes[found], points), self.cells.slack_many(cell, points))
-        for k, index in enumerate(found.tolist()):
-            if slack[k] > _INSIDE_TOL:
-                witnesses[index] = PortalCertificate(Pose2D(*points[k]), float(slack[k]), float(length[index]))
-        return witnesses, length
+        """Line witnesses between each node's cell and ``cell`` (``None`` where the seed segment has no common
+        point) and a separation flag: ``slack`` is 1-Lipschitz in d_G and a cell lies in the d_G ball of radius
+        ``r_g`` around its seed, so ``slack_i(q) <= -r_g`` or ``slack(q_i) <= -r_g,i`` proves the cells disjoint.
+
+        Scalar per pair: a handful of pairs with a few rows each costs less in plain Python than in NumPy."""
+        rho, pose = self.formation_radius, cell.pose
+        new_rows, new_guard, new_limit = self._scalar_rows(cell), cell.guard, rho * cell.yaw_limit
+        witnesses: list[PortalCertificate | None] = []
+        separated = np.zeros(len(nodes), dtype=bool)
+        for k, i in enumerate(nodes.tolist()):
+            xi, yi, ti = float(self._x[i]), float(self._y[i]), float(self._yaw[i])
+            rows, guard, limit = self._py_rows[i], float(self._guard[i]), rho * float(self._yaw_limit[i])
+            vx, vy, vt = pose.x - xi, pose.y - yi, wrap_to_pi(pose.yaw - ti)
+            planar, turn = math.hypot(vx, vy), rho * abs(vt)
+            length = planar + turn
+            at_new = min(guard - length, limit - turn,
+                         min((nx * vx + ny * vy + e for nx, ny, e in rows), default=math.inf) - turn)
+            at_node = min(new_guard - length, new_limit - turn,
+                          min((-nx * vx - ny * vy + e for nx, ny, e in new_rows), default=math.inf) - turn)
+            separated[k] = (at_new <= -new_guard or at_node <= -guard
+                            or _row_separates(rows, new_rows, vx, vy, turn, new_guard)
+                            or _row_separates(new_rows, rows, -vx, -vy, turn, guard))
+            if length <= 0.0:
+                witnesses.append(None)
+                continue
+            ux, uy, rate = vx / length, vy / length, turn / length
+            forward = min(guard, limit / rate if rate > 0.0 else math.inf)
+            for nx, ny, e in rows:
+                speed = rate - nx * ux - ny * uy
+                if speed > 1e-15:
+                    forward = min(forward, e / speed)
+            backward = min(new_guard, new_limit / rate if rate > 0.0 else math.inf)
+            for nx, ny, e in new_rows:
+                speed = rate + nx * ux + ny * uy
+                if speed > 1e-15:
+                    backward = min(backward, e / speed)
+            lo, hi = max(0.0, length - max(backward, 0.0)), min(length, max(forward, 0.0))
+            if not hi > lo:
+                witnesses.append(None)
+                continue
+            s = 0.5 * (lo + hi)
+            px, py, pt = s * vx / length, s * vy / length, s * vt / length
+            turn_i, turn_n = rho * abs(pt), rho * abs(pt - vt)
+            qx, qy = px - vx, py - vy
+            slack = min(guard - math.hypot(px, py) - turn_i, limit - turn_i,
+                        min((nx * px + ny * py + e for nx, ny, e in rows), default=math.inf) - turn_i,
+                        new_guard - math.hypot(qx, qy) - turn_n, new_limit - turn_n,
+                        min((nx * qx + ny * qy + e for nx, ny, e in new_rows), default=math.inf) - turn_n)
+            witnesses.append(PortalCertificate(Pose2D(xi + px, yi + py, wrap_to_pi(ti + pt)), slack, length)
+                             if slack > _INSIDE_TOL else None)
+        return witnesses, separated
+
+    def _neighbors(self, cell: PolyhedralCell) -> tuple[np.ndarray, np.ndarray]:
+        """As ``PolyhedralFrontierPlanner._neighbors`` (guard disks and yaw ranges intersect), in one pass."""
+        count, pose = len(self._nodes), cell.pose
+        planar = np.hypot(self._x[:count] - pose.x, self._y[:count] - pose.y)
+        dyaw = np.abs(wrap_array(self._yaw[:count] - pose.yaw))
+        distances = planar + self.formation_radius * dyaw
+        mask = (planar < self._guard[:count] + cell.guard) & (dyaw < self._yaw_limit[:count] + cell.yaw_limit)
+        if self._goal_nodes:
+            mask[list(self._goal_nodes)] = False
+        neighbors = np.flatnonzero(mask)
+        neighbors = neighbors[np.argsort(distances[neighbors], kind="stable")][:self.frontier_config.max_parent_candidates]
+        return neighbors, distances
 
     # -- Tube-RRT* steps ------------------------------------------------------------------------------------
     def _nearest(self, sample: Pose2D, sample_cell: PolyhedralCell) -> tuple[int, np.ndarray, float, float] | None:
-        """``(i*, u, D, l_i(u))`` of the capturing node, or ``None`` when every node coincides with the sample."""
+        """``(i*, u, D, l_i(u))`` of the capturing node, or ``None`` when every node coincides with the sample.
+
+        Every cell holds the d_G ball of radius ``a_i`` around its seed and lies in the one of radius ``r_g,i``,
+        so ``D_i - r_g,i - r_g,rand <= g_i <= D_i - a_i - a_rand``.  The exact gap is evaluated only for nodes
+        whose lower bound does not exceed the smallest upper bound: the result is the exact ``argmin g_i``
+        (ties to the lowest index)."""
         count = len(self._nodes)
-        nodes = np.arange(count)
-        u, length = self._directions(nodes, sample)
+        dx, dy = sample.x - self._x[:count], sample.y - self._y[:count]
+        dyaw = wrap_array(sample.yaw - self._yaw[:count])
+        length = np.hypot(dx, dy) + self.formation_radius * np.abs(dyaw)
         blocked = length < self.config.min_metric_step
         if self._goal_nodes:
             blocked[list(self._goal_nodes)] = True
-        if np.all(blocked):
+        masked = np.where(blocked, math.inf, length)
+        point = int(np.argmin(masked))
+        if not math.isfinite(masked[point]):
             return None
-        point = int(np.argmin(np.where(blocked, math.inf, length)))
         if self.tube_config.nearest == "point":
-            best = point
-            forward = float(self._node_extents(np.array([best]), u[best:best + 1])[0])
+            candidates = np.array([point])
         else:
-            forward_all = self._node_extents(nodes, u)
-            backward = self._cell_extents(sample_cell, -u) if sample_cell.valid else 0.0
-            gap = length - forward_all - backward
-            best = int(np.argmin(np.where(blocked, math.inf, gap)))
-            forward = float(forward_all[best])
-            self._stats["gap_negative"] += int(gap[best] <= 0.0)
+            valid = sample_cell.valid
+            upper = float(np.min(masked - self._inner[:count])) - (self._inner_radius(sample_cell) if valid else 0.0)
+            candidates = np.flatnonzero(masked - self._guard[:count] - (sample_cell.guard if valid else 0.0) <= upper)
+        self._stats["nearest_exact"] += len(candidates)
+        u = np.column_stack((dx[candidates], dy[candidates], dyaw[candidates])) / length[candidates, None]
+        forward = self._node_extents(candidates, u)
+        gap = length[candidates] - forward
+        if sample_cell.valid and self.tube_config.nearest == "gap":
+            gap = gap - self._cell_extents(sample_cell, -u)
+        k = int(np.argmin(gap))
+        best = int(candidates[k])
+        if self.tube_config.nearest == "gap":
+            self._stats["gap_negative"] += int(gap[k] <= 0.0)
         self._stats["nearest_differs"] += int(best != point)
-        return best, u[best], float(length[best]), forward
+        return best, u[k], float(length[best]), float(forward[k])
 
     def _tube_steer(self, parent: int, u: np.ndarray, length: float, forward: float,
                     sample_cell: PolyhedralCell) -> tuple[Pose2D, PolyhedralCell, PortalCertificate | None, int, str]:
@@ -244,12 +342,14 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         super()._reset()
         self.edge_kind: dict[int, str] = {}
         self._row_e = np.zeros(len(self._row_offset))
+        self._inner = np.zeros(len(self._x))
+        self._py_rows: list[tuple[tuple[float, float, float], ...]] = []
         self._stats = {"samples_colliding": 0, "gap_negative": 0, "nearest_differs": 0, "steer_cells": 0,
                        "steer_first_try": 0, "rejected_no_progress": 0, "rejected_collision": 0,
                        "rejected_no_overlap": 0, "parent_witness": 0, "near_improved": 0, "rewires": 0,
-                       "portal_radius_sum": 0.0}
+                       "portal_radius_sum": 0.0, "nearest_exact": 0}
         for kind in ("near", "rewire"):
-            for key in ("witness", "center_witness", "exact_calls", "exact_accept", "skipped_bound"):
+            for key in ("witness", "separated", "center_witness", "exact_calls", "exact_accept", "skipped_bound"):
                 self._stats[f"{kind}_{key}"] = 0
 
     def _deep_point(self, cell: PolyhedralCell) -> np.ndarray:
@@ -276,12 +376,15 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         portal = Pose2D(float(points[best, 0]), float(points[best, 1]), wrap_to_pi(float(points[best, 2])))
         return self.cells._certificate(first, second, portal, float(slack[best]))
 
-    def _connect(self, candidate: int, cell: PolyhedralCell, witness: PortalCertificate | None,
+    def _connect(self, candidate: int, cell: PolyhedralCell, witness: PortalCertificate | None, separated: bool,
                  kind: str) -> tuple[PortalCertificate | None, str]:
         """Certificate of the pair and how it was found: ``line`` / ``center`` witness or ``exact`` LP / SOCP."""
         if witness is not None:
             self._stats[f"{kind}_witness"] += 1
             return witness, "line"
+        if separated:
+            self._stats[f"{kind}_separated"] += 1
+            return None, ""
         first, second = (self._nodes[candidate].cell, cell) if kind == "near" else (cell, self._nodes[candidate].cell)
         witness = self._center_witness(first, second)
         if witness is not None:
@@ -347,17 +450,23 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             parent_certificate, parent_kind = certificate, "steer"
             parent_cost = self._nodes[parent].cost + self.edge_cost(self._nodes[parent], new_node, certificate)
 
-            neighbors, _ = self._neighbors(cell)
+            neighbors, distances = self._neighbors(cell)
             neighbors = neighbors[neighbors != parent]
-            witnesses, lengths = self._witnesses(neighbors, cell) if len(neighbors) else ([], np.empty(0))
+            lengths = distances[neighbors]
             bounds = self._cost[neighbors] + lengths
-            order = np.argsort(bounds, kind="stable").tolist()
-            for position, k in enumerate(order):
+            order = np.argsort(bounds, kind="stable")
+            tested = order[bounds[order] < parent_cost]
+            self._stats["near_skipped_bound"] += len(order) - len(tested)
+            pairs: dict[int, tuple[PortalCertificate | None, bool]] = {}
+            if len(tested):
+                found, separated = self._witnesses(neighbors[tested], cell)
+                pairs.update((int(neighbors[k]), (w, bool(sep))) for k, w, sep in zip(tested, found, separated))
+            for position, k in enumerate(tested.tolist()):
                 if bounds[k] >= parent_cost:
-                    self._stats["near_skipped_bound"] += len(order) - position
+                    self._stats["near_skipped_bound"] += len(tested) - position
                     break
                 candidate = int(neighbors[k])
-                certificate, how = self._connect(candidate, cell, witnesses[k], "near")
+                certificate, how = self._connect(candidate, cell, *pairs[candidate], "near")
                 if certificate is None:
                     continue
                 cost = self._nodes[candidate].cost + self.edge_cost(self._nodes[candidate], new_node, certificate)
@@ -379,14 +488,19 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
                                        "portal_radius": parent_certificate.slack, "active_pairs": cell.active_count,
                                        "broadphase_pairs": cell.broadphase_pairs, "yaw_limit": cell.yaw_limit})
 
-            for k in range(len(neighbors)):
+            rewire = (neighbors != 0) & (neighbors != parent)
+            improving = rewire & (parent_cost + lengths < self._cost[neighbors])
+            self._stats["rewire_skipped_bound"] += int(np.count_nonzero(rewire & ~improving))
+            missing = [k for k in np.flatnonzero(improving).tolist() if int(neighbors[k]) not in pairs]
+            if missing:
+                found, separated = self._witnesses(neighbors[missing], cell)
+                pairs.update((int(neighbors[k]), (w, bool(sep))) for k, w, sep in zip(missing, found, separated))
+            for k in np.flatnonzero(improving).tolist():
                 candidate = int(neighbors[k])
-                if candidate == 0 or candidate == parent:
-                    continue
                 if parent_cost + lengths[k] >= self._nodes[candidate].cost:
                     self._stats["rewire_skipped_bound"] += 1
                     continue
-                certificate, how = self._connect(candidate, cell, witnesses[k], "rewire")
+                certificate, how = self._connect(candidate, cell, *pairs[candidate], "rewire")
                 if certificate is None:
                     continue
                 cost = parent_cost + self.edge_cost(new_node, self._nodes[candidate], certificate)
