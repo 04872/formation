@@ -118,6 +118,7 @@ class PolyhedralCell:
     broadphase_pairs: int = 0
     outer_normals: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))
     outer_offsets: np.ndarray = field(default_factory=lambda: np.empty(0))
+    outer_robots: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
     """Unpruned rows of every pair with ``d - d_s < r_g + outer_reach`` (including inactive ones).
 
     Not part of the certificate: they tell which part of the guard boundary faces a known obstacle and keep
@@ -233,7 +234,8 @@ class PolyhedralCellModel:
                               normals=normals[robots[rows], components[rows]].reshape((-1, 2)),
                               offsets=offsets, pairs=tuple(zip(robots[rows].tolist(), components[rows].tolist())),
                               guard=guard, yaw_limit=0.0, rho=self.rho, broadphase_pairs=len(robots),
-                              outer_normals=normals[outer].reshape((-1, 2)), outer_offsets=clearance[outer] - d_s)
+                              outer_normals=normals[outer].reshape((-1, 2)), outer_offsets=clearance[outer] - d_s,
+                              outer_robots=np.nonzero(outer)[0])
         if cell.radius > 0.0:
             cell.center_offset, cell.inradius = self._inscribed_circle(cell)
             cell.yaw_limit = min(self.yaw_chart, cell.inradius / self.rho)
@@ -344,6 +346,78 @@ class PolyhedralCellModel:
         turn = cell.rho * np.abs(wrap_array(points[:, 2] - cell.pose.yaw))
         rows = normals @ (points[:, :2] - (cell.pose.x, cell.pose.y)).T + offsets[:, None]
         return rows.min(axis=0) - turn
+
+    def rotation_margin(self, cell: PolyhedralCell, points: np.ndarray) -> np.ndarray:
+        """Exact half-space margin ``min_k n_k^T (dc + (R(dtheta) - I) R_0 s_{i_k}) + e_k`` over the outer rows.
+
+        Unlike the rows' ``-rho |dtheta|`` bound it tells which rotation sense relaxes a facet; it is still a
+        global lower bound on ``clearance - d_s`` of each listed pair (``inf`` without outer rows).
+        """
+        points = np.asarray(points, dtype=float).reshape((-1, 3))
+        if not len(cell.outer_offsets):
+            return np.full(len(points), math.inf)
+        c0, s0 = math.cos(cell.pose.yaw), math.sin(cell.pose.yaw)
+        arms = self.slots[cell.outer_robots] @ np.array(((c0, s0), (-s0, c0)))
+        phi = wrap_array(points[:, 2] - cell.pose.yaw)
+        cos, sin = np.cos(phi)[:, None], np.sin(phi)[:, None]
+        shift_x = (cos - 1.0) * arms[None, :, 0] - sin * arms[None, :, 1]
+        shift_y = sin * arms[None, :, 0] + (cos - 1.0) * arms[None, :, 1]
+        dc = points[:, :2] - (cell.pose.x, cell.pose.y)
+        values = (cell.outer_normals[None, :, 0] * (dc[:, 0:1] + shift_x)
+                  + cell.outer_normals[None, :, 1] * (dc[:, 1:2] + shift_y) + cell.outer_offsets[None, :])
+        return values.min(axis=1)
+
+    @staticmethod
+    def frontier_pieces(cell: PolyhedralCell, max_arc: float = math.pi / 4.0) -> list[dict]:
+        """Frontier pieces of the section ``S_0``: guard arcs (split into chunks of at most ``max_arc``) and
+        obstacle facets.  Each piece has a representative boundary point (chart ``dc``), the outward normal,
+        a unit tangent, its length and, for facets, the row index.
+        """
+        polygon, labels = PolyhedralCellModel.slice_polygon(cell, 0.0)
+        if not len(polygon):
+            return []
+        local = polygon - (cell.pose.x, cell.pose.y)
+        pieces: list[dict] = []
+        count = len(labels)
+        for k in range(count):
+            label = int(labels[k])
+            if label < 0:
+                continue
+            a, b = local[k], local[(k + 1) % count]
+            length = float(np.linalg.norm(b - a))
+            if length <= 1e-9:
+                continue
+            normal = cell.normals[label]
+            pieces.append({"kind": "obstacle", "point": 0.5 * (a + b), "outward": -normal,
+                           "tangent": np.array((-normal[1], normal[0])), "length": length, "row": label})
+        guard = labels < 0
+        if not np.any(guard):
+            return pieces
+        start = int(np.argmin(guard)) if not np.all(guard) else 0
+        runs, current = [], []
+        for step in range(count):
+            k = (start + step) % count
+            if guard[k]:
+                current.append(k)
+            elif current:
+                runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        for run in runs:
+            first, last = local[run[0]], local[(run[-1] + 1) % count]
+            begin = math.atan2(first[1], first[0])
+            sweep = (math.atan2(last[1], last[0]) - begin) % (2.0 * math.pi)
+            if len(run) == count:
+                sweep = 2.0 * math.pi
+            chunks = max(1, int(math.ceil(sweep / max_arc - 1e-9)))
+            for j in range(chunks):
+                angle = begin + (j + 0.5) * sweep / chunks
+                radial = np.array((math.cos(angle), math.sin(angle)))
+                pieces.append({"kind": "guard", "point": cell.guard * radial, "outward": radial,
+                               "tangent": np.array((-radial[1], radial[0])), "length": cell.guard * sweep / chunks,
+                               "row": -1})
+        return pieces
 
     # -- directional extensibility -------------------------------------------------------------------
     def translational_extent(self, cell: PolyhedralCell, directions: np.ndarray,

@@ -49,7 +49,7 @@ from formation import (
     transform_slots,
 )
 from formation.tube_rrt import interpolate_pose
-from formation.tube_rrt_frontier import FRONTIER_GUARD
+from formation.tube_rrt_frontier import FRONTIER_GUARD, FRONTIER_OBSTACLE
 from formation.types import wrap_to_pi
 
 TREE_CMAP = colormaps["viridis"]
@@ -65,9 +65,9 @@ CELL_DESCRIPTIONS = {
     "polyhedral": "polyhedral cell + region/uniform 混合 RRT*：两级 active pair（broadphase d < d_active，再只留真正"
                   "边界行、近平行只留更紧者）的支撑平面 n^T dc - rho|dtheta| >= -(d - d_s)，validity guard "
                   "||dc|| + rho|dtheta| <= r_g 作为谓词，yaw 区间由约束决定（<= pi/2 chart）；每次迭代以 p_region "
-                  "从 expandable frontier（guard 边界 / yaw chart 截断面，obstacle-limited 边界不向外扩展）按 "
-                  "S = alpha l + beta U + gamma G 选点，沿 w_n u_out + w_t u_tan + w_g u_goal 略微越过边界放 seed，"
-                  "否则 uniform SE(2) 采样；每次迭代只构造 1 个 cell",
+                  "从 S_0 的 frontier 几何直接生成的常数个扩展中按 S = alpha l + beta U + gamma G 选一个（guard 弧沿外法向，"
+                  "obstacle facet 沿两个切向、不沿违反约束的法向；dtheta 取 {-s, 0, +s} 中障碍裕度最大者），"
+                  "q_new 在跨出当前 cell 一小段处，否则 uniform SE(2) 采样；每次迭代只构造 1 个 cell",
     "orientation": "orientation-sliced cell：按 yaw 切片的 guarded clearance 下包络，公共 yaw witness + portal 认证（原实现）",
     "first_order": "一阶近似 cell：max_i ||u + J a_i phi|| < rho_k，rho_k = eta d_obs；overlap 用同 chart 位似判据的推广 "
                    "rho_a/n_a + rho_b/n_b > 1（portal 在两节点连线上）",
@@ -90,11 +90,10 @@ FIGURE_FILES = {
     "frames": ("5_formation_frames.png", "关键帧放大：障碍夹在机器人之间（或瓶颈）附近的连续 tube 节点；每个子图以"
                                          "“上一节点 + 当前节点”为中心、比例尺相同，虚线为上一节点姿态，黑箭头为中心位移"),
     "convergence": ("6_convergence.png", "最优路径代价随迭代下降曲线，以及节点 / 拒绝 / rewire 累计数"),
-    "frontier": ("7_frontier.png", "（仅 polyhedral）certified union：全部 cell 的节点 yaw 截面；灰点 = obstacle-limited "
-                                   "边界（active 障碍行起作用，不向外采样），彩色点 = 仍 exposed 的 expandable 候选（圆 = "
-                                   "validity guard 边界，三角 = yaw chart 截断面，颜色 = 采样分数 S），绿线 = region 扩展 "
-                                   "b -> q_new；新 cell 的 rho_new / rho_overlap 分布；region 与 uniform 两个采样通道的"
-                                   "累计接受节点数及 p_region 调度（虚线）"),
+    "frontier": ("7_frontier.png", "（仅 polyhedral）certified union：全部 cell 的节点 yaw 截面；实线 = 已采用的 region "
+                                   "扩展 b -> q_new（蓝 = guard 弧沿外法向，橙 = obstacle facet 沿切向），点线 = 仍 live 的扩展，"
+                                   "空心标记 = live q_new 的 yaw 变化（▲ +，● 0，▼ −）；新 cell 的 rho_new / rho_overlap 分布；"
+                                   "region 与 uniform 两个采样通道的累计接受节点数及 p_region 调度（虚线）"),
     "tube3d": ("8_tube_3d.png", "（仅 polyhedral）路径 cell 在 (x, y, theta) 中的三维实体，两个视角：每个 cell 是 S_0 被 "
                                 "rho|dtheta| 腐蚀后堆起来的双锥体（yaw chart 截断时有平顶），底面为障碍投影，红线为认证路线"),
 }
@@ -812,33 +811,33 @@ def draw_frontier(figure, result: TubeRRTResult, map_data, planner: PolyhedralFr
     axis.add_collection(PolyCollection(polygons, facecolors="tab:cyan", edgecolors="0.45", linewidths=0.3, alpha=0.1,
                                        zorder=3))
     snapshot = planner.frontier_snapshot()
-    blocked = snapshot["obstacle_limited_exposed"]
-    axis.scatter(blocked[:, 0], blocked[:, 1], s=4, color="0.3", zorder=5, linewidth=0,
-                 label=f"obstacle-limited boundary still exposed (sampled; {snapshot['obstacle_limited_total']} "
-                       "fan points in total, never expanded outward)")
     log = planner.expansion_log
-    region = [e for e in log if e["mode"] == "region" and e["frontier_point"] is not None]
-    if region:
-        nodes = result.tree_nodes
-        axis.add_collection(LineCollection([(e["frontier_point"][:2], (nodes[e["node"]].pose.x, nodes[e["node"]].pose.y))
-                                            for e in region], colors="tab:green", linewidths=1.2, zorder=6))
-        axis.scatter([nodes[e["node"]].pose.x for e in region], [nodes[e["node"]].pose.y for e in region], s=6,
-                     color="tab:green", zorder=6, label=f"region expansion b -> q_new ({len(region)} cells)")
+    nodes = result.tree_nodes
+    kind_styles = ((FRONTIER_GUARD, "tab:blue", "guard arc: along outward normal"),
+                   (FRONTIER_OBSTACLE, "tab:orange", "obstacle facet: along facet tangent"))
+    for kind, color, name in kind_styles:
+        region = [e for e in log if e["mode"] == "region" and e["frontier_kind"] == kind]
+        if region:
+            axis.add_collection(LineCollection([(e["frontier_point"][:2], (nodes[e["node"]].pose.x, nodes[e["node"]].pose.y))
+                                                for e in region], colors=color, linewidths=1.1, zorder=6))
+            axis.scatter([nodes[e["node"]].pose.x for e in region], [nodes[e["node"]].pose.y for e in region], s=7,
+                         color=color, zorder=6, label=f"region expansion b -> q_new, {name} ({len(region)} cells)")
+        live = snapshot["kind"] == kind
+        if np.any(live):
+            axis.add_collection(LineCollection(np.stack((snapshot["anchors"][live, :2], snapshot["points"][live, :2]),
+                                                        axis=1), colors=color, linewidths=0.6, alpha=0.5,
+                                               linestyles=":", zorder=5))
     if len(snapshot["points"]):
-        order = np.argsort(snapshot["score"])
-        points, score, kind = snapshot["points"][order], snapshot["score"][order], snapshot["kind"][order]
-        guard = kind == FRONTIER_GUARD
-        scatter = axis.scatter(points[guard, 0], points[guard, 1], c=score[guard], cmap="magma", s=7, zorder=7,
-                               linewidth=0, label="expandable: validity-guard boundary (live)")
-        if np.any(~guard):
-            axis.scatter(points[~guard, 0], points[~guard, 1], c=score[~guard], cmap="magma", marker="^", s=22,
-                         zorder=7, edgecolor="k", linewidth=0.3, norm=scatter.norm,
-                         label="expandable: yaw-chart cap (live)")
-        figure.colorbar(scatter, ax=axis, fraction=0.03, pad=0.01).set_label("frontier score S")
+        for sign, marker, name in ((1.0, "^", "+"), (0.0, "o", "0"), (-1.0, "v", "-")):
+            chosen = np.sign(np.round(snapshot["dtheta"], 12)) == sign
+            if np.any(chosen):
+                axis.scatter(snapshot["points"][chosen, 0], snapshot["points"][chosen, 1], marker=marker, s=12,
+                             facecolor="none", edgecolor="k", linewidth=0.5, zorder=7,
+                             label=f"live q_new, dtheta {name} ({int(chosen.sum())})")
     draw_path(axis, result.path_poses, nodes=False)
     axis.legend(fontsize=7, loc="upper left", framealpha=0.85)
     axis.set_title(f"certified union: {len(polygons)} cells (node-yaw sections), "
-                   f"{len(snapshot['points'])} live expandable candidates", fontsize=10)
+                   f"{len(snapshot['points'])} live expansions (dotted b -> q_new)", fontsize=10)
 
     ratio_axis = figure.add_subplot(grid[0, 1])
     if log:
@@ -1335,11 +1334,14 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
             f"| 采样通道 region / uniform：迭代数（region 无候选回退） | {overlap['region_iterations']} / "
             f"{overlap['uniform_iterations']}（{overlap['region_fallback']}） |",
             f"| 采样通道 region / uniform：接受节点数 | {overlap['region_nodes']} / {overlap['uniform_nodes']} |",
-            f"| expandable frontier 候选：生成 / 被覆盖 / 多次失败丢弃 / 结束时仍 exposed | {overlap['frontier_candidates']} / "
+            f"| 扩展方向：guard 弧 / obstacle facet 切向（每个 cell 平均） | {overlap['frontier_guard_directions']} / "
+            f"{overlap['frontier_obstacle_directions']}（"
+            f"{(overlap['frontier_guard_directions'] + overlap['frontier_obstacle_directions']) / max(overlap['cells_built'], 1):.1f}） |",
+            f"| 扩展方向被拒：障碍裕度 ≤ 0 / 超出 r_g + outer_reach / 仍在原 cell 内 / 出界 / 已被覆盖 | "
+            f"{overlap['frontier_reject_obstacle']} / {overlap['frontier_reject_far']} / {overlap['frontier_reject_inside']} / "
+            f"{overlap['frontier_reject_bounds']} / {overlap['frontier_reject_covered']} |",
+            f"| 保留的扩展：生成 / 被后续 cell 覆盖 / 采样后被拒丢弃 / 结束时仍 live | {overlap['frontier_candidates']} / "
             f"{overlap['frontier_covered']} / {overlap['frontier_dropped']} / {overlap['frontier_alive']} |",
-            f"| obstacle-limited 边界点（只记录，不向外采样） | {overlap['frontier_obstacle_limited']} |",
-            f"| region seed 被拒：仍在原 cell 内 / 越过障碍行 / 出界 / 已被覆盖 | {overlap['region_reject_inside']} / "
-            f"{overlap['region_reject_obstacle']} / {overlap['region_reject_bounds']} / {overlap['region_reject_covered']} |",
             f"| 被拒绝：新 cell 无效（seed clearance ≤ d_s） | {overlap['rejected_collision']} |",
             f"| 每个 cell 平均：broadphase pair / 边界 active row | "
             f"{overlap['broadphase_pairs'] / max(overlap['cells_built'], 1):.2f} / "
@@ -1530,11 +1532,17 @@ def main() -> None:
     parser.add_argument("--score-weights", type=float, nargs=3, metavar=("ALPHA", "BETA", "GAMMA"),
                         default=FrontierConfig.score_weights,
                         help="polyhedral only: S = alpha l + beta U + gamma G")
-    parser.add_argument("--direction-weights", type=float, nargs=3, metavar=("W_N", "W_T", "W_G"),
-                        default=FrontierConfig.direction_weights,
-                        help="polyhedral only: region seed direction u ~ w_n u_out + w_t u_tan + w_g u_goal")
+    parser.add_argument("--guard-weights", type=float, nargs=3, metavar=("W_T", "W_G", "W_N"),
+                        default=FrontierConfig.guard_weights,
+                        help="polyhedral only: guard arcs expand along normalize(w_t u_tan + w_g u_goal + w_n u_out)")
+    parser.add_argument("--obstacle-weights", type=float, nargs=3, metavar=("W_T", "W_G", "W_N"),
+                        default=FrontierConfig.obstacle_weights,
+                        help="polyhedral only: obstacle facets slide along normalize(w_t (+-u_tan) + w_g u_goal_safe "
+                             "+ w_n n)")
+    parser.add_argument("--yaw-step", type=float, default=FrontierConfig.yaw_step,
+                        help="polyhedral only: an expansion turns by one of {-s, 0, +s} (largest obstacle margin)")
     parser.add_argument("--sample-offset", type=float, default=FrontierConfig.sample_offset,
-                        help="polyhedral only: delta, how far (d_G) region seeds go beyond the certificate boundary")
+                        help="polyhedral only: delta [m], how far region seeds go beyond the exit from the cell")
     parser.add_argument("--yaw-slices", type=int, default=16,
                         help="equal yaw slices used to build each analytic safe cell")
     parser.add_argument("--cell-shrink", type=float, default=0.98,
@@ -1569,9 +1577,9 @@ def main() -> None:
                                              region_min=args.region_min, region_decay=args.region_decay,
                                              safety_distance=args.safety_distance, active_range=args.active_range,
                                              score_weights=tuple(args.score_weights),
-                                             direction_weights=tuple(args.direction_weights),
-                                             sample_offset=args.sample_offset,
-                                             min_sample_offset=min(FrontierConfig.min_sample_offset, args.sample_offset))
+                                             guard_weights=tuple(args.guard_weights),
+                                             obstacle_weights=tuple(args.obstacle_weights),
+                                             yaw_step=args.yaw_step, sample_offset=args.sample_offset)
         except ValueError as error:
             parser.error(str(error))
 

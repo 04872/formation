@@ -7,21 +7,27 @@ of biased samples.  Every iteration picks one sampling mode with ``xi ~ U(0, 1)`
   ``d_G`` -> steer by at most ``metric_step`` and at most ``steer_fraction`` of the way to the
   boundary of the nearest cell -> ``q_new``.  This channel provides global randomness, densification
   near the path, rewiring and anytime improvement.
-* ``xi < p_region`` (region-guided): pick an *expandable* frontier point ``b`` of an existing cell,
-  draw a direction ``u ~ w_n u_out + w_t u_tan + w_g u_goal`` and take ``q_new = b + delta u`` just
-  beyond the certificate boundary; the new cell is built there and must add at least
-  ``min_new_ratio`` of uncovered volume.
+* ``xi < p_region`` (region-guided): pick one precomputed expansion of an existing cell's exposed
+  frontier and use its ``q_new``; the new cell is built there and must add at least ``min_new_ratio``
+  of uncovered volume.
 
-Frontier points are sorted by the constraint that bounds the cell there:
+Expansions come straight from the frontier geometry of the section ``S_0`` of each new cell, a constant
+number per frontier piece, without enumerating ``(u, dtheta)``:
 
-* obstacle-limited: an active row ``n^T dc - rho |dtheta| >= -(d - d_s)`` binds.  Its supporting
-  half-space bounds that robot-obstacle clearance everywhere, so beyond it lies a known restricted
-  region; such points are only recorded, never sampled outward.
-* expandable: the validity guard ``||dc|| + rho |dtheta| <= r_g`` binds (only inactive, far pairs limit
-  the certificate there), or the yaw chart ``|dtheta| <= pi/2`` caps the cell.  ``u_out`` is the outward
-  normal in ``(x, y, rho theta)``, ``u_tan`` a random unit tangent, ``u_goal`` the planar goal direction.
-  ``u`` keeps at least ``min_outward`` along ``u_out``; ``q_new`` must leave the current cell, stay
-  inside its directional part ``C_dir`` (never crossing an obstacle row) and be uncovered by other cells.
+* guard arc (only far, inactive pairs limit the certificate there; arcs are split into chunks of at most
+  ``max_arc``): one direction ``normalize(w_t u_tan + w_g u_goal + w_n u_out)`` with the tangent sense
+  towards the goal;
+* obstacle facet (an active row ``n^T dc - rho |dtheta| >= -(d - d_s)`` binds): never along the violating
+  outward normal ``-n``; two directions ``normalize(w_t (+-u_tan) + w_g u_goal_safe + w_n n)`` that slide
+  along the facet, with ``u_goal_safe`` the goal direction without its component into the obstacle.
+
+From the representative point ``b`` the direction is followed until it leaves ``S_0`` and then
+``sample_offset`` further, so ``q_new`` is just outside the current certificate.  The yaw change is one of
+``{-yaw_step, 0, +yaw_step}``, the one with the largest exact half-space margin
+``min_k n_k^T (dc + (R(dtheta) - I) R_0 s_k) + e_k`` of all pairs near the cell (``outer_reach``).  An
+expansion is kept only if that margin is positive (so ``q_new`` never enters a known restricted region
+and its cell is valid), ``q_new`` stays within ``r_g + outer_reach`` (d_G) of the cell, in the map, and
+uncovered by other cells.
 
 Only the accepted ``q_new`` gets a cell, so one iteration builds at most one cell.  The new cell must
 overlap the source cell or another neighbour; parents are re-chosen among overlapping neighbours and
@@ -29,10 +35,10 @@ neighbours are rewired.  A goal node is added when the goal pose lies inside the
 that cell).  Consecutive path nodes are joined by ``q_a -> q_p -> q_b`` with ``q_p`` strictly inside
 both convex cells, so the route is certified collision free with clearance ``>= d_s``.
 
-Expandable candidates sit on a fan of directions on a few yaw slices plus the two yaw caps; candidates
-covered by another cell are not on ``F_i = dC_i minus cup_{j != i} C_j`` and are dropped.  The score is
-``S = alpha min(l / l_ref, 1) + beta U + gamma (G + 1) / 2`` with ``U`` the share of probes along
-``u_out`` outside the union and ``G`` the goal progress per unit length.  No distance query is spent on it.
+Expansions whose ``q_new`` gets covered by a later cell are dropped.  The score is
+``S = alpha min(l / l_ref, 1) + beta U + gamma (G + 1) / 2`` with ``l`` the piece length, ``U`` the share of
+probes beyond ``q_new`` outside the union and ``G`` the goal progress per unit length.  No distance query is
+spent on it.
 """
 from __future__ import annotations
 
@@ -62,7 +68,7 @@ class FrontierConfig:
     yaw_chart: float = math.pi / 2.0
     cell_samples: int = 128
     outer_reach: float = 0.5
-    """Pairs with ``d - d_s < r_g + outer_reach`` classify the guard boundary and validate seeds beyond it."""
+    """Pairs with ``d - d_s < r_g + outer_reach`` choose the yaw change and validate seeds beyond the cell."""
     region_schedule: str = "switch"
     """``switch``: ``region_before`` until the first solution, then ``region_after``; ``constant``:
     ``region_probability``; ``exp``: ``region_min + (region_max - region_min) exp(-region_decay t)``."""
@@ -72,34 +78,26 @@ class FrontierConfig:
     region_max: float = 0.5
     region_min: float = 0.2
     region_decay: float = 0.002
-    yaw_slice_fractions: tuple[float, ...] = (0.0, -0.45, 0.45, -0.85, 0.85)
-    frontier_directions: int = 16
+    max_arc: float = math.pi / 4.0
+    """Guard arcs longer than this are split so each chunk has one outward direction."""
+    guard_weights: tuple[float, float, float] = (0.3, 0.5, 1.0)
+    """``(w_t, w_g, w_n)`` on guard arcs (``u_safe`` = outward normal)."""
+    obstacle_weights: tuple[float, float, float] = (1.0, 0.3, 0.2)
+    """``(w_t, w_g, w_n)`` on obstacle facets (``u_safe`` = facet normal pointing away from the obstacle)."""
+    yaw_step: float = 0.15
+    """``dtheta`` of an expansion is one of ``{-yaw_step, 0, +yaw_step}``."""
+    sample_offset: float = 0.1
+    """``delta`` [m]: how far beyond the exit point of the current section ``q_new`` is placed."""
     probe_step: float = 0.25
     probe_count: int = 3
-    yaw_caps: bool = True
-    """Also expand through the yaw caps ``|dtheta| = pi/2`` when the chart, not the rows, truncates a cell."""
     score_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
     """``(alpha, beta, gamma)`` of ``S = alpha l + beta U + gamma G``."""
     score_temperature: float = 0.15
     length_ref: float = 1.0
-    direction_weights: tuple[float, float, float] = (1.0, 0.5, 0.5)
-    """``(w_n, w_t, w_g)`` of ``u ~ w_n u_out + w_t u_tan + w_g u_goal``."""
-    min_outward: float = 0.3
-    """Lower bound on ``u^T u_out`` so the sample always leaves the certificate."""
-    sample_offset: float = 0.1
-    """``delta`` [d_G]: how far beyond the boundary point the new seed is placed (at most)."""
-    min_sample_offset: float = 0.02
-    """Guard points whose known-obstacle room (outer-row slack) is below this are obstacle-limited; elsewhere
-    the step is ``min(delta, 0.9 room)`` so the seed never crosses a known obstacle half-space."""
-    sample_attempts: int = 4
-    """Directions tried per picked candidate before counting a failure."""
-    candidate_picks: int = 3
-    """Candidates tried per region iteration before falling back to a uniform sample."""
     steer_fraction: float = 0.9
     min_new_ratio: float = 0.05
     overlap_band: tuple[float, float] = (0.1, 0.5)
     """Reference band of ``rho_overlap`` (reported, not enforced)."""
-    max_candidate_failures: int = 3
     max_parent_candidates: int = 12
 
     def __post_init__(self) -> None:
@@ -111,14 +109,12 @@ class FrontierConfig:
         low, high = self.overlap_band
         if not 0.0 <= low < high <= 1.0:
             raise ValueError("overlap_band must satisfy 0 <= rho_min < rho_max <= 1")
-        if self.score_temperature <= 0.0 or not 0.0 < self.steer_fraction < 1.0 or self.frontier_directions < 3:
-            raise ValueError("score_temperature > 0, steer_fraction in (0, 1) and frontier_directions >= 3 are required")
-        if not 0.0 < self.min_outward < 1.0 or not 0.0 < self.min_sample_offset <= self.sample_offset:
-            raise ValueError("min_outward in (0, 1) and 0 < min_sample_offset <= sample_offset are required")
-        if self.direction_weights[0] <= 0.0:
-            raise ValueError("w_n must be positive")
-        if self.sample_attempts < 1 or self.candidate_picks < 1:
-            raise ValueError("sample_attempts and candidate_picks must be positive")
+        if self.score_temperature <= 0.0 or not 0.0 < self.steer_fraction < 1.0:
+            raise ValueError("score_temperature > 0 and steer_fraction in (0, 1) are required")
+        if self.sample_offset <= 0.0 or self.yaw_step < 0.0 or not 0.0 < self.max_arc <= math.pi:
+            raise ValueError("sample_offset > 0, yaw_step >= 0 and max_arc in (0, pi] are required")
+        if self.guard_weights[2] <= 0.0 or self.obstacle_weights[0] <= 0.0:
+            raise ValueError("guard w_n and obstacle w_t must be positive")
 
     def region_probability_at(self, iteration: int, solved: bool) -> float:
         if self.region_schedule == "constant":
@@ -136,18 +132,19 @@ class FrontierConfig:
                 f"exp(-{self.region_decay:g}t)")
 
 
-FRONTIER_GUARD, FRONTIER_YAW_CAP = 1, 2
+FRONTIER_GUARD, FRONTIER_OBSTACLE = 1, 2
 
 
 class _Frontier:
-    """Expandable candidates of all cells in growable arrays.
+    """Precomputed expansions of all cells in growable arrays.
 
-    ``normals`` is the outward unit normal in ``(x, y, rho theta)``; ``kind`` is ``FRONTIER_GUARD`` or
-    ``FRONTIER_YAW_CAP``.
+    ``anchors`` are the representative frontier points ``b``, ``points`` the seeds ``q_new``, ``directions``
+    the planar unit directions ``u_expand`` and ``dtheta`` the chosen yaw change; ``kind`` is
+    ``FRONTIER_GUARD`` or ``FRONTIER_OBSTACLE``.
     """
 
-    _FIELDS = ("cell", "points", "normals", "dtheta", "length", "progress", "kind", "room", "probes", "probe_open",
-               "alive", "failures", "score")
+    _FIELDS = ("cell", "anchors", "points", "directions", "dtheta", "length", "progress", "kind", "probes",
+               "probe_open", "alive", "score")
 
     def __init__(self, probe_count: int) -> None:
         self.size = 0
@@ -157,17 +154,16 @@ class _Frontier:
     def _allocate(self, capacity: int) -> None:
         old = {name: getattr(self, name) for name in self._FIELDS} if self.size else None
         self.cell = np.zeros(capacity, dtype=int)
+        self.anchors = np.zeros((capacity, 3))
         self.points = np.zeros((capacity, 3))
-        self.normals = np.zeros((capacity, 3))
+        self.directions = np.zeros((capacity, 2))
         self.dtheta = np.zeros(capacity)
         self.length = np.zeros(capacity)
         self.progress = np.zeros(capacity)
         self.kind = np.zeros(capacity, dtype=int)
-        self.room = np.zeros(capacity)
         self.probes = np.zeros((capacity, self.probe_count, 3))
         self.probe_open = np.zeros((capacity, self.probe_count), dtype=bool)
         self.alive = np.zeros(capacity, dtype=bool)
-        self.failures = np.zeros(capacity, dtype=int)
         self.score = np.zeros(capacity)
         if old is not None:
             for name in self._FIELDS:
@@ -210,8 +206,6 @@ class PolyhedralFrontierPlanner:
         self._upper = self._origin + (float(map_data.width_m), float(map_data.height_m))
         self._circle_centers = self.cells.circle_centers
         self._circle_radii = self.cells.circle_radii
-        angles = 2.0 * math.pi * (np.arange(f.frontier_directions) + 0.5) / f.frontier_directions
-        self._fan = np.column_stack((np.cos(angles), np.sin(angles)))
         self.rng = np.random.default_rng(self.config.seed)
         self.frontier = _Frontier(f.probe_count)
         self.expansion_log: list[dict[str, float | int | str]] = []
@@ -328,84 +322,107 @@ class PolyhedralFrontierPlanner:
         f, store = self.frontier_config, self.frontier
         alpha, beta, gamma = f.score_weights
         uncovered = np.mean(store.probe_open[indices], axis=1)
-        score = (alpha * np.minimum(store.length[indices] / f.length_ref, 1.0) + beta * uncovered
-                 + gamma * 0.5 * (store.progress[indices] + 1.0))
-        store.score[indices] = score * 0.5 ** store.failures[indices]
+        store.score[indices] = (alpha * np.minimum(store.length[indices] / f.length_ref, 1.0) + beta * uncovered
+                                + gamma * 0.5 * (store.progress[indices] + 1.0))
 
-    def _move(self, points: np.ndarray, vectors: np.ndarray, distance: np.ndarray | float) -> np.ndarray:
-        """World configurations moved by ``distance`` along chart vectors ``(dx, dy, rho dtheta)``."""
-        distance = np.asarray(distance, dtype=float)[..., None] if np.ndim(distance) else distance
-        moved = points + distance * vectors * (1.0, 1.0, 1.0 / self.formation_radius)
-        moved[..., 2] = wrap_array(moved[..., 2])
-        return moved
+    @staticmethod
+    def _section_exit(cell: PolyhedralCell, anchors: np.ndarray, directions: np.ndarray) -> np.ndarray:
+        """``max{t >= 0 : anchor + t u in S_0}`` for chart anchors on the boundary of ``S_0`` and planar ``u``."""
+        along = np.sum(anchors * directions, axis=1)
+        exits = -along + np.sqrt(np.maximum(along ** 2 - np.sum(anchors ** 2, axis=1) + cell.guard ** 2, 0.0))
+        if len(cell.offsets):
+            rate = -(directions @ cell.normals.T)
+            margin = anchors @ cell.normals.T + cell.offsets[None, :]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                limits = np.where(rate > 1e-12, np.maximum(margin, 0.0) / np.maximum(rate, 1e-300), math.inf)
+            exits = np.minimum(exits, limits.min(axis=1))
+        return np.maximum(exits, 0.0)
 
     def _add_frontier(self, index: int) -> None:
-        """Frontier of cell ``index`` on a direction fan per yaw slice plus the yaw caps.
+        """Expansions of cell ``index``: a constant number per frontier piece of its section ``S_0``.
 
-        Fan points where an obstacle row binds are obstacle-limited and only recorded; guard-bounded
-        points and chart-truncated yaw caps are expandable candidates.
+        Guard arcs expand along ``normalize(w_t u_tan + w_g u_goal + w_n u_out)``; obstacle facets slide
+        along both tangent senses with ``u_safe`` the facet normal away from the obstacle, never along the
+        violating normal.  ``q_new`` is ``sample_offset`` beyond the exit from ``S_0`` with the yaw change in
+        ``{0, +yaw_step, -yaw_step}`` of largest exact margin of the pairs near the cell.
         """
         f, cell = self.frontier_config, self._nodes[index].cell
-        center = cell.pose
-        blocks, blocked = [], []
-        for fraction in f.yaw_slice_fractions:
-            dtheta = fraction * cell.yaw_reach
-            lengths, guard_edges = self.cells.translational_extent(cell, self._fan, dtheta)
-            keep = lengths > 1e-9
-            points = np.column_stack((center.x + lengths * self._fan[:, 0], center.y + lengths * self._fan[:, 1],
-                                      np.full(len(lengths), wrap_to_pi(center.yaw + dtheta))))
-            expand = keep & guard_edges
-            room = np.zeros(len(lengths))
-            if np.any(expand):
-                room[expand] = self.cells.directional_slack(cell, points[expand])
-                expand &= room >= f.min_sample_offset
-            if np.any(keep & ~expand):
-                blocked.append(points[keep & ~expand])
-            if np.any(expand):
-                count = int(expand.sum())
-                normals = np.column_stack((self._fan[expand], np.full(count, np.sign(dtheta))))
-                blocks.append((points[expand], normals / np.linalg.norm(normals, axis=1, keepdims=True),
-                               np.full(count, dtheta), lengths[expand], np.full(count, FRONTIER_GUARD), room[expand]))
-        if f.yaw_caps and cell.yaw_limit < cell.inradius / cell.rho - 1e-9:
-            base = cell.center_offset + (center.x, center.y)
-            for side in (1.0, -1.0):
-                cap = np.array(((base[0], base[1], wrap_to_pi(center.yaw + side * cell.yaw_limit)),))
-                room = self.cells.directional_slack(cell, cap)
-                if room[0] >= f.min_sample_offset:
-                    blocks.append((cap, np.array(((0.0, 0.0, side),)), np.array((side * cell.yaw_limit,)),
-                                   np.array((cell.rho * cell.yaw_limit,)), np.array((FRONTIER_YAW_CAP,)), room))
-        if blocked:
-            self._blocked.append(np.vstack(blocked))
-            self._stats["frontier_obstacle_limited"] += sum(len(b) for b in blocked)
-        if not blocks:
+        center = np.array((cell.pose.x, cell.pose.y))
+        anchors, directions, lengths, kinds = [], [], [], []
+        for piece in self.cells.frontier_pieces(cell, f.max_arc):
+            anchor = piece["point"]
+            goal = np.asarray(self.goal_xy) - center - anchor
+            goal /= max(float(np.linalg.norm(goal)), 1e-12)
+            tangent = piece["tangent"]
+            if piece["kind"] == "guard":
+                w_t, w_g, w_n = f.guard_weights
+                tangent = tangent if tangent @ goal >= 0.0 else -tangent
+                options = [(w_t * tangent + w_g * goal + w_n * piece["outward"], FRONTIER_GUARD)]
+            else:
+                w_t, w_g, w_n = f.obstacle_weights
+                normal = -piece["outward"]
+                safe_goal = goal - min(0.0, float(goal @ normal)) * normal
+                options = [(w_t * sign * tangent + w_g * safe_goal + w_n * normal, FRONTIER_OBSTACLE)
+                           for sign in (1.0, -1.0)]
+            for u, kind in options:
+                anchors.append(anchor)
+                directions.append(u / max(float(np.linalg.norm(u)), 1e-12))
+                lengths.append(piece["length"])
+                kinds.append(kind)
+        if not anchors:
             return
-        world, normals, dthetas, lengths, kinds, rooms = (np.concatenate(parts) for parts in zip(*blocks))
-        reach = cell.guard + f.probe_count * f.probe_step
-        others = self._nearby(center.x, center.y, center.yaw, reach, cell.yaw_limit + reach / cell.rho, exclude=index)
-        exposed = ~self._covered(world, others)
-        if not np.any(exposed):
+        anchors, directions = np.asarray(anchors), np.asarray(directions)
+        lengths, kinds = np.asarray(lengths), np.asarray(kinds)
+        seeds = center + anchors + (self._section_exit(cell, anchors, directions) + f.sample_offset)[:, None] * directions
+        choices = np.array((0.0, f.yaw_step, -f.yaw_step))
+        margins = np.stack([self.cells.rotation_margin(cell, np.column_stack((seeds, np.full(len(seeds), cell.pose.yaw + c))))
+                            for c in choices])
+        best = np.argmax(margins, axis=0)
+        dthetas = choices[best]
+        points = np.column_stack((seeds, wrap_array(cell.pose.yaw + dthetas)))
+        reasons = np.full(len(points), "", dtype=object)
+        reasons[margins[best, np.arange(len(points))] <= 0.0] = "obstacle"
+        reach = np.hypot(seeds[:, 0] - center[0], seeds[:, 1] - center[1]) + cell.rho * np.abs(dthetas)
+        reasons[(reasons == "") & (reach > cell.guard + self.cells.outer_reach)] = "far"
+        reasons[(reasons == "") & (self.cells.slack_many(cell, points) >= 0.0)] = "inside"
+        outside = np.any(seeds <= self._origin, axis=1) | np.any(seeds >= self._upper, axis=1)
+        reasons[(reasons == "") & outside] = "bounds"
+        pending = np.flatnonzero(reasons == "")
+        if len(pending):
+            others = self._nearby(center[0], center[1], cell.pose.yaw, cell.guard + self.cells.outer_reach,
+                                  cell.yaw_limit + f.yaw_step, exclude=index)
+            covered = self._covered(points[pending], others)
+            reasons[pending[covered]] = "covered"
+        for reason in ("obstacle", "far", "inside", "bounds", "covered"):
+            self._stats[f"frontier_reject_{reason}"] += int(np.count_nonzero(reasons == reason))
+        keep = reasons == ""
+        for kind, name in ((FRONTIER_GUARD, "guard"), (FRONTIER_OBSTACLE, "obstacle")):
+            self._stats[f"frontier_{name}_directions"] += int(np.count_nonzero(kinds == kind))
+        if not np.any(keep):
             return
-        world, normals, dthetas, lengths, kinds, rooms = (a[exposed] for a in
-                                                          (world, normals, dthetas, lengths, kinds, rooms))
+        anchors, directions, lengths, kinds = anchors[keep], directions[keep], lengths[keep], kinds[keep]
+        points, dthetas = points[keep], dthetas[keep]
         steps = f.probe_step * np.arange(1, f.probe_count + 1)
-        probes = self._move(np.repeat(world[:, None, :], f.probe_count, axis=1), normals[:, None, :],
-                            np.broadcast_to(steps, (len(world), f.probe_count)))
-        near = self._nearby(center.x, center.y, center.yaw, reach, cell.yaw_limit + reach / cell.rho)
+        probes = np.repeat(points[:, None, :], f.probe_count, axis=1)
+        probes[:, :, :2] += steps[None, :, None] * directions[:, None, :]
+        near = self._nearby(center[0], center[1], cell.pose.yaw, cell.guard + self.cells.outer_reach + steps[-1],
+                            cell.yaw_limit + f.yaw_step)
         open_space = ~self._covered(probes.reshape((-1, 3)), near)
-        span = self.frontier.add(len(world))
+        world_anchors = np.column_stack((center + anchors, np.full(len(anchors), cell.pose.yaw)))
+        span = self.frontier.add(len(points))
         store = self.frontier
-        store.cell[span], store.points[span], store.normals[span] = index, world, normals
-        store.dtheta[span], store.length[span], store.kind[span] = dthetas, lengths, kinds
-        store.room[span] = rooms
-        planar = np.hypot(world[:, 0] - center.x, world[:, 1] - center.y)
-        store.progress[span] = np.clip((self._goal_distance(center.x, center.y)
-                                        - self._goal_distance(world[:, 0], world[:, 1])) / np.maximum(planar, 1e-9),
+        store.cell[span], store.anchors[span], store.points[span] = index, world_anchors, points
+        store.directions[span], store.dtheta[span], store.length[span], store.kind[span] = (directions, dthetas,
+                                                                                           lengths, kinds)
+        travel = np.hypot(points[:, 0] - world_anchors[:, 0], points[:, 1] - world_anchors[:, 1])
+        store.progress[span] = np.clip((self._goal_distance(world_anchors[:, 0], world_anchors[:, 1])
+                                        - self._goal_distance(points[:, 0], points[:, 1])) / np.maximum(travel, 1e-9),
                                        -1.0, 1.0)
         store.probes[span] = probes
         store.probe_open[span] = open_space.reshape((-1, f.probe_count))
-        store.alive[span], store.failures[span] = True, 0
+        store.alive[span] = True
         self._score(np.arange(span.start, span.stop))
-        self._stats["frontier_candidates"] += len(world)
+        self._stats["frontier_candidates"] += len(points)
 
     def _cover_frontier(self, index: int) -> None:
         """Drop candidates that the new cell ``index`` covers and close the probes it covers."""
@@ -460,65 +477,18 @@ class PolyhedralFrontierPlanner:
             return None
         return Pose2D(near.pose.x + t * dc[0], near.pose.y + t * dc[1], wrap_to_pi(near.pose.yaw + t * dphi))
 
-    def _expansion_direction(self, candidate: int) -> np.ndarray:
-        """``u ~ w_n u_out + w_t u_tan + w_g u_goal`` in ``(x, y, rho theta)``, at least ``min_outward`` outward."""
-        f, store = self.frontier_config, self.frontier
-        w_n, w_t, w_g = f.direction_weights
-        normal, point = store.normals[candidate], store.points[candidate]
-        tangent = self.rng.normal(size=3)
-        tangent -= (tangent @ normal) * normal
-        tangent /= max(float(np.linalg.norm(tangent)), 1e-12)
-        goal = np.array((self.goal_xy[0] - point[0], self.goal_xy[1] - point[1], 0.0))
-        goal /= max(float(np.linalg.norm(goal)), 1e-12)
-        u = w_n * normal + w_t * self.rng.uniform(0.0, 1.0) * tangent + w_g * goal
-        u /= max(float(np.linalg.norm(u)), 1e-12)
-        along = float(u @ normal)
-        if along < f.min_outward:
-            side = u - along * normal
-            norm = float(np.linalg.norm(side))
-            side = side / norm if norm > 1e-12 else tangent
-            u = f.min_outward * normal + math.sqrt(1.0 - f.min_outward ** 2) * side
-        return u
-
     def _region_sample(self) -> tuple[int, int, Pose2D] | None:
-        """``q_new = b + delta u`` beyond an expandable frontier point ``b``, or ``None`` if every try fails.
-
-        ``q_new`` must leave the source cell, satisfy its obstacle rows (``C_dir``), stay in the map and not be
-        covered by another cell.
-        """
-        f, store = self.frontier_config, self.frontier
-        for _ in range(f.candidate_picks):
-            candidate = self._pick_candidate()
-            if candidate is None:
-                return None
-            source = int(store.cell[candidate])
-            cell = self._nodes[source].cell
-            step = min(f.sample_offset, 0.9 * float(store.room[candidate]))
-            for _ in range(f.sample_attempts):
-                u = self._expansion_direction(candidate)
-                q = self._move(store.points[candidate], u, step / (math.hypot(u[0], u[1]) + abs(u[2])))
-                if self.cells.slack_many(cell, q)[0] >= 0.0:
-                    reason = "inside"
-                elif self.cells.directional_slack(cell, q)[0] <= 0.0:
-                    reason = "obstacle"
-                elif np.any(q[:2] <= self._origin) or np.any(q[:2] >= self._upper):
-                    reason = "bounds"
-                elif self._covered(q[None, :], self._nearby(q[0], q[1], q[2], 0.0, 0.0))[0]:
-                    reason = "covered"
-                else:
-                    return candidate, source, Pose2D(float(q[0]), float(q[1]), float(q[2]))
-                self._stats[f"region_reject_{reason}"] += 1
-            self._fail_candidate(candidate)
-        return None
+        """The ``q_new`` of a live expansion drawn by ``exp(S / tau)`` (``None`` when the frontier is empty)."""
+        candidate = self._pick_candidate()
+        if candidate is None:
+            return None
+        q = self.frontier.points[candidate]
+        return candidate, int(self.frontier.cell[candidate]), Pose2D(float(q[0]), float(q[1]), float(q[2]))
 
     def _fail_candidate(self, candidate: int) -> None:
-        f, store = self.frontier_config, self.frontier
-        store.failures[candidate] += 1
-        if store.failures[candidate] >= f.max_candidate_failures:
-            store.alive[candidate] = False
-            self._stats["frontier_dropped"] += 1
-        else:
-            self._score(np.array((candidate,)))
+        """Expansions are deterministic, so a rejected one is dropped."""
+        self.frontier.alive[candidate] = False
+        self._stats["frontier_dropped"] += 1
 
     # -- tree -------------------------------------------------------------------------------------------
     def _store(self, node: TubeRRTNode) -> int:
@@ -569,21 +539,12 @@ class PolyhedralFrontierPlanner:
                     route.append(pose)
         return route, indices
 
-    def frontier_snapshot(self, max_obstacle_points: int = 6000) -> dict[str, np.ndarray]:
-        """Live expandable candidates, and a subsample of obstacle-limited boundary points still uncovered."""
+    def frontier_snapshot(self) -> dict[str, np.ndarray]:
+        """Live expansions: anchor ``b``, seed ``q_new``, planar direction, yaw change, kind, score, owner cell."""
         live = self.frontier.live()
         store = self.frontier
-        blocked = np.vstack(self._blocked) if self._blocked else np.empty((0, 3))
-        shown = blocked[::max(1, len(blocked) // max_obstacle_points)]
-        if len(shown) and self._nodes:
-            cells = np.array([i for i in range(len(self._nodes)) if i not in self._goal_nodes])
-            exposed = np.zeros(len(shown), dtype=bool)
-            for chunk in range(0, len(shown), 500):
-                exposed[chunk:chunk + 500] = ~self._covered(shown[chunk:chunk + 500], cells)
-            shown = shown[exposed]
-        return {"obstacle_limited_exposed": shown, "obstacle_limited_total": len(blocked),"points": store.points[live].copy(), "cell": store.cell[live].copy(),
-                "score": store.score[live].copy(), "kind": store.kind[live].copy(),
-                "normals": store.normals[live].copy(), "length": store.length[live].copy()}
+        return {name: getattr(store, name)[live].copy()
+                for name in ("anchors", "points", "directions", "dtheta", "kind", "score", "cell", "length")}
 
     def _print_progress(self, iteration: int, best_goal_distance: float, best_cost: float | None) -> None:
         cost = "" if best_cost is None else f" best_cost={best_cost:.3f}"
@@ -599,11 +560,11 @@ class PolyhedralFrontierPlanner:
             self.cells.stats[key] = 0
         self._stats = {"region_iterations": 0, "uniform_iterations": 0, "region_nodes": 0, "uniform_nodes": 0,
                        "region_fallback": 0, "frontier_candidates": 0, "frontier_covered": 0, "frontier_dropped": 0,
-                       "frontier_obstacle_limited": 0, "region_reject_inside": 0, "region_reject_obstacle": 0,
-                       "region_reject_bounds": 0, "region_reject_covered": 0, "rejected_redundant": 0,
+                       "frontier_guard_directions": 0, "frontier_obstacle_directions": 0,
+                       "frontier_reject_obstacle": 0, "frontier_reject_far": 0, "frontier_reject_inside": 0,
+                       "frontier_reject_bounds": 0, "frontier_reject_covered": 0, "rejected_redundant": 0,
                        "rejected_no_progress": 0, "rejected_collision": 0, "rejected_no_overlap": 0}
         self._goal_nodes: set[int] = set()
-        self._blocked: list[np.ndarray] = []
         self._nodes: list[TubeRRTNode] = []
         self._children: list[list[int]] = []
         capacity = 1024
@@ -707,7 +668,7 @@ class PolyhedralFrontierPlanner:
                                        "broadphase_pairs": cell.broadphase_pairs, "yaw_limit": cell.yaw_limit,
                                        "source": origin,
                                        "frontier_kind": int(self.frontier.kind[candidate]) if candidate is not None else 0,
-                                       "frontier_point": (self.frontier.points[candidate].copy()
+                                       "frontier_point": (self.frontier.anchors[candidate].copy()
                                                           if candidate is not None else None)})
             event = TubeRRTTraceEvent(iteration, sample, source, q_new, cell.radius, "added", new_index, parent,
                                       cell=cell, mode=mode)

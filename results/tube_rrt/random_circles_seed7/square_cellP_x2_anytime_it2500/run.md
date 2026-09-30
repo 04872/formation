@@ -1,7 +1,7 @@
 # Tube-RRT 运行记录：random_circles / seed 7 / square_cellP_x2_anytime_it2500
 
-- 运行时间：2026-09-30 10:20:24
-- 代码版本：`bededcf (有未提交改动)`
+- 运行时间：2026-09-30 10:37:02
+- 代码版本：`ffe0d5b (有未提交改动)`
 - 结果目录：`results/tube_rrt/random_circles_seed7/square_cellP_x2_anytime_it2500`
 
 复现命令（在仓库根目录执行）：
@@ -16,32 +16,32 @@ MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map ran
 | --- | --- |
 | 是否成功 | 是 |
 | 执行迭代数 | 2500 / 2500 |
-| 首次连到目标的迭代 | 63 |
-| 树节点数（含目标节点） | 1843（目标节点 4） |
-| 被拒绝：碰撞 / 安全球不重叠 | 2 / 0 |
-| rewire 次数 | 752 |
+| 首次连到目标的迭代 | 51 |
+| 树节点数（含目标节点） | 1963（目标节点 1） |
+| 被拒绝：碰撞 / 安全球不重叠 | 3 / 1 |
+| rewire 次数 | 498 |
 | 步长回退后才接受的节点数 | 0 |
-| 障碍夹在机器人之间的节点：树 / 路径 | 27 / 0（路径共 19 个节点） |
-| 路径代价（含 J_margin）：首次 → 最终 | 13.002 → 12.064 |
-| 路径 d_G 长度 | 12.064 |
-| 认证路线上稠密采样的最小 guarded clearance（<0 表示碰撞） | 0.082 |
-| T_first / C_first / 首解前 N_query | 0.066 s / 13.002 / 63 |
-| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | 2.94 s / 2086 / 133504 |
-| overlap 判定：总数 / 快速拒绝 / 快速接受 / 方向部分 LP（拒绝 / 接受） / 含 guard SOCP（接受） | 5794 / 0 / 3718 / 2076（445 / 529） / 1102（908） |
-| 被拒绝：region 冗余 cell（rho_new 过小） / steer 无进展 | 245 / 415 |
-| 采样通道 region / uniform：迭代数（region 无候选回退） | 537 / 1963（0） |
-| 采样通道 region / uniform：接受节点数 | 290 / 1548 |
-| expandable frontier 候选：生成 / 被覆盖 / 多次失败丢弃 / 结束时仍 exposed | 4066 / 3901 / 0 / 165 |
-| obstacle-limited 边界点（只记录，不向外采样） | 93727 |
-| region seed 被拒：仍在原 cell 内 / 越过障碍行 / 出界 / 已被覆盖 | 0 / 0 / 0 / 13 |
-| 被拒绝：新 cell 无效（seed clearance ≤ d_s） | 2 |
-| 每个 cell 平均：broadphase pair / 边界 active row | 3.33 / 2.07 |
+| 障碍夹在机器人之间的节点：树 / 路径 | 176 / 0（路径共 12 个节点） |
+| 路径代价（含 J_margin）：首次 → 最终 | 11.225 → 11.225 |
+| 路径 d_G 长度 | 11.225 |
+| 认证路线上稠密采样的最小 guarded clearance（<0 表示碰撞） | 0.156 |
+| T_first / C_first / 首解前 N_query | 0.049 s / 11.225 / 52 |
+| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | 2.96 s / 2158 / 138112 |
+| overlap 判定：总数 / 快速拒绝 / 快速接受 / 方向部分 LP（拒绝 / 接受） / 含 guard SOCP（接受） | 6773 / 0 / 3597 / 3176（1250 / 944） / 982（796） |
+| 被拒绝：region 冗余 cell（rho_new 过小） / steer 无进展 | 192 / 343 |
+| 采样通道 region / uniform：迭代数（region 无候选回退） | 553 / 1947（0） |
+| 采样通道 region / uniform：接受节点数 | 360 / 1601 |
+| 扩展方向：guard 弧 / obstacle facet 切向（每个 cell 平均） | 6716 / 8976（7.3） |
+| 扩展方向被拒：障碍裕度 ≤ 0 / 超出 r_g + outer_reach / 仍在原 cell 内 / 出界 / 已被覆盖 | 4150 / 0 / 0 / 0 / 9095 |
+| 保留的扩展：生成 / 被后续 cell 覆盖 / 采样后被拒丢弃 / 结束时仍 live | 2447 / 1548 / 193 / 706 |
+| 被拒绝：新 cell 无效（seed clearance ≤ d_s） | 3 |
+| 每个 cell 平均：broadphase pair / 边界 active row | 3.78 / 2.34 |
 
 ## 配置
 
 | 参数 | 值 |
 | --- | --- |
-| cell | polyhedral cell + region/uniform 混合 RRT*：两级 active pair（broadphase d < d_active，再只留真正边界行、近平行只留更紧者）的支撑平面 n^T dc - rho|dtheta| >= -(d - d_s)，validity guard ||dc|| + rho|dtheta| <= r_g 作为谓词，yaw 区间由约束决定（<= pi/2 chart）；每次迭代以 p_region 从 expandable frontier（guard 边界 / yaw chart 截断面，obstacle-limited 边界不向外扩展）按 S = alpha l + beta U + gamma G 选点，沿 w_n u_out + w_t u_tan + w_g u_goal 略微越过边界放 seed，否则 uniform SE(2) 采样；每次迭代只构造 1 个 cell |
+| cell | polyhedral cell + region/uniform 混合 RRT*：两级 active pair（broadphase d < d_active，再只留真正边界行、近平行只留更紧者）的支撑平面 n^T dc - rho|dtheta| >= -(d - d_s)，validity guard ||dc|| + rho|dtheta| <= r_g 作为谓词，yaw 区间由约束决定（<= pi/2 chart）；每次迭代以 p_region 从 S_0 的 frontier 几何直接生成的常数个扩展中按 S = alpha l + beta U + gamma G 选一个（guard 弧沿外法向，obstacle facet 沿两个切向、不沿违反约束的法向；dtheta 取 {-s, 0, +s} 中障碍裕度最大者），q_new 在跨出当前 cell 一小段处，否则 uniform SE(2) 采样；每次迭代只构造 1 个 cell |
 | 地图 | random_circles, seed 7 |
 | 编队 | square × 2（R_F = 0.707 m，相邻机器人最小间距 1.000 m） |
 | 机器人半径 / 安全余量 | 0.113 m（TurtleBot3 Burger 外接圆） / 0.060 m |
@@ -79,36 +79,31 @@ MPLBACKEND=Agg ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py --map ran
 | frontier.region_max | 0.5 |
 | frontier.region_min | 0.2 |
 | frontier.region_decay | 0.002 |
-| frontier.yaw_slice_fractions | (0.0, -0.45, 0.45, -0.85, 0.85) |
-| frontier.frontier_directions | 16 |
+| frontier.max_arc | 0.7853981633974483 |
+| frontier.guard_weights | (0.3, 0.5, 1.0) |
+| frontier.obstacle_weights | (1.0, 0.3, 0.2) |
+| frontier.yaw_step | 0.15 |
+| frontier.sample_offset | 0.1 |
 | frontier.probe_step | 0.25 |
 | frontier.probe_count | 3 |
-| frontier.yaw_caps | True |
 | frontier.score_weights | (1.0, 1.0, 1.0) |
 | frontier.score_temperature | 0.15 |
 | frontier.length_ref | 1.0 |
-| frontier.direction_weights | (1.0, 0.5, 0.5) |
-| frontier.min_outward | 0.3 |
-| frontier.sample_offset | 0.1 |
-| frontier.min_sample_offset | 0.02 |
-| frontier.sample_attempts | 4 |
-| frontier.candidate_picks | 3 |
 | frontier.steer_fraction | 0.9 |
 | frontier.min_new_ratio | 0.05 |
 | frontier.overlap_band | (0.1, 0.5) |
-| frontier.max_candidate_failures | 3 |
 | frontier.max_parent_candidates | 12 |
 
 ## 耗时
 
 | 阶段 | 秒 |
 | --- | --- |
-| startup_imports | 0.234 |
+| startup_imports | 0.230 |
 | map_build | 0.086 |
-| tube_rrt | 2.946 |
-| plot_build | 2.530 |
-| save | 2.660 |
-| total | 8.457 |
+| tube_rrt | 2.962 |
+| plot_build | 1.843 |
+| save | 2.384 |
+| total | 7.506 |
 
 ## 图
 
@@ -156,7 +151,7 @@ joint tube：路径 polyhedral cell 的 dtheta = 0 截面 P_i(0) 与 portal、(x
 
 ### 7_frontier.png
 
-（仅 polyhedral）certified union：全部 cell 的节点 yaw 截面；灰点 = obstacle-limited 边界（active 障碍行起作用，不向外采样），彩色点 = 仍 exposed 的 expandable 候选（圆 = validity guard 边界，三角 = yaw chart 截断面，颜色 = 采样分数 S），绿线 = region 扩展 b -> q_new；新 cell 的 rho_new / rho_overlap 分布；region 与 uniform 两个采样通道的累计接受节点数及 p_region 调度（虚线）
+（仅 polyhedral）certified union：全部 cell 的节点 yaw 截面；实线 = 已采用的 region 扩展 b -> q_new（蓝 = guard 弧沿外法向，橙 = obstacle facet 沿切向），点线 = 仍 live 的扩展，空心标记 = live q_new 的 yaw 变化（▲ +，● 0，▼ −）；新 cell 的 rho_new / rho_overlap 分布；region 与 uniform 两个采样通道的累计接受节点数及 p_region 调度（虚线）
 
 ![frontier](7_frontier.png)
 
@@ -174,14 +169,14 @@ joint tube：路径 polyhedral cell 的 dtheta = 0 截面 P_i(0) 与 portal、(x
 ## 控制台输出
 
 ```text
-timing startup_imports=0.234s
+timing startup_imports=0.230s
 timing map_build=0.086s
 geometry robot_radius=0.113 safety_margin=0.060 pass_through_bound=0.327 obstacle_radius=0.121-0.267 passable_obstacles=12/12
 planning...
-timing tube_rrt=2.946s
-planning result: success=True iterations=2500 nodes=1843 path_nodes=19 path_cost=12.064 min_guarded_clearance=0.082
-overlap cells_built=2086 pose_queries=2086 pair_queries=133504 broadphase_pairs=6942 active_pairs=4319 overlap_calls=5794 quick_reject=0 quick_accept=3718 lp_calls=2076 lp_reject=445 lp_accept=529 socp_calls=1102 socp_accept=908 region_iterations=537 uniform_iterations=1963 region_nodes=290 uniform_nodes=1548 region_fallback=0 frontier_candidates=4066 frontier_covered=3901 frontier_dropped=0 frontier_obstacle_limited=93727 region_reject_inside=0 region_reject_obstacle=0 region_reject_bounds=0 region_reject_covered=13 rejected_redundant=245 rejected_no_progress=415 rejected_collision=2 rejected_no_overlap=0 first_goal_time_s=0.06618224899284542 first_goal_pose_queries=63 first_goal_cost=13.002393198864874 frontier_alive=165 plan_time_s=2.9438051939941943
-timing plot_build=2.530s
-timing save=2.660s total=8.457s
+timing tube_rrt=2.962s
+planning result: success=True iterations=2500 nodes=1963 path_nodes=12 path_cost=11.225 min_guarded_clearance=0.156
+overlap cells_built=2158 pose_queries=2158 pair_queries=138112 broadphase_pairs=8165 active_pairs=5040 overlap_calls=6773 quick_reject=0 quick_accept=3597 lp_calls=3176 lp_reject=1250 lp_accept=944 socp_calls=982 socp_accept=796 region_iterations=553 uniform_iterations=1947 region_nodes=360 uniform_nodes=1601 region_fallback=0 frontier_candidates=2447 frontier_covered=1548 frontier_dropped=193 frontier_guard_directions=6716 frontier_obstacle_directions=8976 frontier_reject_obstacle=4150 frontier_reject_far=0 frontier_reject_inside=0 frontier_reject_bounds=0 frontier_reject_covered=9095 rejected_redundant=192 rejected_no_progress=343 rejected_collision=3 rejected_no_overlap=1 first_goal_time_s=0.049364439910277724 first_goal_pose_queries=52 first_goal_cost=11.225291835615778 frontier_alive=706 plan_time_s=2.960232273908332
+timing plot_build=1.843s
+timing save=2.384s total=7.506s
 saved results/tube_rrt/random_circles_seed7/square_cellP_x2_anytime_it2500/
 ```

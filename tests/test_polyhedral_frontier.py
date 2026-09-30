@@ -17,8 +17,7 @@ from formation import (
     TubeRRTConfig,
     make_tube_rrt_planner,
 )
-from formation.tube_rrt_frontier import FRONTIER_GUARD
-from formation.types import wrap_to_pi
+from formation.tube_rrt_frontier import FRONTIER_GUARD, FRONTIER_OBSTACLE
 
 # Square formation with 1 m between neighbouring robots (slots at (+-0.5, +-0.5)).
 SLOTS = FormationLibrary.build_default(0.113).get("square").slots * 2.0
@@ -234,38 +233,51 @@ class FrontierPlannerTest(unittest.TestCase):
                 parent = nodes[node.parent]
                 self.assertAlmostEqual(node.cost, parent.cost + planner.edge_cost(parent, node, node.certificate), places=9)
 
-    def test_live_frontier_is_exposed_boundary(self) -> None:
-        planner = random_circles_planner(max_iterations=150, stop_on_first_goal=False)
-        result = planner.plan()
-        snapshot = planner.frontier_snapshot()
-        self.assertGreater(len(snapshot["points"]), 50)
-        for point, owner in zip(snapshot["points"][::7], snapshot["cell"][::7]):
-            slack = planner.cells.slack(result.tree_nodes[owner].cell, Pose2D(*point))
-            self.assertAlmostEqual(slack, 0.0, places=9)
-            for index, node in enumerate(result.tree_nodes):
-                if index != owner:
-                    self.assertFalse(planner.cells.contains(node.cell, point[None, :])[0])
+    def test_frontier_pieces_follow_the_section_boundary(self) -> None:
+        planner = random_circles_planner()
+        model = planner.cells
+        for cell in valid_cells(planner, 40):
+            pieces = model.frontier_pieces(cell, math.pi / 4.0)
+            self.assertLessEqual(len(pieces), cell.active_count + 8 + cell.active_count)
+            for piece in pieces:
+                point = Pose2D(cell.pose.x + piece["point"][0], cell.pose.y + piece["point"][1], cell.pose.yaw)
+                self.assertAlmostEqual(abs(float(piece["tangent"] @ piece["outward"])), 0.0, places=12)
+                if piece["kind"] == "obstacle":
+                    self.assertAlmostEqual(model.slack(cell, point), 0.0, places=9)
+                    self.assertTrue(np.allclose(piece["outward"], -cell.normals[piece["row"]]))
+                else:
+                    self.assertAlmostEqual(math.hypot(*piece["point"]), cell.guard, places=9)
+                    self.assertGreater(model.slack(cell, point), -2e-3 * cell.guard)
 
-    def test_only_guard_and_yaw_cap_boundaries_are_expanded(self) -> None:
+    def test_live_expansions_follow_frontier_geometry(self) -> None:
         planner = random_circles_planner(max_iterations=300, stop_on_first_goal=False)
         result = planner.plan()
-        store, f = planner.frontier, planner.frontier_config
+        f, model, store = planner.frontier_config, planner.cells, planner.frontier
         kinds = set()
+        choices = np.array((0.0, f.yaw_step, -f.yaw_step))
         for index in range(store.size):
             cell = result.tree_nodes[store.cell[index]].cell
-            point = store.points[index]
+            anchor, q, u = store.anchors[index], store.points[index], store.directions[index]
             kinds.add(int(store.kind[index]))
-            local = point - (cell.pose.x, cell.pose.y, 0.0)
-            turn = cell.rho * abs(wrap_to_pi(point[2] - cell.pose.yaw))
-            if store.kind[index] == FRONTIER_GUARD:
-                self.assertAlmostEqual(math.hypot(local[0], local[1]) + turn, cell.guard, places=9)
+            self.assertAlmostEqual(float(np.linalg.norm(u)), 1.0, places=12)
+            if store.kind[index] == FRONTIER_OBSTACLE:
+                rows = cell.normals @ (anchor[:2] - (cell.pose.x, cell.pose.y)) + cell.offsets
+                self.assertGreater(float(cell.normals[int(np.argmin(np.abs(rows)))] @ u), 0.0)
             else:
-                self.assertAlmostEqual(turn, cell.rho * cell.yaw_limit, places=9)
-            if len(cell.offsets):
-                self.assertGreater(float(planner.cells.directional_slack(cell, point, outer=False)[0]), 0.0)
-            self.assertGreaterEqual(float(planner.cells.directional_slack(cell, point)[0]), f.min_sample_offset)
-        self.assertIn(FRONTIER_GUARD, kinds)
-        self.assertGreater(result.overlap_stats["frontier_obstacle_limited"], store.size)
+                radial = (anchor[:2] - (cell.pose.x, cell.pose.y)) / cell.guard
+                self.assertGreater(float(radial @ u), 0.0)
+            self.assertIn(round(float(store.dtheta[index]), 12), np.round(choices, 12).tolist())
+            margins = [model.rotation_margin(cell, np.array((q[0], q[1], cell.pose.yaw + c)))[0] for c in choices]
+            self.assertAlmostEqual(max(margins), model.rotation_margin(cell, q)[0], places=9)
+            self.assertGreater(model.rotation_margin(cell, q)[0], 0.0)
+            self.assertFalse(model.contains(cell, q)[0])
+            if store.alive[index]:
+                for other, node in enumerate(result.tree_nodes):
+                    self.assertFalse(model.contains(node.cell, q[None, :])[0])
+        self.assertEqual(kinds, {FRONTIER_GUARD, FRONTIER_OBSTACLE})
+        stats = result.overlap_stats
+        directions = stats["frontier_guard_directions"] + stats["frontier_obstacle_directions"]
+        self.assertLess(directions, 12 * stats["cells_built"])
 
     def test_region_seeds_leave_the_certificate_but_not_into_known_obstacles(self) -> None:
         planner = random_circles_planner(FrontierConfig(region_schedule="constant", region_probability=0.8),
@@ -278,13 +290,10 @@ class FrontierPlannerTest(unittest.TestCase):
             node = result.tree_nodes[entry["node"]]
             q = np.array((node.pose.x, node.pose.y, node.pose.yaw))
             self.assertFalse(planner.cells.contains(source, q)[0])
-            self.assertGreater(float(planner.cells.directional_slack(source, q)[0]), 0.0)
-            self.assertLessEqual(planner.metric(Pose2D(*entry["frontier_point"]), node.pose),
-                                 planner.frontier_config.sample_offset + 1e-9)
+            self.assertGreater(float(planner.cells.rotation_margin(source, q)[0]), 0.0)
+            self.assertLessEqual(planner.metric(source.pose, node.pose),
+                                 source.guard + planner.cells.outer_reach + 1e-9)
             self.assertTrue(node.cell.valid)
-        stats = result.overlap_stats
-        self.assertEqual(stats["region_reject_obstacle"], 0)
-        self.assertEqual(stats["rejected_collision"], 0)
 
     def test_extreme_region_probabilities(self) -> None:
         uniform = random_circles_planner(FrontierConfig(region_schedule="constant", region_probability=0.0),
