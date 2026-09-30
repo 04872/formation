@@ -17,6 +17,7 @@ from formation import (
     make_tube_rrt_planner,
 )
 from formation import polyhedral_cell
+from formation.polyhedral_cell import wrap_array
 from formation.types import wrap_to_pi
 
 SLOTS = FormationLibrary.build_default(0.113).get("square").slots * 2.0
@@ -68,24 +69,36 @@ class RegionTubeGeometryTest(unittest.TestCase):
             self.assertGreaterEqual(analytic, reference - 1e-7)
             self.assertLessEqual(analytic, reference + 1e-6)
 
-    def test_lazy_cells_are_the_unpruned_cells_and_skip_the_geometry(self) -> None:
-        eager = region_tube_planner(tube_config=RegionTubeConfig(lazy_geometry=False)).cells
-        rng = np.random.default_rng(2)
+    def test_lazy_cells_equal_the_definition_and_skip_the_geometry(self) -> None:
+        """Lazy cell == {every broadphase row} and guard and |dtheta| <= yaw_chart, pointwise (slack included)."""
+        model, rng = self.model, np.random.default_rng(2)
         compared = 0
         for pose in random_poses(self.planner, 600, seed=4):
-            lazy_cell, eager_cell = self.model.make_cell(pose), eager.make_cell(pose)
-            self.assertEqual(lazy_cell.valid, eager_cell.valid)
-            if not lazy_cell.valid:
+            cell = model.make_cell(pose)
+            clearance, normals = model.proximity(model.robot_positions(pose))
+            broadphase = clearance < model.active_range
+            inactive = clearance[~broadphase]
+            guard = min(float(inactive.min()) - model.safety_distance if inactive.size else math.inf, model.max_extent)
+            rows, offsets = normals[broadphase], clearance[broadphase] - model.safety_distance
+            self.assertEqual(cell.valid, min(offsets.min(initial=math.inf), guard) > 0.0)
+            if not cell.valid:
                 continue
-            self.assertIsNone(lazy_cell._inradius)
-            self.assertIsNone(lazy_cell._samples)
-            self.assertGreaterEqual(lazy_cell.yaw_limit, eager_cell.yaw_limit - 1e-12)
-            points = np.column_stack((pose.x + rng.uniform(-1.6, 1.6, 300), pose.y + rng.uniform(-1.6, 1.6, 300),
-                                      pose.yaw + rng.uniform(-1.6, 1.6, 300)))
-            lazy_slack, eager_slack = self.model.slack_many(lazy_cell, points), eager.slack_many(eager_cell, points)
-            self.assertFalse(np.any((eager_slack > 1e-9) & (lazy_slack <= 0.0)))
-            self.assertLess(np.mean((lazy_slack > 0.0) != (eager_slack > 0.0)), 0.01)
-            self.assertAlmostEqual(lazy_cell.inradius, eager_cell.inradius, delta=0.02)
+            self.assertIsNone(cell._inradius)
+            self.assertIsNone(cell._samples)
+            with mock.patch.object(polyhedral_cell, "_ANALYTIC_INCIRCLE_ROWS", -1):
+                _, inradius = model._inscribed_circle(cell)
+            self.assertGreaterEqual(cell.yaw_limit, min(model.yaw_chart, inradius / model.rho) - 1e-9)
+            points = np.column_stack((pose.x + rng.uniform(-1.6, 1.6, 400), pose.y + rng.uniform(-1.6, 1.6, 400),
+                                      pose.yaw + rng.uniform(-1.7, 1.7, 400)))
+            dx, dy = points[:, 0] - pose.x, points[:, 1] - pose.y
+            turn = model.rho * np.abs(wrap_array(points[:, 2] - pose.yaw))
+            definition = np.minimum(guard - np.hypot(dx, dy) - turn, model.rho * model.yaw_chart - turn)
+            if len(offsets):
+                definition = np.minimum(definition, (rows @ np.vstack((dx, dy)) + offsets[:, None]).min(axis=0) - turn)
+            lazy = model.slack_many(cell, points)
+            self.assertTrue(np.array_equal(definition > 0.0, lazy > 0.0))
+            inside = definition > 0.0
+            self.assertTrue(np.allclose(definition[inside], lazy[inside], atol=1e-12))
             compared += 1
         self.assertGreater(compared, 100)
 
