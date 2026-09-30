@@ -116,6 +116,12 @@ class PolyhedralCell:
     center_offset: np.ndarray = field(default_factory=lambda: np.zeros(2))
     """In-circle centre of ``S_0`` relative to ``c_0``; it lies in ``P(dtheta)`` for every valid yaw."""
     broadphase_pairs: int = 0
+    outer_normals: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))
+    outer_offsets: np.ndarray = field(default_factory=lambda: np.empty(0))
+    """Unpruned rows of every pair with ``d - d_s < r_g + outer_reach`` (including inactive ones).
+
+    Not part of the certificate: they tell which part of the guard boundary faces a known obstacle and keep
+    seeds placed just beyond the cell out of known restricted regions."""
     samples: np.ndarray = field(default_factory=lambda: np.empty((0, 3)))
     """Deterministic quasi-random world configurations ``(x, y, theta)`` inside the cell."""
     volume: float = 0.0
@@ -149,7 +155,8 @@ class PolyhedralCellModel:
 
     def __init__(self, slots: np.ndarray, map_data: MapData, clearance_margin: float, safety_distance: float = 0.02,
                  active_range: float = 1.0, parallel_tolerance: float = math.radians(5.0), max_extent: float = 1.5,
-                 yaw_chart: float = math.pi / 2.0, cell_samples: int = 128) -> None:
+                 yaw_chart: float = math.pi / 2.0, cell_samples: int = 128, outer_reach: float = 0.5) -> None:
+        self.outer_reach = float(outer_reach)
         self.slots = np.asarray(slots, dtype=float)
         self.rho = float(np.max(np.linalg.norm(self.slots, axis=1)))
         if self.rho <= 0.0:
@@ -221,10 +228,12 @@ class PolyhedralCellModel:
         rows, offsets = self._boundary_rows(normals[robots, components], clearance[robots, components] - d_s, guard)
         self.stats["broadphase_pairs"] += len(robots)
         self.stats["active_pairs"] += len(rows)
+        outer = clearance - d_s < guard + self.outer_reach
         cell = PolyhedralCell(pose=pose, clearance=float(np.min(clearance)),
                               normals=normals[robots[rows], components[rows]].reshape((-1, 2)),
                               offsets=offsets, pairs=tuple(zip(robots[rows].tolist(), components[rows].tolist())),
-                              guard=guard, yaw_limit=0.0, rho=self.rho, broadphase_pairs=len(robots))
+                              guard=guard, yaw_limit=0.0, rho=self.rho, broadphase_pairs=len(robots),
+                              outer_normals=normals[outer].reshape((-1, 2)), outer_offsets=clearance[outer] - d_s)
         if cell.radius > 0.0:
             cell.center_offset, cell.inradius = self._inscribed_circle(cell)
             cell.yaw_limit = min(self.yaw_chart, cell.inradius / self.rho)
@@ -318,6 +327,23 @@ class PolyhedralCellModel:
 
     def contains(self, cell: PolyhedralCell, points: np.ndarray) -> np.ndarray:
         return self.slack_many(cell, points) > _INSIDE_TOL
+
+    @staticmethod
+    def directional_slack(cell: PolyhedralCell, points: np.ndarray, outer: bool = True) -> np.ndarray:
+        """Margin [m] of obstacle rows alone (no guard / yaw range), ``inf`` without rows.
+
+        ``outer=True`` uses the unpruned rows of all pairs near the guard (``outer_normals``), else the
+        certificate rows of ``C_dir``.  Each row is a supporting half-space of a convex obstacle, so it bounds
+        the clearance of its pair everywhere, not only inside the guard: a pose violating it heads into a
+        known obstacle-limited region.
+        """
+        points = np.asarray(points, dtype=float).reshape((-1, 3))
+        normals, offsets = (cell.outer_normals, cell.outer_offsets) if outer else (cell.normals, cell.offsets)
+        if not len(offsets):
+            return np.full(len(points), math.inf)
+        turn = cell.rho * np.abs(wrap_array(points[:, 2] - cell.pose.yaw))
+        rows = normals @ (points[:, :2] - (cell.pose.x, cell.pose.y)).T + offsets[:, None]
+        return rows.min(axis=0) - turn
 
     # -- directional extensibility -------------------------------------------------------------------
     def translational_extent(self, cell: PolyhedralCell, directions: np.ndarray,

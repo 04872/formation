@@ -20,7 +20,7 @@
 - `scripts/visualize_tube_rrt.py`：CLI、规划、绘图、计时、报告和结果索引。
 - `tests/test_tube_rrt.py`：工厂分派（默认 orientation）、原 orientation 实现复现旧运行（random_circles seed 7、square×2、anytime：2143 节点、首次 236 次迭代、代价 12.406），以及 chart 范数定义、一阶位似 overlap、portal 同属两个 cell、一阶 / 二阶 cell 对真实机器人位移的界、二阶 overlap 与暴力采样一致、射线内步长、两种 cell 的确定性规划、二阶路线认证与无碰撞、rewire 后代价一致、非法 cell 名和起点碰撞。
 - `tests/test_maps.py`：全部地图字段、随机圆确定性 / 边界、各类走廊和起终点验证。
-- `tests/test_polyhedral_frontier.py`（17 个）：公共旋转半径 ρ、边界行来自 broadphase 且 guard 来自其余 pair、剪枝后的 cell 是全部 broadphase 行 cell 的子集且几乎相同、cell 内任意构型真实 clearance ≥ d_s（蒙特卡洛）、yaw 半宽 = min(π/2, R_in/ρ) 且超出后截面为空、ℓ 恰好落在边界、射线步长、三维边界曲面、截面多边形与成员判定一致、portal 严格在两 cell 内且与暴力采样一致（LP / SOCP 均被调用）、p_region 三种调度、每次迭代至多 1 个 cell（`cells_built = 1 + 迭代 − no_progress`）与认证路线、live frontier 恰在所属 cell 边界且不被其他 cell 覆盖、p_region = 0 / 1 两个极端、post_fence 可达、起点碰撞。
+- `tests/test_polyhedral_frontier.py`（19 个；另 2 个检查 expandable 候选恰在 guard 边界或 yaw cap 上、满足所有障碍行且 room ≥ `min_sample_offset`，以及 region seed 离开源 cell、不越过任何已知障碍行、距边界点 ≤ δ、新 cell 有效）：公共旋转半径 ρ、边界行来自 broadphase 且 guard 来自其余 pair、剪枝后的 cell 是全部 broadphase 行 cell 的子集且几乎相同、cell 内任意构型真实 clearance ≥ d_s（蒙特卡洛）、yaw 半宽 = min(π/2, R_in/ρ) 且超出后截面为空、ℓ 恰好落在边界、射线步长、三维边界曲面、截面多边形与成员判定一致、portal 严格在两 cell 内且与暴力采样一致（LP / SOCP 均被调用）、p_region 三种调度、每次迭代至多 1 个 cell（`cells_built = 1 + 迭代 − no_progress`）与认证路线、live frontier 恰在所属 cell 边界且不被其他 cell 覆盖、p_region = 0 / 1 两个极端、post_fence 可达、起点碰撞。
 
 ## 当前算法与安全语义
 
@@ -50,9 +50,22 @@ cell overlap：yaw 区间或 guard 圆不相交时快速拒绝；节点连线上
 
 搜索（标准 RRT* 主体 + 有界比例的 region 采样通道）：每次迭代抽 `ξ ~ U(0, 1)`，`ξ < p_region` 走 region 通道，否则走 uniform 通道。`p_region` 调度：`switch`（默认，首解前 `region_before` = 0.5，之后 `region_after` = 0.2）、`constant`（`region_probability`）、`exp`（`p_min + (p_max − p_min) e^{−k t}`）。
 
-- **region 通道**：从 exposed frontier 候选 `(i, u, Δθ)` 中按 `exp(S/τ)` 抽一个（`S = α min(ℓ/ℓ_ref, 1) + β U + γ (G+1)/2`，候选由各节点 yaw 截面上 16 个方向的 ℓ_i(u, Δθ) 生成，`U` 为边界外探针中不在 union 内的比例，障碍平面上的边乘 `obstacle_edge_weight` 0.3；不做距离查询），`q_sample = 边界点 + sample_offset·u`，不建 cell；从 `q_i` 沿 chart 射线 steer（不超过 `steer_fraction` 0.9 × 射线到 C_i 边界的长度），得到 `q_new`。没有候选时回退 uniform（`region_fallback`）。
+- **frontier 按边界来源分类**：在各节点 yaw 截面上 16 个方向求 ℓ_i(u, Δθ) 得到边界点 b。
+  - **obstacle-limited**：active 障碍行在 b 起作用。障碍行是凸障碍的支撑半空间，对该 pair 处处成立，越过它就是已知受限区域。这类点只记录（`frontier_obstacle_limited`），不沿外法向采样。
+  - **expandable**：validity guard 在 b 起作用（`FRONTIER_GUARD`），或 yaw chart π/2 截断 cell 的上下平顶（`FRONTIER_YAW_CAP`，只在 R_in/ρ > π/2 时出现）。
+  - **outer rows**：guard 由 inactive pair 决定时，guard 边界的某些方向其实正对一个稍远的障碍。cell 另存 `outer_normals / outer_offsets`，即 `d − d_s < r_g + outer_reach`（0.5 m）的全部 pair 的未剪枝行，不进入证书，只用于分类和校验 seed。guard 点的 outer 行余量 room < `min_sample_offset`（0.02）时也归为 obstacle-limited。
+- **region 通道**：
+  - 从 expandable 候选中按 `exp(S/τ)` 抽一个。分数 `S = α min(ℓ/ℓ_ref, 1) + β U + γ (G+1)/2`，`U` 为沿外法向探针中不在 union 内的比例；不做距离查询。
+  - 方向 `u ∝ w_n u_out + w_t u_tan + w_g u_goal`（`direction_weights` 默认 1, 0.5, 0.5），在 (x, y, ρθ) 中归一化：
+    - `u_out` 是外法向：guard 为 `(û, sign Δθ)/√2`，yaw cap 为 `(0, 0, ±1)`；
+    - `u_tan` 是随机单位切向，模长乘 U(0, 1)；
+    - `u_goal` 是平面目标方向；
+    - 保证 `u·u_out ≥ min_outward`（0.3）。
+  - `q_new = b + step·u`，d_G 步长 `step = min(sample_offset 0.1, 0.9·room)`。因为行对 d_G 1-Lipschitz，`q_new` 离开当前 certificate，但不越过任何已知障碍行，新 cell 必然有效（实测 `region_reject_obstacle` = `rejected_collision` = 0）。
+  - 另要求 `q_new` 不被其他 cell 覆盖且在地图内；每个候选试 `sample_attempts`（4）个方向，每次迭代最多试 `candidate_picks`（3）个候选，都失败则回退 uniform（`region_fallback`）。
+  - 在 `q_new` 重新做 proximity query 建 cell；要求 `ρ_new ≥ min_new_ratio`，并与源 cell（不重叠时退而找其他邻居）有 portal 证书。
 - **uniform 通道**：`q_rand ~ U(SE(2))`（goal bias 0.12），d_G 最近节点（不含 goal 节点），同样 steer 且步长 ≤ `metric_step`。
-- 两个通道都**只对 `q_new` 建 1 个 cell**（一次位姿 proximity query），不预建候选 cell；region 样本要求 `ρ_new ≥ min_new_ratio`（0.05，否则 `redundant`），steer 步长过小记为 `no_progress`。随后与 parent 做 overlap 认证，在“可能重叠”（guard 圆 / yaw 区间相交）的至多 12 个节点中选父节点并 rewire，更新 frontier 覆盖。
+- 两个通道都**只对 `q_new` 建 1 个 cell**（一次位姿 proximity query），不预建候选 cell；region 样本要求 `ρ_new ≥ min_new_ratio`（0.05，否则 `redundant`），uniform steer 步长过小记为 `no_progress`。随后与 parent 做 overlap 认证，在“可能重叠”（guard 圆 / yaw 区间相交）的至多 12 个节点中选父节点并 rewire，更新 frontier 覆盖。
 - 目标：目标位姿（goal_xy, θ_new）落在 C_new 内即加 goal 节点（共享 C_new，不参与父节点选择 / rewire / nearest）。anytime 语义与 chart 版本相同。
 - `result.overlap_stats`：cell / 查询计数（`pose_queries` = 构造 cell 数 = N_query，`pair_queries` = robot-obstacle 距离对数）、overlap / LP / SOCP 计数、region / uniform 迭代数与接受节点数、frontier 统计、各类拒绝，以及 `first_goal_time_s`（T_first）、`first_goal_cost`（C_first）、`first_goal_pose_queries`、`plan_time_s`。
 
@@ -75,7 +88,7 @@ cell overlap：yaw 区间或 guard 圆不相交时快速拒绝；节点连线上
 - `--yaw-slices N`：orientation cell 的 yaw 切片数，默认 16（只对 orientation 生效）。
 - `--margin-weight W`：J_margin 权重，默认 0。
 - `--no-step-backoff`：关闭步长回退（旧的固定步长行为）。
-- `--cell polyhedral` 时另有：`--region-schedule {switch,constant,exp}`（默认 switch）、`--region-prob P`（constant，变体名加 `p<P>`）、`--region-before / --region-after`（switch，默认 0.5 / 0.2，非默认时加 `p<before>-<after>`）、`--region-max / --region-min / --region-decay`（exp，加 `pexp<max>-<min>-k<k>`）、`--safety-distance D_S`（0.02）、`--active-range R`（1.0）、`--score-weights A B G`（1 1 1）。变体名标记为 `cellP`；多出 `7_frontier.png`（全部 cell 的节点 yaw 截面构成的 union、仍 exposed 的 frontier 候选按 S 着色、ρ_new / ρ_overlap 直方图、region / uniform 接受节点累计数与 p_region 调度曲线）和 `8_tube_3d.png`（路径 cell 在 (x, y, θ) 中的三维实体，两个视角，底面为障碍投影）；`3_tube.png` 右上也画三维实体（`boundary_radii` 给出的半透明边界曲面，yaw chart 截断处加平顶），右下为最紧 portal 处的截面（实线边 = active 障碍平面，虚线边 = guard 弧）；`run.md` 额外列出 T_first / C_first / N_query、LP / SOCP、拒绝、采样通道和 frontier 统计以及 `frontier.*` 配置。
+- `--cell polyhedral` 时另有：`--region-schedule {switch,constant,exp}`（默认 switch）、`--region-prob P`（constant，变体名加 `p<P>`）、`--region-before / --region-after`（switch，默认 0.5 / 0.2，非默认时加 `p<before>-<after>`）、`--region-max / --region-min / --region-decay`（exp，加 `pexp<max>-<min>-k<k>`）、`--safety-distance D_S`（0.02）、`--active-range R`（1.0）、`--score-weights A B G`（1 1 1）、`--direction-weights W_N W_T W_G`（1 0.5 0.5）、`--sample-offset DELTA`（0.1）。变体名标记为 `cellP`；多出 `7_frontier.png`（全部 cell 的节点 yaw 截面构成的 union；仍 exposed 的 obstacle-limited 边界点（灰）、expandable 候选（圆 = guard，三角 = yaw cap，按 S 着色）、region 扩展 `b → q_new`（绿线）；ρ_new / ρ_overlap 直方图、region / uniform 接受节点累计数与 p_region 调度曲线）和 `8_tube_3d.png`（路径 cell 在 (x, y, θ) 中的三维实体，两个视角，底面为障碍投影）；`3_tube.png` 右上也画三维实体（`boundary_radii` 给出的半透明边界曲面，yaw chart 截断处加平顶），右下为最紧 portal 处的截面（实线边 = active 障碍平面，虚线边 = guard 弧）；`run.md` 额外列出 T_first / C_first / N_query、LP / SOCP、拒绝、采样通道和 frontier 统计以及 `frontier.*` 配置。
 - `--progress-interval INT`，非负，默认 500；传 0 关闭搜索进度输出。
 - `--show`：保存后再交互式显示全部图。
 
@@ -122,32 +135,37 @@ orientation 版本的旧命令 `--map random_circles --seed 7 --slot-scale 2 --a
 
 polyhedral region/uniform RRT*（同一场景，square × 2 即相邻 1 m，默认 switch 调度 0.5 → 0.2，anytime 2500 次迭代，planner seed 7，单次实测，env-rebuilt）：
 
-| 地图 | 首次到达迭代 / T_first / 首解前 N_query | C_first → C_2500 / 最小 clearance | 节点 | 夹障碍路径节点 / 路径节点 | 每 cell broadphase / 边界行 | 规划耗时 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `random_circles` | 45 / 0.040 s / 45 | 11.300 → 11.266 / 0.157 | 1869 | 0 / 16 | 3.21 / 2.07 | 3.85 s |
-| `single_post` | 48 / 0.036 s / 49 | 11.621 → 11.302 / 0.176 | 1900 | 0 / 14 | 1.76 / 0.98 | 3.16 s |
-| `post_fence` | 402 / 0.387 s / 361 | 13.374 → 12.699 / 0.130 | 1880 | 2 / 21 | 2.86 / 1.59 | 3.44 s |
+| 地图 | 首次到达迭代 / T_first / 首解前 N_query | C_first → C_2500 / 最小 clearance | 节点 | 夹障碍路径节点 / 路径节点 | 规划耗时 |
+| --- | --- | --- | --- | --- | --- |
+| `random_circles` | 63 / 0.066 s / 63 | 13.002 → 12.064 / 0.082 | 1843 | 0 / 19 | 2.94 s |
+| `single_post` | 38 / 0.039 s / 39 | 12.115 → 11.152 / 0.138 | 1904 | 0 / 12 | 2.86 s |
+| `post_fence` | 98 / 0.096 s / 93 | 11.354 → 10.966 / 0.039 | 1928 | 1 / 16 | 3.04 s |
+
+每个 cell 平均 broadphase pair 约 2–3 个、边界行 1–2 行。边界统计：每次运行约 6–9 万个 fan 边界点为 obstacle-limited，只有 4–6 千个为 expandable；region 节点约 210–290 个 / 约 540 次 region 迭代。
 
 v1（多 seed 预建 cell）→ v2：每次迭代至多 1 个 cell，N_query = 构造 cell 数 ≈ 迭代数；二级剪枝后每个 cell 平均只剩 1–2 行。
 
-p_region 消融（`scripts/ablate_region_sampling.py --seeds 20`，每配置 20 个 planner seed，全部成功，总耗时约 105 s；完整表格与图见 `results/region_ablation/README.md`）。均值：
+p_region 消融（`scripts/ablate_region_sampling.py --seeds 20`，每配置 20 个 planner seed，全部成功，总耗时约 90 s；完整表格与图见 `results/region_ablation/README.md`）。按边界来源区分的 region 通道，均值：
 
 | 地图 | 指标 | p=0 | p=0.2 | p=0.4 | p=0.6 | p=0.8 | p=1 | switch | exp |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `random_circles` | T_first [s] | 0.333 | 0.170 | 0.126 | 0.086 | 0.067 | 0.062 | 0.105 | 0.108 |
-| | C_2500 | 12.55 | 11.89 | 11.95 | 11.82 | 11.96 | 11.78 | 11.86 | 11.79 |
-| `single_post` | T_first [s] | 0.133 | 0.099 | 0.075 | 0.066 | 0.048 | 0.039 | 0.054 | 0.053 |
-| | C_2500 | 11.50 | 11.48 | 11.68 | 11.57 | 11.50 | 11.73 | 11.61 | 11.63 |
-| `post_fence` | T_first [s] | 0.241 | 0.232 | 0.330 | 0.254 | 0.408 | 0.596 | 0.275 | 0.267 |
-| | C_2500 | 11.48 | 11.52 | 11.94 | 11.59 | 11.73 | 12.12 | 11.90 | 11.87 |
+| `random_circles` | T_first [s] | 0.332 | 0.162 | 0.116 | 0.104 | 0.080 | 0.063 | 0.108 | 0.120 |
+| | C_first | 13.36 | 12.65 | 12.61 | 12.67 | 12.54 | 12.56 | 12.70 | 12.62 |
+| | C_2500 | 12.55 | 12.13 | 11.94 | 12.02 | 11.95 | 12.00 | 12.05 | 12.04 |
+| `single_post` | T_first [s] | 0.150 | 0.109 | 0.086 | 0.078 | 0.061 | 0.051 | 0.084 | 0.084 |
+| | C_first | 11.82 | 12.42 | 12.85 | 12.93 | 13.09 | 12.83 | 12.75 | 12.56 |
+| | C_2500 | 11.50 | 11.63 | 11.56 | 11.59 | 11.67 | 11.68 | 11.62 | 11.72 |
+| `post_fence` | T_first [s] | 0.252 | 0.244 | 0.165 | 0.287 | 0.354 | 0.477 | 0.259 | 0.253 |
+| | C_first | 11.84 | 12.13 | 12.27 | 12.54 | 12.80 | 12.94 | 12.94 | 12.39 |
+| | C_2500 | 11.48 | 11.70 | 11.45 | 11.77 | 11.94 | 12.10 | 12.05 | 11.79 |
 
-结论：开阔 / 单障碍场景中 region 通道把 T_first 和首解前查询数降到 1/3–1/5（random_circles 中 p=0 的 C_2500 也明显更差）；但 post_fence 中 p_region 越大越慢（p=1 的 T_first 约为 p=0 的 2.5 倍），因为 frontier 分数偏向大 ℓ / 大未覆盖量，柱子之间窄缝的边界点得分低，而 uniform 采样 + goal bias 反而更快穿过栅栏。switch / exp 在三张图上都接近最优档，是折中默认值；post_fence 上 C_2500 仍略逊于 p ≤ 0.2。
+与上一版（所有 exposed 边界统一向外、从源 cell 内 steer，`bededcf`）相比：首解迭代数与 T_first 基本持平（random_circles / single_post 仍比 p=0 快 2–5 倍）；总规划时间降低约 15–25%；C_first 普遍略差 0.2–0.7（只从 guard 边界扩展，seed 远离障碍，首解更绕）；post_fence 的 p=0.4 明显改善（T_first 0.31 → 0.17 s，C_2500 11.94 → 11.45），但 p ≥ 0.6 仍比 p=0 慢：栅栏附近几乎全部边界都是 obstacle-limited，穿过柱间主要靠 uniform 采样。switch / exp 仍是折中默认值。
 
 orientation 的 clearance 是展开路线上的局部 guarded clearance，一阶 / 二阶是认证路线上稠密采样的 guarded clearance，两者口径不同。对全部树边稠密检查，这些场景中一阶 cell 也没有产生碰撞边；但一阶 cell 内确实存在真实位移超过 `rho` 的构型，只有二阶 cell 是证书。`formation/distance_field.py:61-68` 的纯 Python 行列扫描约 0.6s，是独立热点，当前未改。
 
 ## 验证命令与最近记录
 
-最近验证记录：focused 37 tests（`test_polyhedral_frontier` 17 + `test_tube_rrt` 12 + `test_maps` 8），完整 84 tests；这些是最近一次验证记录，不是永久保证。
+最近验证记录：focused 39 tests（`test_polyhedral_frontier` 19 + `test_tube_rrt` 12 + `test_maps` 8），完整 86 tests；这些是最近一次验证记录，不是永久保证。
 
 项目使用的 Conda 环境是 `../env-rebuilt`（即 `/home/eai/projects/env-rebuilt`，可用 `conda activate /home/eai/projects/env-rebuilt` 激活）。
 
