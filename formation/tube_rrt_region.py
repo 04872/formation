@@ -57,6 +57,8 @@ class RegionTubeConfig:
     max_neighbors: int = 12
     exact_overlap: bool = True
     """Solve LP / SOCP for NearConnect / rewire pairs without a line witness that could still improve a cost."""
+    lazy_geometry: bool = True
+    """Build cells as rows only (``PolyhedralCellModel.lazy_geometry``): in-circle on first use, no samples."""
     colliding: str = "drop"
     """A colliding ``q_rand``: ``"drop"`` (Tube-RRT*) or ``"extend"`` (capture with ``l_rand = 0`` and steer towards it)."""
 
@@ -86,6 +88,7 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         self.tube_config = tube_config or RegionTubeConfig()
         super().__init__(map_data, formation, start, goal_xy, config or TubeRRTConfig(cell_model="polyhedral_tube"),
                          self.tube_config.cell_config())
+        self.cells.lazy_geometry = self.tube_config.lazy_geometry
 
     def edge_cost(self, first: TubeRRTNode, second: TubeRRTNode, certificate: PortalCertificate) -> float:
         """Route length, optionally penalised by ``margin_weight / r_portal`` (the certified edge width)."""
@@ -249,10 +252,20 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             for key in ("witness", "center_witness", "exact_calls", "exact_accept", "skipped_bound"):
                 self._stats[f"{kind}_{key}"] = 0
 
+    def _deep_point(self, cell: PolyhedralCell) -> np.ndarray:
+        """In-circle centre when already known, else ``approximate_center`` (cached on the cell)."""
+        if cell._center_offset is not None:
+            return cell._center_offset
+        point = getattr(cell, "_deep", None)
+        if point is None:
+            point = cell._deep = self.cells.approximate_center(cell)
+        return point
+
     def _center_witness(self, first: PolyhedralCell, second: PolyhedralCell) -> PortalCertificate | None:
-        """Best of a few points on the segment between the two in-circle centres (still no optimisation)."""
-        a = np.array((first.pose.x + first.center_offset[0], first.pose.y + first.center_offset[1], first.pose.yaw))
-        b = np.array((second.pose.x + second.center_offset[0], second.pose.y + second.center_offset[1],
+        """Best of a few points on the segment between two deep points of the cells (no optimisation)."""
+        ca, cb = self._deep_point(first), self._deep_point(second)
+        a = np.array((first.pose.x + ca[0], first.pose.y + ca[1], first.pose.yaw))
+        b = np.array((second.pose.x + cb[0], second.pose.y + cb[1],
                       first.pose.yaw + wrap_to_pi(second.pose.yaw - first.pose.yaw)))
         ts = np.asarray(_CENTER_CANDIDATES)
         points = a[None, :] + ts[:, None] * (b - a)[None, :]

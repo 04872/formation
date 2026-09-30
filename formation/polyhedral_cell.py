@@ -120,12 +120,9 @@ class PolyhedralCell:
     guard: float
     """``r_g`` of the validity predicate ``||dc|| + rho |dtheta| <= r_g``."""
     yaw_limit: float
-    """``L = min(pi / 2, R_in / rho)``: the natural yaw half-width of the cell."""
+    """``L = min(pi / 2, R_in / rho)``: the natural yaw half-width of the cell (lazy cells use a cheap upper
+    bound of ``R_in``; the set is the same because ``P(dtheta)`` is empty for ``rho |dtheta| > R_in`` anyway)."""
     rho: float
-    inradius: float = 0.0
-    """``R_in``: in-radius of the section ``S_0 = P(0)`` (``C_dir`` and guard)."""
-    center_offset: np.ndarray = field(default_factory=lambda: np.zeros(2))
-    """In-circle centre of ``S_0`` relative to ``c_0``; it lies in ``P(dtheta)`` for every valid yaw."""
     broadphase_pairs: int = 0
     outer_normals: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))
     outer_offsets: np.ndarray = field(default_factory=lambda: np.empty(0))
@@ -134,13 +131,54 @@ class PolyhedralCell:
 
     Not part of the certificate: they tell which part of the guard boundary faces a known obstacle and keep
     seeds placed just beyond the cell out of known restricted regions."""
-    samples: np.ndarray = field(default_factory=lambda: np.empty((0, 3)))
-    """Deterministic quasi-random world configurations ``(x, y, theta)`` inside the cell."""
-    volume: float = 0.0
-    """Volume in ``(x, y, rho * theta)`` [m^3], estimated from the quasi-random box samples."""
     new_ratio: float = math.nan
     overlap_ratio: float = math.nan
     mode: str = ""
+    _inradius: float | None = field(default=None, repr=False)
+    _center_offset: np.ndarray | None = field(default=None, repr=False)
+    _samples: np.ndarray | None = field(default=None, repr=False)
+    _volume: float | None = field(default=None, repr=False)
+    _model: "PolyhedralCellModel | None" = field(default=None, repr=False)
+
+    def _incircle(self) -> None:
+        if self._model is None or not self.radius > 0.0:
+            self._center_offset, self._inradius = np.zeros(2), 0.0
+        else:
+            self._center_offset, self._inradius = self._model._inscribed_circle(self)
+
+    @property
+    def inradius(self) -> float:
+        """``R_in``: in-radius of the section ``S_0 = P(0)`` (``C_dir`` and guard); computed on first use."""
+        if self._inradius is None:
+            self._incircle()
+        return self._inradius
+
+    @property
+    def center_offset(self) -> np.ndarray:
+        """In-circle centre of ``S_0`` relative to ``c_0``; it lies in ``P(dtheta)`` for every valid yaw."""
+        if self._center_offset is None:
+            self._incircle()
+        return self._center_offset
+
+    @property
+    def samples(self) -> np.ndarray:
+        """Deterministic quasi-random world configurations ``(x, y, theta)`` inside the cell (first use)."""
+        if self._samples is None:
+            self._fill()
+        return self._samples
+
+    @property
+    def volume(self) -> float:
+        """Volume in ``(x, y, rho * theta)`` [m^3], estimated from the quasi-random box samples (first use)."""
+        if self._volume is None:
+            self._fill()
+        return self._volume
+
+    def _fill(self) -> None:
+        if self._model is None or not self.valid:
+            self._samples, self._volume = np.empty((0, 3)), 0.0
+        else:
+            self._model._fill_samples(self)
 
     @property
     def radius(self) -> float:
@@ -167,8 +205,12 @@ class PolyhedralCellModel:
 
     def __init__(self, slots: np.ndarray, map_data: MapData, clearance_margin: float, safety_distance: float = 0.02,
                  active_range: float = 1.0, parallel_tolerance: float = math.radians(5.0), max_extent: float = 1.5,
-                 yaw_chart: float = math.pi / 2.0, cell_samples: int = 128, outer_reach: float = 0.5) -> None:
+                 yaw_chart: float = math.pi / 2.0, cell_samples: int = 128, outer_reach: float = 0.5,
+                 lazy_geometry: bool = False) -> None:
         self.outer_reach = float(outer_reach)
+        self.lazy_geometry = bool(lazy_geometry)
+        """Build only ``A q >= b`` (proximity, active pairs, exact vectorised redundancy filters); the in-circle,
+        samples and volume are computed on first use and there are no outer rows."""
         self.slots = np.asarray(slots, dtype=float)
         self.rho = float(np.max(np.linalg.norm(self.slots, axis=1)))
         if self.rho <= 0.0:
@@ -228,6 +270,8 @@ class PolyhedralCellModel:
         return clearance, np.concatenate((wall_normals, normals), axis=1)
 
     def make_cell(self, pose: Pose2D) -> PolyhedralCell:
+        if self.lazy_geometry:
+            return self._make_lazy_cell(pose)
         self.stats["cells_built"] += 1
         self.stats["pose_queries"] += 1
         self.stats["pair_queries"] += len(self.slots) * self.component_count
@@ -246,12 +290,63 @@ class PolyhedralCellModel:
                               offsets=offsets, pairs=tuple(zip(robots[rows].tolist(), components[rows].tolist())),
                               guard=guard, yaw_limit=0.0, rho=self.rho, broadphase_pairs=len(robots),
                               outer_normals=normals[outer].reshape((-1, 2)), outer_offsets=clearance[outer] - d_s,
-                              outer_robots=np.nonzero(outer)[0])
+                              outer_robots=np.nonzero(outer)[0], _model=self)
         if cell.radius > 0.0:
-            cell.center_offset, cell.inradius = self._inscribed_circle(cell)
-            cell.yaw_limit = min(self.yaw_chart, cell.inradius / self.rho)
+            cell._center_offset, cell._inradius = self._inscribed_circle(cell)
+            cell.yaw_limit = min(self.yaw_chart, cell._inradius / self.rho)
             self._fill_samples(cell)
         return cell
+
+    def _make_lazy_cell(self, pose: Pose2D) -> PolyhedralCell:
+        """One proximity pass and the rows ``A q >= b``; nothing else.
+
+        Rows are dropped only when they are implied inside the guard disk, so the cell is exactly the cell of
+        all broadphase rows: ``e_k >= r_g`` (``n^T dc - rho |dtheta| + e >= e - r_g``), or another row ``i`` with
+        ``e_j >= e_i + ||n_j - n_i|| r_g`` (then ``n_j^T dc + e_j >= n_i^T dc + e_i`` for ``||dc|| <= r_g``).
+        """
+        stats = self.stats
+        stats["cells_built"] += 1
+        stats["pose_queries"] += 1
+        count = len(self.slots)
+        stats["pair_queries"] += count * self.component_count
+        clearance, normals = self.proximity(self.robot_positions(pose))
+        flat = clearance.ravel()
+        broadphase = flat < self.active_range
+        broadphase_count = int(broadphase.sum())
+        guard = self.max_extent
+        if broadphase_count < len(flat):
+            guard = min(float(flat[~broadphase].min()) - self.safety_distance, guard)
+        offsets = flat - self.safety_distance
+        index = np.flatnonzero(broadphase & (offsets < guard))
+        offsets = offsets[index]
+        rows = normals.reshape((-1, 2))[index]
+        if len(index) > 1:
+            gap = np.sqrt(((rows[:, None, :] - rows[None, :, :]) ** 2).sum(axis=2)) * guard
+            order = np.argsort(offsets, kind="stable")
+            implied = (offsets[:, None] >= offsets[None, :] + gap) & (order.argsort()[None, :] < order.argsort()[:, None])
+            keep = ~implied.any(axis=1)
+            if not keep.all():
+                index, offsets, rows = index[keep], offsets[keep], rows[keep]
+        stats["broadphase_pairs"] += broadphase_count
+        stats["active_pairs"] += len(index)
+        components = clearance.shape[1]
+        radius = min(float(offsets.min()), guard) if len(index) else guard
+        bound = 0.5 * (radius + guard)
+        return PolyhedralCell(pose=pose, clearance=float(flat.min()), normals=rows, offsets=offsets,
+                              pairs=tuple(zip((index // components).tolist(), (index % components).tolist())),
+                              guard=guard, yaw_limit=min(self.yaw_chart, bound / self.rho) if radius > 0.0 else 0.0,
+                              rho=self.rho, broadphase_pairs=broadphase_count, _model=self)
+
+    def approximate_center(self, cell: PolyhedralCell) -> np.ndarray:
+        """A deep point of ``S_0`` (offset from ``c_0``) without optimisation: the best of the guard-only and
+        one-row-plus-guard in-circle candidates, each scored by its true margin."""
+        if not len(cell.offsets):
+            return np.zeros(2)
+        e = np.minimum(cell.offsets, cell.guard)
+        points = np.vstack((np.zeros((1, 2)), 0.5 * (cell.guard - e)[:, None] * cell.normals))
+        margin = np.minimum((points @ cell.normals.T + cell.offsets[None, :]).min(axis=1),
+                            cell.guard - np.sqrt((points ** 2).sum(axis=1)))
+        return points[int(np.argmax(margin))]
 
     def _boundary_rows(self, normals: np.ndarray, offsets: np.ndarray, guard: float) -> tuple[np.ndarray, np.ndarray]:
         """Rows that bound ``S_0`` and their offsets.
@@ -361,10 +456,10 @@ class PolyhedralCellModel:
         inside = self._local_slack(cell, dx, dy, dphi) > _INSIDE_TOL
         box = (2.0 * g) ** 2 * 2.0 * cell.rho * limit
         kept = int(np.count_nonzero(inside))
-        cell.volume = box * max(kept, 0.5) / len(unit)
+        cell._volume = box * max(kept, 0.5) / len(unit)
         if kept == 0:
             dx, dy, dphi, inside = np.zeros(1), np.zeros(1), np.zeros(1), np.ones(1, dtype=bool)
-        cell.samples = np.column_stack((cell.pose.x + dx[inside], cell.pose.y + dy[inside],
+        cell._samples = np.column_stack((cell.pose.x + dx[inside], cell.pose.y + dy[inside],
                                         wrap_array(cell.pose.yaw + dphi[inside])))
 
     # -- membership ------------------------------------------------------------------------------------

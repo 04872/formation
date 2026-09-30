@@ -68,6 +68,33 @@ class RegionTubeGeometryTest(unittest.TestCase):
             self.assertGreaterEqual(analytic, reference - 1e-7)
             self.assertLessEqual(analytic, reference + 1e-6)
 
+    def test_lazy_cells_are_the_unpruned_cells_and_skip_the_geometry(self) -> None:
+        eager = region_tube_planner(tube_config=RegionTubeConfig(lazy_geometry=False)).cells
+        rng = np.random.default_rng(2)
+        compared = 0
+        for pose in random_poses(self.planner, 600, seed=4):
+            lazy_cell, eager_cell = self.model.make_cell(pose), eager.make_cell(pose)
+            self.assertEqual(lazy_cell.valid, eager_cell.valid)
+            if not lazy_cell.valid:
+                continue
+            self.assertIsNone(lazy_cell._inradius)
+            self.assertIsNone(lazy_cell._samples)
+            self.assertGreaterEqual(lazy_cell.yaw_limit, eager_cell.yaw_limit - 1e-12)
+            points = np.column_stack((pose.x + rng.uniform(-1.6, 1.6, 300), pose.y + rng.uniform(-1.6, 1.6, 300),
+                                      pose.yaw + rng.uniform(-1.6, 1.6, 300)))
+            lazy_slack, eager_slack = self.model.slack_many(lazy_cell, points), eager.slack_many(eager_cell, points)
+            self.assertFalse(np.any((eager_slack > 1e-9) & (lazy_slack <= 0.0)))
+            self.assertLess(np.mean((lazy_slack > 0.0) != (eager_slack > 0.0)), 0.01)
+            self.assertAlmostEqual(lazy_cell.inradius, eager_cell.inradius, delta=0.02)
+            compared += 1
+        self.assertGreater(compared, 100)
+
+    def test_approximate_center_is_inside_the_section(self) -> None:
+        for cell in valid_cells(self.planner, 200, seed=8):
+            point = self.model.approximate_center(cell)
+            pose = Pose2D(cell.pose.x + point[0], cell.pose.y + point[1], cell.pose.yaw)
+            self.assertGreater(self.model.slack(cell, pose), 0.0)
+
     def test_vectorised_extents_and_slack_match_the_cell_model(self) -> None:
         planner, rng = self.planner, np.random.default_rng(1)
         nodes = np.arange(len(planner._nodes))
