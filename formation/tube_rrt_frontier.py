@@ -534,7 +534,9 @@ class PolyhedralFrontierPlanner:
         indices.reverse()
         route = [self._nodes[indices[0]].pose]
         for child in indices[1:]:
-            for pose in (self._nodes[child].certificate.portal, self._nodes[child].pose):
+            certificate = self._nodes[child].certificate
+            waypoints = ((certificate.launch,) if certificate.launch is not None else ())
+            for pose in (*waypoints, certificate.portal, self._nodes[child].pose):
                 if pose != route[-1]:
                     route.append(pose)
         return route, indices

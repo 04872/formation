@@ -139,6 +139,7 @@ class PolyhedralCell:
     _samples: np.ndarray | None = field(default=None, repr=False)
     _volume: float | None = field(default=None, repr=False)
     _model: "PolyhedralCellModel | None" = field(default=None, repr=False)
+    _release_geometry: tuple[np.ndarray, np.ndarray, np.ndarray] | None = field(default=None, repr=False)
 
     def _incircle(self) -> None:
         if self._model is None or not self.radius > 0.0:

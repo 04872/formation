@@ -47,6 +47,10 @@ class PortalCertificate:
     """Smallest relative slack ``1 - f(q_p) / radius`` over the two cells."""
     route_length: float
     """``||q_p - q_a||_{F,a} + ||q_b - q_p||_{F,b}``."""
+    launch: Pose2D | None = None
+    """Optional launch waypoint. With an explicit branch entry, the edge ends
+    at ``portal`` (the child's entry), rather than making a detour to its seed.
+    """
 
 
 def interpolate_pose(first: Pose2D, second: Pose2D, alpha: float) -> Pose2D:

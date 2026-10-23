@@ -43,6 +43,7 @@ from formation import (
     PolyhedralCellModel,
     PolyhedralFrontierPlanner,
     RegionTubeConfig,
+    LaunchConfig,
     RegionTubeRRTPlanner,
     TubeRRTPlanner,
     TubeRRTResult,
@@ -572,7 +573,9 @@ def draw_chart_tube_xy(axis, result: TubeRRTResult, map_data, rho_norm: Normaliz
                       textcoords="offset points", ha="center", fontsize=9,
                       bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="0.6"),
                       arrowprops=dict(arrowstyle="->", color="k"), zorder=10)
-    draw_path(axis, result.path_poses, label="certified route q_k -> q_p -> q_k+1")
+    entry_route = bool(result.tree_nodes and result.tree_nodes[0].entry is not None)
+    draw_path(axis, result.path_poses, label="certified entry -> launch -> next entry" if entry_route else
+              "certified route q_k -> q_p -> q_k+1")
     axis.set_title("path cells sliced at node yaw (disk radius = cell radius) and portals", fontsize=10)
 
 
@@ -899,8 +902,9 @@ def draw_region_tube(figure, result: TubeRRTResult, map_data, planner: RegionTub
     polygons = [p for p in (poly_slice(node.cell, 0.0) for node in nodes) if p is not None]
     axis.add_collection(PolyCollection(polygons, facecolors="tab:cyan", edgecolors="none", alpha=0.025, zorder=3))
     for kind, color, name in EDGE_KIND_STYLE:
-        segments = [((nodes[n.parent].pose.x, nodes[n.parent].pose.y), (n.certificate.portal.x, n.certificate.portal.y),
-                     (n.pose.x, n.pose.y)) for i, n in enumerate(nodes)
+        segments = [((nodes[n.parent].entry_pose.x, nodes[n.parent].entry_pose.y),
+                     *(((n.certificate.launch.x, n.certificate.launch.y),) if n.certificate.launch is not None else ()),
+                     (n.certificate.portal.x, n.certificate.portal.y), (n.entry_pose.x, n.entry_pose.y)) for i, n in enumerate(nodes)
                     if n.parent is not None and planner.edge_kind.get(i) == kind]
         if segments:
             axis.add_collection(LineCollection(segments, colors=color, linewidths=0.7 if kind == "steer" else 1.1,
@@ -1354,6 +1358,17 @@ def variant_name(args) -> str:
             parts.append(f"p{number_tag(args.region_before)}-{number_tag(args.region_after)}")
     if args.cell == "polyhedral_tube":
         default = RegionTubeConfig()
+        if args.expansion != "tube":
+            parts.append(args.expansion)
+            launch_default = LaunchConfig()
+            for name, value, default_value in (
+                ("Lin", args.launch_distance, launch_default.internal_distance),
+                ("threshold", args.opening_threshold, launch_default.threshold),
+                ("facet_eps", args.launch_facet_epsilon, launch_default.facet_epsilon),
+                ("prog_eps", args.launch_progress_epsilon, launch_default.progress_epsilon),
+            ):
+                if value != default_value:
+                    parts.append(f"{name}{number_tag(value)}")
         if args.nearest != default.nearest:
             parts.append(f"nearest{args.nearest}")
         if args.max_step != default.max_step:
@@ -1411,8 +1426,12 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
     chart = cell_model != "orientation"
     poly = cell_model in ("polyhedral", "polyhedral_tube")
     overlap = summary.get("overlap_stats") or {}
+    cell_description = CELL_DESCRIPTIONS[cell_model]
     if cell_model == "polyhedral_tube":
+        expansion = summary["tube_config"]["expansion"]
         overlap_rows = [
+            f"| expansion / opening 临时 cell 数 / 选中正 opening 次数 | "
+            f"{expansion} / {overlap['opening_cells']} / {overlap['opening_selected']} |",
             f"| T_first / C_first / 首解前 N_query | {overlap['first_goal_time_s']:.3f} s / "
             f"{overlap['first_goal_cost']:.3f} / {overlap['first_goal_pose_queries']} |",
             f"| 总规划时间 / N_query（位姿 proximity 查询 = 构造 cell 数） / robot-obstacle 距离对 | "
@@ -1437,6 +1456,14 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
             f"{overlap['broadphase_pairs'] / max(overlap['cells_built'], 1):.2f} / "
             f"{overlap['active_pairs'] / max(overlap['cells_built'], 1):.2f} |",
         ]
+        if expansion != "tube":
+            cell_description = (f"certified polyhedral cell；point nearest；{expansion} launch；"
+                                "固定步长 steer；单 parent RRT* 与 overlap rewire")
+            overlap_rows[3] = "| 采样 / nearest | 原有 SE(2) 随机采样和 goal bias / point nearest；不构造 C_rand |"
+            overlap_rows[4] = (f"| launch-steer：插入节点 / 首次成功 / 新 cell / 失败（无进展 / 碰撞 / 无 overlap） | "
+                               f"{overlap['tube_nodes']} / {overlap['steer_first_try']} / {overlap['steer_cells']} / "
+                               f"{overlap['rejected_no_progress']} / {overlap['rejected_collision']} / "
+                               f"{overlap['rejected_no_overlap']} |")
     elif poly:
         overlap_rows = [
             f"| T_first / C_first / 首解前 N_query | {overlap['first_goal_time_s']:.3f} s / "
@@ -1506,7 +1533,7 @@ def write_report(run_dir: Path, summary: dict, console: str) -> None:
         "",
         "| 参数 | 值 |",
         "| --- | --- |",
-        f"| cell | {CELL_DESCRIPTIONS[cell_model]} |",
+        f"| cell | {cell_description} |",
         f"| 地图 | {summary['map']}, seed {summary['seed']} |",
         f"| 编队 | {summary['formation']} × {number_tag(summary['slot_scale'])}"
         f"（R_F = {summary['formation_radius']:.3f} m，相邻机器人最小间距 {summary['min_slot_distance']:.3f} m） |",
@@ -1665,6 +1692,16 @@ def main() -> None:
                         help="polyhedral only: delta [m], how far region seeds go beyond the exit from the cell")
     parser.add_argument("--nearest", default=RegionTubeConfig.nearest, choices=("gap", "point"),
                         help="polyhedral_tube only: region-gap nearest argmin D - l_i - l_rand, or point nearest argmin D")
+    parser.add_argument("--expansion", default=RegionTubeConfig.expansion, choices=("tube", "point", "projection", "opening"),
+                        help="polyhedral_tube: projection = continuous-cell core; opening = near-projection release "
+                             "correction; point = seed-launch ablation; tube = legacy TubeSteer")
+    parser.add_argument("--launch-distance", type=float, default=LaunchConfig.internal_distance)
+    parser.add_argument("--opening-threshold", type=float, default=LaunchConfig.threshold,
+                        help="minimum maximum facet release utility to activate opening launch")
+    parser.add_argument("--launch-progress-epsilon", type=float, default=LaunchConfig.progress_epsilon,
+                        help="maximum W-distance loss relative to sample projection for release correction")
+    parser.add_argument("--launch-facet-epsilon", type=float, default=LaunchConfig.facet_epsilon,
+                        help="allowed first-stage facet progress loss in the second convex solve")
     parser.add_argument("--max-step", type=float, default=RegionTubeConfig.max_step,
                         help="polyhedral_tube only: largest TubeSteer advance s along the random direction (d_G)")
     parser.add_argument("--min-witness", type=float, default=RegionTubeConfig.min_witness,
@@ -1717,7 +1754,12 @@ def main() -> None:
         try:
             tube_config = RegionTubeConfig(safety_distance=args.safety_distance, active_range=args.active_range,
                                            nearest=args.nearest, max_step=args.max_step, min_witness=args.min_witness,
-                                           exact_overlap=not args.no_exact_overlap, colliding=args.colliding)
+                                           exact_overlap=not args.no_exact_overlap, colliding=args.colliding,
+                                           expansion=args.expansion,
+                                           launch=LaunchConfig(internal_distance=args.launch_distance,
+                                                               threshold=args.opening_threshold,
+                                                               facet_epsilon=args.launch_facet_epsilon,
+                                                               progress_epsilon=args.launch_progress_epsilon))
         except ValueError as error:
             parser.error(str(error))
 
@@ -1815,6 +1857,8 @@ def main() -> None:
         "timing": timing,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if isinstance(planner, RegionTubeRRTPlanner):
+        (run_dir / "expansions.json").write_text(json.dumps(planner.expansion_log, indent=2), encoding="utf-8")
     write_report(run_dir, summary, tee.getvalue())
     out_root = args.out_dir.resolve()
     index = write_index(out_root)

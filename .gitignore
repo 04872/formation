@@ -5,7 +5,7 @@ __pycache__/
 *.pyd
 
 
-# **/results/
+**/results/
 **/paper/   
 **/.codex/**
 **/.claude/**

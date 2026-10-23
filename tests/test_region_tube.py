@@ -30,7 +30,7 @@ def region_tube_planner(map_name: str = "random_circles", tube_config: RegionTub
     map_data = MapBuilder().build(map_name, MAPS[map_name](robot_radius=0.113, safety_margin=0.06, **extra))
     config = TubeRRTConfig(cell_model="polyhedral_tube", seed=7, **overrides)
     return make_tube_rrt_planner(map_data, SLOTS, Pose2D(*map_data.start_xy, 0.0), config=config,
-                                 tube_config=tube_config)
+                                 tube_config=tube_config or RegionTubeConfig(expansion="tube"))
 
 
 def random_poses(planner: RegionTubeRRTPlanner, count: int, seed: int) -> list[Pose2D]:
@@ -222,7 +222,7 @@ class RegionTubePlannerTest(unittest.TestCase):
                 self.assertGreater(result.overlap_stats["samples_colliding"], 0)
 
     def test_without_exact_overlap_no_lp_is_solved(self) -> None:
-        result = region_tube_planner(tube_config=RegionTubeConfig(exact_overlap=False), max_iterations=600,
+        result = region_tube_planner(tube_config=RegionTubeConfig(expansion="tube", exact_overlap=False), max_iterations=600,
                                      stop_on_first_goal=False).plan()
         self.assertTrue(result.success)
         self.assertEqual(result.overlap_stats["lp_calls"], 0)
@@ -230,7 +230,7 @@ class RegionTubePlannerTest(unittest.TestCase):
         self.assertEqual(result.overlap_stats["near_exact_calls"] + result.overlap_stats["rewire_exact_calls"], 0)
 
     def test_point_nearest_and_extend_variants_plan(self) -> None:
-        for tube_config in (RegionTubeConfig(nearest="point"), RegionTubeConfig(colliding="extend")):
+        for tube_config in (RegionTubeConfig(expansion="tube", nearest="point"), RegionTubeConfig(expansion="tube", colliding="extend")):
             with self.subTest(nearest=tube_config.nearest, colliding=tube_config.colliding):
                 planner = region_tube_planner(tube_config=tube_config, max_iterations=2500, stop_on_first_goal=True)
                 result = planner.plan()

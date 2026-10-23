@@ -28,6 +28,7 @@ from formation.swept_band import SweptBand, SweptBandBuilder
 from formation.tube_cell_first_order import FirstOrderCellModel, PortalCertificate, TubeCell
 from formation.tube_cell_second_order import SecondOrderCellModel
 from formation.polyhedral_cell import PolyhedralCell, PolyhedralCellModel
+from formation.cell_launch import LaunchConfig, CellLaunchSearch
 from formation.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
 from formation.tube_rrt_region import RegionTubeConfig, RegionTubeRRTPlanner
 from formation.tube_rrt_chart import CELL_MODELS, ChartCellTubeRRTPlanner, make_tube_rrt_planner
@@ -136,6 +137,8 @@ __all__ = [
     "ChartCellTubeRRTPlanner",
     "PolyhedralCell",
     "PolyhedralCellModel",
+    "LaunchConfig",
+    "CellLaunchSearch",
     "FrontierConfig",
     "RegionTubeConfig",
     "RegionTubeRRTPlanner",

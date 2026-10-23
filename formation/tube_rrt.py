@@ -295,6 +295,13 @@ class TubeRRTNode:
     parent: int | None
     cost: float
     certificate: EdgeCertificate | None = None
+    entry: Pose2D | None = None
+    version: int = 0
+    parent_version: int = -1
+
+    @property
+    def entry_pose(self) -> Pose2D:
+        return self.pose if self.entry is None else self.entry
 
     @property
     def edge_certificate(self) -> EdgeCertificate | None:
@@ -349,6 +356,7 @@ class TubeRRTResult:
     cost_history: list[tuple[int, float]] = field(default_factory=list)
     path_nodes: list[int] = field(default_factory=list)
     overlap_stats: dict[str, int] = field(default_factory=dict)
+    cost_time_history: list[tuple[float, float]] = field(default_factory=list)
 
 
 def transform_slots(pose: Pose2D, slots: np.ndarray) -> np.ndarray:

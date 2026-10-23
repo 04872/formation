@@ -1,28 +1,8 @@
-"""Tube-RRT* over polyhedral SE(2) cells with region-gap nearest and line-witness overlaps.
+"""Single-entry continuous-cell RRT* with optional near-projection release correction.
 
-The search keeps Tube-RRT*'s flow ``q_rand -> C_rand -> nearest -> TubeSteer -> NearConnect -> rewire``;
-the directional cells only change which node captures a sample and how far the tree advances:
-
-1. ``q_rand ~ U(SE(2))`` (goal bias as in ``TubeRRTConfig``); a colliding sample is dropped, otherwise one
-   proximity query gives ``C_rand``.
-2. **Region-gap nearest**: for every node ``v_i = q_rand - q_i``, ``D_i = ||v_i||_G``, ``u_i = v_i / D_i`` and
-   ``g_i = D_i - l_i(u_i) - l_rand(-u_i)`` with the analytic ray lengths
-   ``l(u) = min(r_g, L / |u_theta|, min_k e_k / (rho |u_theta| - n_k^T u_c))``; the node with the smallest
-   gap captures the sample (``nearest = "point"`` uses ``argmin D_i`` instead).
-3. **Line TubeSteer** along ``q_i + s u_i``: a seed ``q(s)`` with cell ``C(s)`` is accepted when the two cells'
-   intervals on the line share ``w = min(s, l_i) - max(0, s - l_s(-u)) >= min_witness``.  ``s = D`` reuses
-   ``C_rand``; retries move to ``l_i + l_prev(-u) - min_witness`` and finally inside ``C_i``.
-4. The shared interval is the edge certificate: its midpoint ``q_w`` is a portal strictly inside both
-   convex cells, the route ``q_i -> q_w -> q(s)`` has length ``s`` and ``min`` of the two slacks at ``q_w``
-   is a d_G ball radius inside both cells (``r_portal``, the edge width).  No LP / SOCP.
-5. **NearConnect / rewire** over nodes whose guard disks and yaw ranges meet ``C_new``: pairs whose optimistic
-   cost ``cost + D`` cannot change the parent or a rewire are skipped; the rest get, in order, a line witness,
-   a cheap separation proof (Lipschitz slack at the other seed, or a row that is negative on the whole other
-   cell), a deep-point witness, and only then an exact LP / SOCP overlap.
-
-Region-gap nearest is exact but bounded: ``D_i - r_g,i - r_g,rand <= g_i <= D_i - a_i - a_rand`` with ``a`` the
-radius of the d_G ball around the seed inside the cell, so only nodes whose lower bound is below the smallest
-upper bound are evaluated.
+Launch determines discovery; continuous intersection projection determines tree
+attachment. Parent/entry versions trigger lazy descendant portal reoptimisation.
+The explicit ``tube`` mode retains the legacy region-gap / line-witness planner.
 """
 from __future__ import annotations
 
@@ -33,6 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from formation.polyhedral_cell import PolyhedralCell, wrap_array
+from formation.cell_launch import CellLaunchSearch, LaunchConfig
 from formation.tube_cell_first_order import PortalCertificate
 from formation.tube_rrt import TubeRRTConfig, TubeRRTNode, TubeRRTResult, TubeRRTTraceEvent
 from formation.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
@@ -60,6 +41,9 @@ def _row_separates(rows, other_rows, vx: float, vy: float, turn: float, other_gu
 
 @dataclass
 class RegionTubeConfig:
+    expansion: str = "projection"
+    """Single-entry continuous-cell RRT*: projection core, optional opening correction, legacy tube."""
+    launch: LaunchConfig = field(default_factory=LaunchConfig)
     safety_distance: float = 0.02
     active_range: float = 1.0
     parallel_tolerance: float = math.radians(5.0)
@@ -101,7 +85,7 @@ class RegionTubeConfig:
 
 
 class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
-    """Tube-RRT* with region-gap nearest, line TubeSteer and lazy exact overlaps (``cell_model = "polyhedral_tube"``)."""
+    """Continuous launch, portal attachment, ChooseParent and whole-cell Rewire."""
 
     def __init__(self, map_data: MapData, formation: FormationSpec | np.ndarray, start: Pose2D,
                  goal_xy: tuple[float, float] | None = None, config: TubeRRTConfig | None = None,
@@ -110,13 +94,152 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         super().__init__(map_data, formation, start, goal_xy, config or TubeRRTConfig(cell_model="polyhedral_tube"),
                          self.tube_config.cell_config())
         self.cells.lazy_geometry = self.tube_config.lazy_geometry
+        self.launch_search = CellLaunchSearch(self.cells, self.tube_config.launch)
+
+    def metric(self, first, second):
+        if self.tube_config.expansion == "tube":
+            return super().metric(first, second)
+        return math.sqrt((second.x-first.x)**2 + (second.y-first.y)**2
+                         + (self.formation_radius*wrap_to_pi(second.yaw-first.yaw))**2)
+
+    def _launch_extend(self, parent: int, target: Pose2D):
+        """Steer from a continuous launch; certify only the new segment by a shared line interval.
+
+        The branch enters at the incoming portal, independently of the seed
+        used to construct the cell. Only the root entry equals the start seed.
+        """
+        self._refresh_node(parent)
+        node = self._nodes[parent]
+        mode = self.tube_config.expansion
+        before = self.cells.stats["cells_built"]
+        entry = node.entry_pose
+        launch, signal, active = ((node.pose, 0.0, False) if mode == "point" else
+                                  self.launch_search.select(node.cell, target, mode, entry))
+        self._stats["opening_cells"] += self.cells.stats["cells_built"] - before
+        self._stats["opening_selected"] += int(active)
+        self._last_launch = {"entry": (entry.x, entry.y, entry.yaw),
+                             "launch": (launch.x, launch.y, launch.yaw), "opening": signal,
+                             "opening_active": active, "internal_step": self.metric(entry, launch),
+                             **(self.launch_search.last_solve if mode != "point" else {})}
+        u, length = self.cells.chart_direction(launch, target)
+        step = min(self.config.metric_step, length)
+        # The prefix of this ray in C_i is convex in the local yaw lift.
+        def parent_slack(s):
+            dx = np.array([launch.x - node.pose.x + s * u[0]])
+            dy = np.array([launch.y - node.pose.y + s * u[1]])
+            dyaw = np.array([wrap_to_pi(launch.yaw - node.pose.yaw) + s * u[2]])
+            return float(self.cells._local_slack(node.cell, dx, dy, dyaw)[0])
+
+        forward = step
+        if parent_slack(step) <= 0.0:
+            lo, hi = 0.0, step
+            for _ in range(24):
+                mid = 0.5 * (lo + hi)
+                if parent_slack(mid) > 0.0:
+                    lo = mid
+                else:
+                    hi = mid
+            forward = lo
+        for attempt in range(1, self.tube_config.steer_attempts + 1):
+            pose = Pose2D(launch.x + step * u[0], launch.y + step * u[1],
+                          wrap_to_pi(launch.yaw + step * u[2]))
+            cell = self.cells.make_cell(pose)
+            self._stats["steer_cells"] += 1
+            backward = self.cells.ray_extent(cell, tuple(-u[:2]), float(-u[2])) if cell.valid else 0.0
+            lo, hi = max(0.0, step - backward), min(step, forward)
+            if cell.valid and hi >= lo:
+                s = 0.5 * (lo + hi)
+                portal = Pose2D(launch.x + s * u[0], launch.y + s * u[1], wrap_to_pi(launch.yaw + s * u[2]))
+                slack = min(parent_slack(s), self.cells.slack(cell, portal))
+                if slack >= -1e-8 and self.cells.slack(cell, portal) > 0.:
+                    certificate = PortalCertificate(portal, max(0., slack),
+                                                  self.metric(entry, launch) + self.metric(launch, portal), launch)
+                    return pose, cell, certificate, attempt, "added"
+            status = "collision" if not cell.valid else "no_overlap"
+            if not self.config.step_backoff or step * 0.5 < self.config.min_metric_step:
+                break
+            step *= 0.5
+        return pose, cell, None, attempt, status
 
     def edge_cost(self, first: TubeRRTNode, second: TubeRRTNode, certificate: PortalCertificate) -> float:
-        """Route length, optionally penalised by ``margin_weight / r_portal`` (the certified edge width)."""
+        if self.tube_config.expansion != "tube":
+            return self.metric(first.entry_pose, certificate.portal)
         length = certificate.route_length
         if self.config.margin_weight <= 0.0:
             return length
         return length * (1.0 + self.config.margin_weight / max(certificate.slack, 1e-9))
+
+    def _attachment(self, first, second, entry):
+        started = time.perf_counter()
+        portal = self.launch_search.attachment(first, second, entry)
+        self._stats["attachment_queries"] += 1
+        self._stats["attachment_time_s"] += time.perf_counter()-started
+        if portal is None:
+            return None
+        slack = min(self.cells.slack(first, portal), self.cells.slack(second, portal))
+        return PortalCertificate(portal, max(0., slack), self.metric(entry, portal))
+
+    def _refresh_node(self, index):
+        """Refresh the parent chain first; versions propagate staleness lazily."""
+        if self.tube_config.expansion == "tube":
+            return
+        chain = []
+        cursor = index
+        while self._nodes[cursor].parent is not None:
+            chain.append(cursor)
+            cursor = self._nodes[cursor].parent
+        for child in reversed(chain):
+            node = self._nodes[child]
+            parent = self._nodes[node.parent]
+            if node.parent_version == parent.version:
+                continue
+            if child in self._goal_nodes:
+                # Terminal goal states are fixed endpoints, not another free portal.
+                cert = PortalCertificate(node.pose, max(0., self.cells.slack(parent.cell, node.pose)),
+                                         self.metric(parent.entry_pose, node.pose))
+            else:
+                cert = self._attachment(parent.cell, node.cell, parent.entry_pose)
+            node.certificate, node.entry = cert, cert.portal
+            node.cost = self._cost[child] = parent.cost+self.edge_cost(parent, node, cert)
+            node.parent_version = parent.version
+            node.version += 1
+            self._stats["descendant_repairs"] += 1
+
+    def _refresh_all(self):
+        if self.tube_config.expansion != "tube":
+            for i in range(len(self._nodes)):
+                self._refresh_node(i)
+
+    def _rewire_entry(self, candidate, new_parent, certificate):
+        node, parent = self._nodes[candidate], self._nodes[new_parent]
+        self._children[node.parent].remove(candidate)
+        self._children[new_parent].append(candidate)
+        node.parent, node.certificate, node.entry = new_parent, certificate, certificate.portal
+        node.cost = self._cost[candidate] = parent.cost+self.edge_cost(parent, node, certificate)
+        node.parent_version = parent.version
+        node.version += 1
+        return True
+
+    def _path(self, index):
+        if self.tube_config.expansion == "tube":
+            return super()._path(index)
+        self._refresh_node(index)
+        indices = []
+        while index is not None:
+            indices.append(index)
+            index = self._nodes[index].parent
+        indices.reverse()
+        route = [self._nodes[indices[0]].entry_pose]
+        for child in indices[1:]:
+            parent = self._nodes[self._nodes[child].parent]
+            pose = self._nodes[child].entry_pose
+            if pose != route[-1]:
+                a = self.launch_search.offset(parent.cell.pose, route[-1])
+                b = self.launch_search.offset(parent.cell.pose, pose)
+                if abs(a[2]-b[2]) > self.formation_radius*math.pi/2.:
+                    route.append(self.launch_search.pose(parent.cell.pose, .5*(a+b)))
+                route.append(pose)
+        return route, indices
 
     # -- vectorised directional geometry -------------------------------------------------------------------
     def _register_rows(self, index: int, cell: PolyhedralCell) -> None:
@@ -334,6 +457,10 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         return pose, cell, None, t.steer_attempts, status
 
     def _store(self, node: TubeRRTNode) -> int:
+        if self.tube_config.expansion != "tube":
+            node.entry = node.pose if node.parent is None else node.certificate.portal
+            if node.parent is not None:
+                node.parent_version = self._nodes[node.parent].version
         index = super()._store(node)
         self.edge_kind[index] = "goal" if node.parent is not None and node.cell is self._nodes[node.parent].cell else ""
         return index
@@ -345,6 +472,8 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         self._inner = np.zeros(len(self._x))
         self._py_rows: list[tuple[tuple[float, float, float], ...]] = []
         self._stats = {"samples_colliding": 0, "gap_negative": 0, "nearest_differs": 0, "steer_cells": 0,
+                       "attachment_queries": 0, "attachment_time_s": 0., "descendant_repairs": 0,
+                       "opening_cells": 0, "opening_selected": 0, "rejected_optimization_failed": 0,
                        "steer_first_try": 0, "rejected_no_progress": 0, "rejected_collision": 0,
                        "rejected_no_overlap": 0, "parent_witness": 0, "near_improved": 0, "rewires": 0,
                        "portal_radius_sum": 0.0, "nearest_exact": 0}
@@ -377,8 +506,21 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         return self.cells._certificate(first, second, portal, float(slack[best]))
 
     def _connect(self, candidate: int, cell: PolyhedralCell, witness: PortalCertificate | None, separated: bool,
-                 kind: str) -> tuple[PortalCertificate | None, str]:
+                 kind: str, source_entry=None) -> tuple[PortalCertificate | None, str]:
         """Certificate of the pair and how it was found: ``line`` / ``center`` witness or ``exact`` LP / SOCP."""
+        if self.tube_config.expansion != "tube":
+            self._refresh_node(candidate)
+            if separated and witness is None:
+                self._stats[f"{kind}_separated"] += 1
+                return None, ""
+            if kind == "near":
+                first, second, entry = self._nodes[candidate].cell, cell, self._nodes[candidate].entry_pose
+            else:
+                first, second, entry = cell, self._nodes[candidate].cell, source_entry
+            self._stats[f"{kind}_exact_calls"] += 1
+            cert = self._attachment(first, second, entry)
+            self._stats[f"{kind}_exact_accept"] += int(cert is not None)
+            return cert, "continuous_attachment"
         if witness is not None:
             self._stats[f"{kind}_witness"] += 1
             return witness, "line"
@@ -415,45 +557,64 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
         first_goal_iteration: int | None = None
         first_goal = {"first_goal_time_s": math.nan, "first_goal_pose_queries": -1, "first_goal_cost": math.nan}
         cost_history: list[tuple[int, float]] = []
+        cost_time_history: list[tuple[float, float]] = []
         iteration = 0
         for iteration in range(1, config.max_iterations + 1):
             report = config.progress_interval > 0 and iteration % config.progress_interval == 0
             sample = self._sample_pose()
-            sample_cell = self.cells.make_cell(sample)
-            usable = sample_cell.valid or self.tube_config.colliding == "extend"
-            self._stats["samples_colliding"] += int(not sample_cell.valid)
-            picked = self._nearest(sample, sample_cell) if usable else None
+            continuous = self.tube_config.expansion != "tube"
+            if continuous:
+                distances = self._distances_to(sample)
+                if self._goal_nodes:
+                    distances[list(self._goal_nodes)] = math.inf
+                nearest_index = int(np.argmin(distances))
+                picked = (nearest_index, None, None, None)
+            else:
+                sample_cell = self.cells.make_cell(sample)
+                usable = sample_cell.valid or self.tube_config.colliding == "extend"
+                self._stats["samples_colliding"] += int(not sample_cell.valid)
+                picked = self._nearest(sample, sample_cell) if usable else None
             if picked is None:
                 status = "collision" if not usable else "no_progress"
                 self._stats["rejected_no_progress"] += int(usable)
                 if config.record_trace:
                     trace.append(TubeRRTTraceEvent(iteration, sample, -1, sample, sample_cell.radius, status,
-                                                   cell=sample_cell, mode="tube"))
+                                                   cell=sample_cell, mode=self.tube_config.expansion))
                 if report:
                     self._print_progress(iteration, best_goal_distance, best_cost)
                 continue
             parent, u, length, forward = picked
             nearest_index = parent
-            q_new, cell, certificate, attempts, status = self._tube_steer(parent, u, length, forward, sample_cell)
+            if continuous:
+                q_new, cell, certificate, attempts, status = self._launch_extend(parent, sample)
+            else:
+                q_new, cell, certificate, attempts, status = self._tube_steer(parent, u, length, forward, sample_cell)
             if certificate is None:
                 self._stats[f"rejected_{status}"] += 1
                 if config.record_trace:
                     trace.append(TubeRRTTraceEvent(iteration, sample, parent, q_new, cell.radius if cell else 0.0,
-                                                   status, attempts=attempts, cell=cell, mode="tube"))
+                                                   status, attempts=attempts, cell=cell, mode=self.tube_config.expansion))
                 if report:
                     self._print_progress(iteration, best_goal_distance, best_cost)
                 continue
             self._stats["steer_first_try"] += int(attempts == 1)
             self._stats["parent_witness"] += 1
-            cell.mode = "tube"
+            cell.mode = self.tube_config.expansion
             new_node = TubeRRTNode(q_new, cell, None, 0.0)
+            if continuous:
+                certificate = self._attachment(self._nodes[parent].cell, cell, self._nodes[parent].entry_pose)
             parent_certificate, parent_kind = certificate, "steer"
             parent_cost = self._nodes[parent].cost + self.edge_cost(self._nodes[parent], new_node, certificate)
 
             neighbors, distances = self._neighbors(cell)
             neighbors = neighbors[neighbors != parent]
             lengths = distances[neighbors]
-            bounds = self._cost[neighbors] + lengths
+            # Costs end at entries, not seeds. Seed distance is not a lower
+            # bound on the cost of reaching an overlap portal in the new cell.
+            if continuous:
+                for candidate in neighbors:
+                    self._refresh_node(int(candidate))
+            bounds = self._cost[neighbors] + (0. if continuous else lengths)
             order = np.argsort(bounds, kind="stable")
             tested = order[bounds[order] < parent_cost]
             self._stats["near_skipped_bound"] += len(order) - len(tested)
@@ -478,18 +639,25 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             self.edge_kind[new_index] = parent_kind
             self._stats["portal_radius_sum"] += parent_certificate.slack
             event = TubeRRTTraceEvent(iteration, sample, nearest_index, q_new, cell.radius, "added", new_index, parent,
-                                      attempts=attempts, cell=cell, mode="tube")
+                                      attempts=attempts, cell=cell, mode=self.tube_config.expansion)
             if config.record_trace:
                 trace.append(event)
-            self.expansion_log.append({"iteration": iteration, "node": new_index, "mode": "tube", "source": nearest_index,
+            self.expansion_log.append({"iteration": iteration, "node": new_index, "mode": self.tube_config.expansion, "source": nearest_index,
                                        "parent": parent, "parent_kind": parent_kind, "attempts": attempts,
                                        "step": float(parent_certificate.route_length if parent_kind == "steer" else
                                                      self.metric(self._nodes[nearest_index].pose, q_new)),
                                        "portal_radius": parent_certificate.slack, "active_pairs": cell.active_count,
                                        "broadphase_pairs": cell.broadphase_pairs, "yaw_limit": cell.yaw_limit})
+            if continuous:
+                self.expansion_log[-1].update(self._last_launch)
 
             rewire = (neighbors != 0) & (neighbors != parent)
-            improving = rewire & (parent_cost + lengths < self._cost[neighbors])
+            if continuous:
+                ancestor = new_node.parent
+                while ancestor is not None:
+                    rewire &= neighbors != ancestor
+                    ancestor = self._nodes[ancestor].parent
+            improving = rewire if continuous else rewire & (parent_cost + lengths < self._cost[neighbors])
             self._stats["rewire_skipped_bound"] += int(np.count_nonzero(rewire & ~improving))
             missing = [k for k in np.flatnonzero(improving).tolist() if int(neighbors[k]) not in pairs]
             if missing:
@@ -497,15 +665,24 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
                 pairs.update((int(neighbors[k]), (w, bool(sep))) for k, w, sep in zip(missing, found, separated))
             for k in np.flatnonzero(improving).tolist():
                 candidate = int(neighbors[k])
-                if parent_cost + lengths[k] >= self._nodes[candidate].cost:
+                if continuous:
+                    self._refresh_node(candidate)
+                if parent_cost + (0. if continuous else lengths[k]) >= self._nodes[candidate].cost:
                     self._stats["rewire_skipped_bound"] += 1
                     continue
-                certificate, how = self._connect(candidate, cell, *pairs[candidate], "rewire")
+                certificate, how = self._connect(candidate, cell, *pairs[candidate], "rewire", new_node.entry_pose)
                 if certificate is None:
                     continue
                 cost = parent_cost + self.edge_cost(new_node, self._nodes[candidate], certificate)
                 if cost < self._nodes[candidate].cost:
                     old_parent = self._nodes[candidate].parent
+                    if continuous:
+                        if not self._rewire_entry(candidate, new_index, certificate):
+                            continue
+                        event.rewires.append((candidate, old_parent, new_index))
+                        self.edge_kind[candidate] = how
+                        self._stats["rewires"] += 1
+                        continue
                     event.rewires.append((candidate, old_parent, new_index))
                     self._children[old_parent].remove(candidate)
                     self._children[new_index].append(candidate)
@@ -518,23 +695,31 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             goal_distance = float(self._goal_distance(q_new.x, q_new.y))
             best_goal_distance = min(best_goal_distance, goal_distance)
             if goal_indices:
+                for goal in goal_indices:
+                    self._refresh_node(goal)
                 best_cost = min(self._nodes[i].cost for i in goal_indices)
-                if best_cost < cost_history[-1][1]:
+                if abs(best_cost-cost_history[-1][1]) > 1e-10:
                     cost_history.append((iteration, best_cost))
+                    cost_time_history.append((time.perf_counter() - started, best_cost))
             goal_pose = Pose2D(self.goal_xy[0], self.goal_xy[1], q_new.yaw)
             goal_slack = self.cells.slack(cell, goal_pose)
-            if goal_slack > 0.0 and (best_cost is None or parent_cost + goal_distance < best_cost):
+            if goal_slack > 0.0 and (continuous or best_cost is None or parent_cost + goal_distance < best_cost):
                 goal_certificate = PortalCertificate(goal_pose, goal_slack, goal_distance)
                 goal_node = TubeRRTNode(goal_pose, cell, new_index, 0.0, goal_certificate)
                 goal_node.cost = parent_cost + self.edge_cost(new_node, goal_node, goal_certificate)
+                if continuous and best_cost is not None and goal_node.cost >= best_cost:
+                    if report:
+                        self._print_progress(iteration, best_goal_distance, best_cost)
+                    continue
                 goal_index = self._store(goal_node)
                 goal_indices.append(goal_index)
                 self._goal_nodes.add(goal_index)
                 if config.record_trace:
                     trace.append(TubeRRTTraceEvent(iteration, goal_pose, new_index, goal_pose, cell.radius, "goal",
-                                                   goal_index, new_index, cell=cell, mode="tube"))
+                                                   goal_index, new_index, cell=cell, mode=self.tube_config.expansion))
                 best_cost = goal_node.cost
                 cost_history.append((iteration, best_cost))
+                cost_time_history.append((time.perf_counter() - started, best_cost))
                 if first_goal_iteration is None:
                     first_goal_iteration = iteration
                     first_goal = {"first_goal_time_s": time.perf_counter() - started,
@@ -547,11 +732,20 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             if report:
                 self._print_progress(iteration, best_goal_distance, best_cost)
 
+        self._refresh_all()
         nodes = self._nodes
         edges = [(i, node.parent) for i, node in enumerate(nodes) if node.parent is not None]
         added = len(nodes) - 1 - len(goal_indices)
+        attachment_violation, cost_error = 0., 0.
+        if self.tube_config.expansion != "tube":
+            for node in nodes[1:]:
+                parent = nodes[node.parent]
+                attachment_violation = max(attachment_violation,
+                    -self.cells.slack(parent.cell, node.entry_pose), -self.cells.slack(node.cell, node.entry_pose))
+                cost_error = max(cost_error, abs(node.cost-parent.cost-self.metric(parent.entry_pose, node.entry_pose)))
         stats = {**self.cells.stats, **self._stats, **first_goal, "tube_nodes": added,
                  "portal_radius_mean": self._stats["portal_radius_sum"] / max(added, 1),
+                 "attachment_violation_max": attachment_violation, "entry_cost_error_max": cost_error,
                  "plan_time_s": time.perf_counter() - started}
         if not goal_indices:
             if config.progress_interval > 0:
@@ -560,8 +754,9 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
             return TubeRRTResult(False, tree_nodes=nodes, tree_edges=edges, failure_reason="iteration budget exhausted",
                                  trace=trace, iterations=iteration, overlap_stats=stats)
         best_goal = min(goal_indices, key=lambda i: nodes[i].cost)
-        if nodes[best_goal].cost < cost_history[-1][1]:
+        if abs(nodes[best_goal].cost-cost_history[-1][1]) > 1e-10:
             cost_history.append((iteration, nodes[best_goal].cost))
+            cost_time_history.append((time.perf_counter() - started, nodes[best_goal].cost))
         route, indices = self._path(best_goal)
         radii = [float(v) for v in self.clearances([p.x for p in route], [p.y for p in route], [p.yaw for p in route])]
         if config.progress_interval > 0 and not config.stop_on_first_goal:
@@ -569,7 +764,8 @@ class RegionTubeRRTPlanner(PolyhedralFrontierPlanner):
                   f"best_cost={nodes[best_goal].cost:.3f}", flush=True)
         return TubeRRTResult(True, route, radii, nodes, edges, bottleneck=self.route_clearance(route), path_nodes=indices,
                              trace=trace, iterations=iteration, first_goal_iteration=first_goal_iteration,
-                             path_cost=nodes[best_goal].cost, cost_history=cost_history, overlap_stats=stats)
+                             path_cost=nodes[best_goal].cost, cost_history=cost_history, overlap_stats=stats,
+                             cost_time_history=cost_time_history)
 
     def _print_progress(self, iteration: int, best_goal_distance: float, best_cost: float | None) -> None:
         cost = "" if best_cost is None else f" best_cost={best_cost:.3f}"
