@@ -38,10 +38,24 @@ LABELS = {FULL: "full (A)", f"{RAY}@0.3": "q_i ray-exit launch, eta 0.3", f"{RAY
           f"{RAY}@1.0": "q_i ray-exit launch, eta 1.0", "single_entry_seed_launch": "q_i-launch (fixed eta from q_i)",
           "single_entry_seed_launch_covered": "q_i-launch, covered samples skipped",
           "single_entry_no_rewire": "no ChooseParent/Rewire", "anchor_rrtstar": "region proxy + post-hoc (B)",
-          "single_entry_heading_hold": "heading-held expansion"}
+          "single_entry_heading_hold": "heading-held expansion",
+          "single_entry_lex_turn": "(J, Theta) lexicographic, eps_J 1%",
+          "single_entry_lex_turn5": "(J, Theta) lexicographic, eps_J 5%",
+          "single_entry_ancestor": "A + ancestor connection", "single_entry_entry_ray": "A + entry-ray launch",
+          "single_entry_ancestor_entry_ray": "A + both",
+          "single_entry_consistent_rewire": "A + consistent rewire",
+          "single_entry_reference_parent": "A + reference-state ChooseParent",
+          "single_entry_consistent": "A + consistent rewire + reference ChooseParent",
+          f"{FULL}@0.3": "A, eta 0.3", f"{FULL}@1.0": "A, eta 1.0", f"{FULL}@1.5": "A, eta 1.5",
+          "single_entry_adaptive_step05": "adaptive step, kappa 0.5", "single_entry_adaptive_step": "adaptive step, kappa 1.0",
+          "single_entry_adaptive_step15": "adaptive step, kappa 1.5"}
 COLORS = {FULL: "C3", f"{RAY}@0.3": "C9", f"{RAY}@0.6": "C2", f"{RAY}@1.0": "C5", "single_entry_seed_launch": "C7",
           "single_entry_seed_launch_covered": "C8", "single_entry_no_rewire": "C1", "anchor_rrtstar": "C0",
-          "single_entry_heading_hold": "C4"}
+          "single_entry_heading_hold": "C4", "single_entry_lex_turn": "C6", "single_entry_lex_turn5": "C8",
+          "single_entry_ancestor": "C0", "single_entry_entry_ray": "C2", "single_entry_ancestor_entry_ray": "C4",
+          "single_entry_consistent_rewire": "C0", "single_entry_reference_parent": "C2", "single_entry_consistent": "C4",
+          f"{FULL}@0.3": "C9", f"{FULL}@1.0": "C5", f"{FULL}@1.5": "C1",
+          "single_entry_adaptive_step05": "C0", "single_entry_adaptive_step": "C2", "single_entry_adaptive_step15": "C4"}
 
 
 def run_task(task):

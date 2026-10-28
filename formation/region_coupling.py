@@ -50,6 +50,10 @@ class CouplingConfig:
     safety_distance: float = 0.02
     active_range: float = 1.0
     max_extent: float = 1.5
+    turn_slacks: tuple[float, ...] = ()
+    """Path phase, second stage per relative slack ``eps``: min total turning s.t. ``J_W <= (1 + eps) J_W*``."""
+    turn_fixed_xy: bool = False
+    """Path phase, second stage with the translations of the first stage held (diagnostic)."""
 
 
 _ZERO_P: dict[int, sp.csc_matrix] = {}
@@ -345,17 +349,75 @@ class RegionGeometry:
         z = self._solve_projection(self.lift(entry, anchor), *self._constraints((first, second), anchor, margin))
         return None if z is None else self.pose(z)
 
+    def via(self, a: Pose2D, first: PolyhedralCell, second: PolyhedralCell, b: Pose2D, margin: float
+            ) -> tuple[float, Pose2D] | None:
+        """``min d_W(a, z) + d_W(z, b)`` over ``z in C_first ∩ C_second`` with slack ``>= margin``, and ``z``."""
+        anchor = first.pose.yaw
+        program = _Program(5)
+        program.cell(first, self.lift(first.pose, anchor), 0, margin)
+        program.cell(second, self.lift(second.pose, anchor), 0, margin)
+        program.distance(3, 0, self.lift(a, anchor))
+        program.distance(4, 0, self.lift(b, anchor))
+        x = self._run(program, np.array((0.0, 0.0, 0.0, 1.0, 1.0)))
+        if x is None:
+            return None
+        z = self.pose(x[:3])
+        return self.distance(a, z) + self.distance(z, b), z
+
     def chain(self, start: Pose2D, goal_xy, cells: list[PolyhedralCell], margin: float
               ) -> tuple[float, list[Pose2D]] | None:
         """Shortest ``start -> z_0 -> ... -> z_{m-1} -> goal`` with ``z_k in C_k ∩ C_{k+1}`` (slack ``>= margin``)
         and ``(goal_xy, yaw) in C_m``; the goal yaw is free.  Returns the length and the poses."""
+        program, points, t0 = self._chain_program(start, goal_xy, cells, margin, 0)
+        q = np.zeros(program.nvar)
+        q[t0:] = 1.0
+        x = self._run(program, q)
+        return None if x is None else self._chain_route(start, goal_xy, x, len(cells) - 1)
+
+    def min_turn(self, start: Pose2D, goal_xy, cells: list[PolyhedralCell], margin: float,
+                 budget: float | None = None, fixed: list[Pose2D] | None = None
+                 ) -> tuple[float, list[Pose2D]] | None:
+        """Second stage on the same region chain: ``min sum_k |theta_{k+1} - theta_k|`` with the chain constraints
+        and either ``J_W <= budget`` or the translations of ``fixed`` (a route of the same chain) held."""
+        m = len(cells) - 1
+        program, points, t0 = self._chain_program(start, goal_xy, cells, margin, m + 1)
+        u0 = t0 + m + 1
+        if budget is not None:
+            a = np.zeros((1, program.nvar))
+            a[0, t0:u0] = 1.0
+            program.nonneg(a, np.array((budget,)))
+        if fixed is not None:
+            for k in range(m):
+                program.fix(3 * k, fixed[k + 1].x)
+                program.fix(3 * k + 1, fixed[k + 1].y)
+        a = np.zeros((2 * (m + 1), program.nvar))
+        b = np.zeros(2 * (m + 1))
+        for k in range(m + 1):
+            d = np.zeros(program.nvar)
+            c = 0.0
+            for point, sign in ((points[k + 1], 1.0), (points[k], -1.0)):
+                if isinstance(point, (int, np.integer)):
+                    d[point + 2] += sign
+                else:
+                    c += sign * float(point[2])
+            a[2 * k], b[2 * k] = d, -c
+            a[2 * k, u0 + k] = -1.0
+            a[2 * k + 1], b[2 * k + 1] = -d, c
+            a[2 * k + 1, u0 + k] = -1.0
+        program.nonneg(a, b)
+        q = np.zeros(program.nvar)
+        q[u0:] = 1.0
+        x = self._run(program, q)
+        return None if x is None else self._chain_route(start, goal_xy, x, m)
+
+    def _chain_program(self, start: Pose2D, goal_xy, cells: list[PolyhedralCell], margin: float, extra: int):
         m = len(cells) - 1
         yaws = [cells[0].pose.yaw]
         for cell in cells[1:]:
             yaws.append(yaws[-1] + wrap_to_pi(cell.pose.yaw - yaws[-1]))
         seeds = [np.array((c.pose.x, c.pose.y, self.rho * y)) for c, y in zip(cells, yaws)]
         goal_col, t0 = 3 * m, 3 * m + 3
-        program = _Program(t0 + m + 1)
+        program = _Program(t0 + m + 1 + extra)
         for k in range(m):
             program.cell(cells[k], seeds[k], 3 * k, margin)
             program.cell(cells[k + 1], seeds[k + 1], 3 * k, margin)
@@ -365,11 +427,10 @@ class RegionGeometry:
         points: list[int | np.ndarray] = [self.lift(start, yaws[0])] + [3 * k for k in range(m)] + [goal_col]
         for k in range(m + 1):
             program.distance(t0 + k, points[k + 1], points[k])
-        q = np.zeros(program.nvar)
-        q[t0:] = 1.0
-        x = self._run(program, q)
-        if x is None:
-            return None
+        return program, points, t0
+
+    def _chain_route(self, start: Pose2D, goal_xy, x: np.ndarray, m: int) -> tuple[float, list[Pose2D]]:
+        goal_col = 3 * m
         route = [start] + [self.pose(x[3 * k:3 * k + 3]) for k in range(m)]
         route.append(Pose2D(goal_xy[0], goal_xy[1], wrap_to_pi(float(x[goal_col + 2]) / self.rho)))
         length = sum(self.distance(a, b) for a, b in zip(route, route[1:]))
@@ -473,7 +534,7 @@ class _CorePlanner:
             self.stats["steer_time_s"] += time.perf_counter() - started
             return None, None, 0
         direction /= length
-        step = self.config.step
+        step = self._initial_step(cell, z_star, direction, anchor)
         result: tuple[PolyhedralCell | None, Pose2D | None, int] = (None, None, self.config.steer_attempts)
         for attempt in range(1, self.config.steer_attempts + 1):
             pose = self.geo.pose(z_star + min(step, length) * direction)
@@ -498,6 +559,10 @@ class _CorePlanner:
     def _launch(self, cell: PolyhedralCell, sample: Pose2D) -> Pose2D:
         """Where the step towards ``q_rand`` starts: the projection ``Pi_{C_i}(q_rand)``."""
         return self.geo.project(cell, sample)
+
+    def _initial_step(self, cell: PolyhedralCell, z_star: np.ndarray, direction: np.ndarray, anchor: float) -> float:
+        """First candidate step from ``x*`` along the unit lifted direction (later halved on failure)."""
+        return self.config.step
 
     def _quick_portal(self, first: PolyhedralCell, second: PolyhedralCell, margin: float) -> Pose2D | None:
         """A point on the seed segment with slack ``>= margin`` in both cells, without optimisation."""
@@ -608,13 +673,26 @@ class _CorePlanner:
         sequence, raw = self._region_chain()
         extract = time.perf_counter() - started
         started = time.perf_counter()
-        solved = self.geo.chain(self.start, self.goal_xy, [self.cells[i] for i in sequence],
-                                self.config.overlap_margin * (1.0 - 1e-6))
+        cells = [self.cells[i] for i in sequence]
+        margin = self.config.overlap_margin * (1.0 - 1e-6)
+        solved = self.geo.chain(self.start, self.goal_xy, cells, margin)
         optimise = time.perf_counter() - started
         record.update(success=True, raw_cost=raw, chain_regions=len(sequence), extract_time_s=extract,
                       optimise_time_s=optimise, sequence=sequence,
                       optimised_cost=solved[0] if solved else math.nan,
                       route=[(p.x, p.y, p.yaw) for p in solved[1]] if solved else [])
+        if solved:
+            stages = {f"eps={eps:g}": dict(budget=solved[0] * (1.0 + max(eps, 1e-6))) for eps in self.config.turn_slacks}
+            if self.config.turn_fixed_xy:
+                stages["fixed_xy"] = dict(fixed=solved[1])
+            post = {}
+            for key, options in stages.items():
+                started = time.perf_counter()
+                second = self.geo.min_turn(self.start, self.goal_xy, cells, margin, **options)
+                post[key] = dict(time_s=time.perf_counter() - started, cost=second[0] if second else math.nan,
+                                 route=[(p.x, p.y, p.yaw) for p in second[1]] if second else [])
+            if post:
+                record["post"] = post
         return record
 
     def _init_root(self) -> None:
@@ -698,6 +776,8 @@ class SingleEntryRRTStar(_CorePlanner):
         self.cost.append(best_cost)
         self.version.append(0)
         self.parent_version.append(self.version[best])
+        self._after_choose(index)
+        best, best_entry, best_cost = self.parent[index], self.entry[index], self.cost[index]
         ancestors = set()
         cursor = best
         while cursor is not None:
@@ -720,6 +800,9 @@ class SingleEntryRRTStar(_CorePlanner):
                 self.version[k] += 1
                 self.stats["rewires"] += 1
 
+    def _after_choose(self, index: int) -> None:
+        """Hook between ChooseParent and Rewire of a new region."""
+
     def _goal_cost(self, g: int) -> float:
         self._refresh(g)
         yaw = self.geo.goal_yaw(self.cells[g], self.goal_xy, self.entry[g].yaw, self.config.overlap_margin)
@@ -733,6 +816,197 @@ class SingleEntryRRTStar(_CorePlanner):
             sequence.append(cursor)
             cursor = self.parent[cursor]
         return sequence[::-1], float(costs[k])
+
+
+class AncestorRRTStar(SingleEntryRRTStar):
+    """A + ancestor connection: after ChooseParent the new region ``n`` tries the ancestors above its parent (up to
+    ``depth`` levels); ``a`` is taken when ``e' = argmin_{z in C_a ∩ C_n} d_W(e_a, z)`` (delta-overlap) gives
+    ``J_a + d_W(e_a, e') + d_W(e', e_n) < J_n``, so no descendant cost can increase."""
+
+    variant = "single_entry_ancestor"
+    depth = 3
+
+    def _init_root(self) -> None:
+        super()._init_root()
+        self.stats.update(ancestor_screened=0, ancestor_solves=0, ancestor_reconnects=0, ancestor_gain=0.0)
+
+    def _after_choose(self, index: int) -> None:
+        cell, entry, cost = self.cells[index], self.entry[index], self.cost[index]
+        best = None
+        cursor = self.parent[self.parent[index]]
+        for _ in range(self.depth):
+            if cursor is None:
+                break
+            a = cursor
+            cursor = self.parent[a]
+            self.stats["ancestor_screened"] += 1
+            if self.cost[a] + self.geo.distance(self.entry[a], entry) >= cost - 1e-9:
+                continue
+            self.stats["ancestor_solves"] += 1
+            z = self._attach(self.entry[a], self.cells[a], cell)
+            if z is None:
+                continue
+            c = self.cost[a] + self.geo.distance(self.entry[a], z)
+            if c + self.geo.distance(z, entry) < cost - 1e-9 and (best is None or c < best[1]):
+                best = (a, c, z)
+        if best is not None:
+            a, c, z = best
+            self.stats["ancestor_reconnects"] += 1
+            self.stats["ancestor_gain"] += cost - c
+            self.parent[index], self.entry[index], self.cost[index] = a, z, c
+            self.parent_version[index] = self.version[a]
+            self.version[index] += 1
+
+
+class EntryRayRRTStar(SingleEntryRRTStar):
+    """A + entry-ray launch: the step towards ``q_rand`` starts where the ray ``e_i -> q_rand`` leaves ``C_i``
+    (``q_rand`` itself if it is inside), instead of ``Pi_{C_i}(q_rand)``."""
+
+    variant = "single_entry_entry_ray"
+
+    def _steer(self, parent: int, sample: Pose2D):
+        self._refresh(parent)
+        self._launch_entry = self.entry[parent]
+        return super()._steer(parent, sample)
+
+    def _launch(self, cell: PolyhedralCell, sample: Pose2D) -> Pose2D:
+        if self.geo.slack(cell, sample) >= 0.0:
+            return sample
+        anchor = cell.pose.yaw
+        e, q = self.geo.lift(self._launch_entry, anchor), self.geo.lift(sample, anchor)
+        lo, hi = 0.0, 1.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if self.geo.slack(cell, self.geo.pose(e + mid * (q - e))) >= 0.0:
+                lo = mid
+            else:
+                hi = mid
+        return self.geo.pose(e + lo * (q - e))
+
+
+class AncestorEntryRayRRTStar(EntryRayRRTStar, AncestorRRTStar):
+    variant = "single_entry_ancestor_entry_ray"
+
+
+class ConsistentRRTStar(SingleEntryRRTStar):
+    """A with cost comparisons at a common state.  ``consistent_rewire``: ``k`` is rewired only if
+    ``J_k' + d_W(e_k', e_k) < J_k`` (the new branch also reaches the old entry more cheaply).  ``reference_parent``:
+    ChooseParent ranks candidates by ``F_j = J_j + min_{z in C_j ∩ C_n} [d_W(e_j, z) + d_W(z, q_n)]`` (``q_n`` the
+    construction state of ``C_n``) and enters at the minimiser ``z``; ``J_n`` stays the cost to ``e_n``."""
+
+    variant = "single_entry_consistent"
+    consistent_rewire = True
+    reference_parent = True
+
+    def _init_root(self) -> None:
+        super()._init_root()
+        self.stats.update(via_solves=0)
+
+    def _connect(self, index: int, parent: int, portal: Pose2D) -> None:
+        cell = self.cells[index]
+        q_n = cell.pose
+        margin = self.config.overlap_margin * (1.0 - 1e-6)
+        neighbors = self._neighbors(index)
+        candidates = [parent] + neighbors
+        for j in candidates:
+            self._refresh(j)
+        best, best_rank, best_cost, best_entry = None, math.inf, math.inf, None
+        for j in sorted(candidates, key=lambda j: (j != parent, self.cost[j])):
+            if self.reference_parent:
+                if self.cost[j] + self.geo.distance(self.entry[j], q_n) >= best_rank:
+                    continue
+                self.stats["choose_parent_tests"] += 1
+                self.stats["via_solves"] += 1
+                solved = self.geo.via(self.entry[j], self.cells[j], cell, q_n, margin)
+                if solved is None:
+                    continue
+                rank, z = self.cost[j] + solved[0], solved[1]
+                c = self.cost[j] + self.geo.distance(self.entry[j], z)
+            else:
+                if self.cost[j] + self._bound(self.entry[j], self.cells[j], cell) >= best_rank:
+                    continue
+                self.stats["choose_parent_tests"] += 1
+                z = self._attach(self.entry[j], self.cells[j], cell)
+                if z is None:
+                    continue
+                c = rank = self.cost[j] + self.geo.distance(self.entry[j], z)
+            if rank < best_rank:
+                self.stats["choose_parent_improved"] += int(best is not None)
+                best, best_rank, best_cost, best_entry = j, rank, c, z
+        if best is None:
+            best, best_entry = parent, portal
+            best_cost = self.cost[parent] + self.geo.distance(self.entry[parent], portal)
+        self.parent.append(best)
+        self.entry.append(best_entry)
+        self.cost.append(best_cost)
+        self.version.append(0)
+        self.parent_version.append(self.version[best])
+        ancestors = set()
+        cursor = best
+        while cursor is not None:
+            ancestors.add(cursor)
+            cursor = self.parent[cursor]
+        for k in neighbors + ([parent] if parent != best else []):
+            if k in ancestors:
+                continue
+            self._refresh(k)
+            if best_cost + self._bound(best_entry, cell, self.cells[k]) >= self.cost[k] - 1e-9:
+                continue
+            self.stats["rewire_tests"] += 1
+            z = self._attach(best_entry, cell, self.cells[k])
+            if z is None:
+                continue
+            c = best_cost + self.geo.distance(best_entry, z)
+            reach = c + self.geo.distance(z, self.entry[k]) if self.consistent_rewire else c
+            if reach < self.cost[k] - 1e-9:
+                self.parent[k], self.entry[k], self.cost[k] = index, z, c
+                self.parent_version[k] = self.version[index]
+                self.version[k] += 1
+                self.stats["rewires"] += 1
+
+
+class ConsistentRewireRRTStar(ConsistentRRTStar):
+    variant = "single_entry_consistent_rewire"
+    reference_parent = False
+
+
+class ReferenceParentRRTStar(ConsistentRRTStar):
+    variant = "single_entry_reference_parent"
+    consistent_rewire = False
+
+
+class AdaptiveStepRRTStar(SingleEntryRRTStar):
+    """A with the first candidate step ``clip(kappa l^-(u), eta_min, eta_max)`` (capped by ``d_W(x*, q_rand)`` in
+    the loop), ``l^-(u) = max{t >= 0 : z(x*) - t u in C_i}`` the depth of ``C_i`` behind ``x*`` along the step
+    direction; the halving back-off is unchanged."""
+
+    variant = "single_entry_adaptive_step"
+    kappa, eta_min, eta_max = 1.0, 0.3, 1.0
+
+    def _initial_step(self, cell: PolyhedralCell, z_star: np.ndarray, direction: np.ndarray, anchor: float) -> float:
+        inside = lambda t: self.geo.slack(cell, self.geo.pose(z_star - t * direction)) >= -1e-9
+        lo, hi = 0.0, 2.0 * cell.guard
+        if inside(hi):
+            lo = hi
+        else:
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                if inside(mid):
+                    lo = mid
+                else:
+                    hi = mid
+        self.stats["depth_sum"] = self.stats.get("depth_sum", 0.0) + lo
+        return min(max(self.kappa * lo, self.eta_min), self.eta_max)
+
+
+class AdaptiveStep05RRTStar(AdaptiveStepRRTStar):
+    variant = "single_entry_adaptive_step05"
+    kappa = 0.5
+
+
+class AdaptiveStep15RRTStar(AdaptiveStepRRTStar):
+    variant = "single_entry_adaptive_step15"
+    kappa = 1.5
 
 
 class SeedLaunchRRTStar(SingleEntryRRTStar):
@@ -853,6 +1127,119 @@ class HeadingHoldRRTStar(SingleEntryRRTStar):
             self.stats["steer_first_try"] += int(attempt == 1)
             self.stats["backoffs"] += attempt - 1
         return result
+
+
+class LexTurnRRTStar(SingleEntryRRTStar):
+    """A with node cost ``(J_i, Theta_i)``, ``Theta_i`` the accumulated turning of the entries along the tree path.
+    ChooseParent / Rewire / goal choice: a clearly shorter candidate (``J_a (1 + eps_J) < J_b``) wins; otherwise,
+    within the length tolerance, the one with less turning."""
+
+    variant = "single_entry_lex_turn"
+    eps_j = 0.01
+
+    def _init_root(self) -> None:
+        super()._init_root()
+        self.turn: list[float] = [0.0]
+
+    def _better(self, ja: float, ta: float, jb: float, tb: float) -> bool:
+        if ja * (1.0 + self.eps_j) < jb:
+            return True
+        return ja <= jb * (1.0 + self.eps_j) and ta < tb - 1e-12
+
+    def _turn(self, a: Pose2D, b: Pose2D) -> float:
+        return abs(wrap_to_pi(b.yaw - a.yaw))
+
+    def _refresh(self, index: int) -> None:
+        chain = []
+        cursor = index
+        while self.parent[cursor] is not None:
+            chain.append(cursor)
+            cursor = self.parent[cursor]
+        for node in reversed(chain):
+            p = self.parent[node]
+            if self.parent_version[node] == self.version[p]:
+                continue
+            z = self._attach(self.entry[p], self.cells[p], self.cells[node])
+            if z is not None:
+                self.entry[node] = z
+            self.cost[node] = self.cost[p] + self.geo.distance(self.entry[p], self.entry[node])
+            self.turn[node] = self.turn[p] + self._turn(self.entry[p], self.entry[node])
+            self.parent_version[node] = self.version[p]
+            self.version[node] += 1
+            self.stats["repairs"] += 1
+
+    def _connect(self, index: int, parent: int, portal: Pose2D) -> None:
+        cell = self.cells[index]
+        neighbors = self._neighbors(index)
+        candidates = [parent] + neighbors
+        for j in candidates:
+            self._refresh(j)
+        best, best_cost, best_turn, best_entry = None, math.inf, math.inf, None
+        for j in sorted(candidates, key=lambda j: (j != parent, self.cost[j])):
+            if self.cost[j] + self._bound(self.entry[j], self.cells[j], cell) > best_cost * (1.0 + self.eps_j):
+                continue
+            self.stats["choose_parent_tests"] += 1
+            z = self._attach(self.entry[j], self.cells[j], cell)
+            if z is None:
+                continue
+            c, t = self.cost[j] + self.geo.distance(self.entry[j], z), self.turn[j] + self._turn(self.entry[j], z)
+            if self._better(c, t, best_cost, best_turn):
+                self.stats["choose_parent_improved"] += int(best is not None)
+                best, best_cost, best_turn, best_entry = j, c, t, z
+        if best is None:
+            best, best_entry = parent, portal
+            best_cost = self.cost[parent] + self.geo.distance(self.entry[parent], portal)
+            best_turn = self.turn[parent] + self._turn(self.entry[parent], portal)
+        self.parent.append(best)
+        self.entry.append(best_entry)
+        self.cost.append(best_cost)
+        self.turn.append(best_turn)
+        self.version.append(0)
+        self.parent_version.append(self.version[best])
+        ancestors = set()
+        cursor = best
+        while cursor is not None:
+            ancestors.add(cursor)
+            cursor = self.parent[cursor]
+        for k in neighbors + ([parent] if parent != best else []):
+            if k in ancestors:
+                continue
+            self._refresh(k)
+            if best_cost + self._bound(best_entry, cell, self.cells[k]) > self.cost[k] * (1.0 + self.eps_j):
+                continue
+            self.stats["rewire_tests"] += 1
+            z = self._attach(best_entry, cell, self.cells[k])
+            if z is None:
+                continue
+            c, t = best_cost + self.geo.distance(best_entry, z), best_turn + self._turn(best_entry, z)
+            if self._better(c, t, self.cost[k], self.turn[k]):
+                self.parent[k], self.entry[k], self.cost[k], self.turn[k] = index, z, c, t
+                self.parent_version[k] = self.version[index]
+                self.version[k] += 1
+                self.stats["rewires"] += 1
+
+    def _goal_value(self, g: int) -> tuple[float, float]:
+        self._refresh(g)
+        yaw = self.geo.goal_yaw(self.cells[g], self.goal_xy, self.entry[g].yaw, self.config.overlap_margin)
+        goal = Pose2D(self.goal_xy[0], self.goal_xy[1], yaw)
+        return self.cost[g] + self.geo.distance(self.entry[g], goal), self.turn[g] + self._turn(self.entry[g], goal)
+
+    def _region_chain(self) -> tuple[list[int], float]:
+        values = [self._goal_value(g) for g in self.goal_cells]
+        k = 0
+        for i in range(1, len(values)):
+            if self._better(*values[i], *values[k]):
+                k = i
+        sequence, cursor = [], self.goal_cells[k]
+        while cursor is not None:
+            sequence.append(cursor)
+            cursor = self.parent[cursor]
+        return sequence[::-1], float(values[k][0])
+
+
+class LexTurn5RRTStar(LexTurnRRTStar):
+    variant = "single_entry_lex_turn5"
+    eps_j = 0.05
 
 
 class NoRewireRRTStar(SingleEntryRRTStar):
@@ -1138,5 +1525,7 @@ class AnchorRRTStar(_CorePlanner):
 
 
 PLANNERS = {cls.variant: cls for cls in (SingleEntryRRTStar, SeedLaunchRRTStar, SeedLaunchCoveredRRTStar,
-                                         RayLaunchRRTStar, HeadingHoldRRTStar, NoRewireRRTStar, ProxyRRTStar, PortalRRTStar,
+                                         RayLaunchRRTStar, HeadingHoldRRTStar, AncestorRRTStar, EntryRayRRTStar, AncestorEntryRayRRTStar, ConsistentRRTStar,
+                                    ConsistentRewireRRTStar, ReferenceParentRRTStar, AdaptiveStepRRTStar,
+                                    AdaptiveStep05RRTStar, AdaptiveStep15RRTStar, LexTurnRRTStar, LexTurn5RRTStar, NoRewireRRTStar, ProxyRRTStar, PortalRRTStar,
                                          AnchorRRTStar)}
