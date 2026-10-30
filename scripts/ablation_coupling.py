@@ -48,14 +48,29 @@ LABELS = {FULL: "full (A)", f"{RAY}@0.3": "q_i ray-exit launch, eta 0.3", f"{RAY
           "single_entry_consistent": "A + consistent rewire + reference ChooseParent",
           f"{FULL}@0.3": "A, eta 0.3", f"{FULL}@1.0": "A, eta 1.0", f"{FULL}@1.5": "A, eta 1.5",
           "single_entry_adaptive_step05": "adaptive step, kappa 0.5", "single_entry_adaptive_step": "adaptive step, kappa 1.0",
-          "single_entry_adaptive_step15": "adaptive step, kappa 1.5"}
+          "single_entry_adaptive_step15": "adaptive step, kappa 1.5",
+          "single_entry_normal_turn": "normal-aware rotation rows", "single_entry_normal_turn@0.3": "normal-aware rows, eta 0.3",
+          "single_entry_cost_near@0.3": "Cost-Near-3 (p 0.8)", "single_entry_cost_near5@0.3": "Cost-Near-5 (p 0.8)",
+          "single_entry_cost_near_mix@0.3": "Cost-Near-3-Mix (p 0.5)", "single_entry_cost_near_full@0.3": "Cost-Near-3-Full (p 1.0)",
+          "single_entry_cost_near5_full@0.3": "Cost-Near-5-Full (p 1.0)",
+          "single_entry_cost_near5_after@0.3": "Cost-Near-5 after first (p 0.8)",
+          "single_entry_cost_near5_full_after@0.3": "Cost-Near-5-Full after first (p 1.0)"}
 COLORS = {FULL: "C3", f"{RAY}@0.3": "C9", f"{RAY}@0.6": "C2", f"{RAY}@1.0": "C5", "single_entry_seed_launch": "C7",
           "single_entry_seed_launch_covered": "C8", "single_entry_no_rewire": "C1", "anchor_rrtstar": "C0",
           "single_entry_heading_hold": "C4", "single_entry_lex_turn": "C6", "single_entry_lex_turn5": "C8",
           "single_entry_ancestor": "C0", "single_entry_entry_ray": "C2", "single_entry_ancestor_entry_ray": "C4",
           "single_entry_consistent_rewire": "C0", "single_entry_reference_parent": "C2", "single_entry_consistent": "C4",
           f"{FULL}@0.3": "C9", f"{FULL}@1.0": "C5", f"{FULL}@1.5": "C1",
-          "single_entry_adaptive_step05": "C0", "single_entry_adaptive_step": "C2", "single_entry_adaptive_step15": "C4"}
+          "single_entry_adaptive_step05": "C0", "single_entry_adaptive_step": "C2", "single_entry_adaptive_step15": "C4",
+          "single_entry_normal_turn": "C2", "single_entry_normal_turn@0.3": "C4",
+          "single_entry_cost_near@0.3": "C2", "single_entry_cost_near5@0.3": "C4", "single_entry_cost_near_mix@0.3": "C0",
+          "single_entry_cost_near_full@0.3": "C1", "single_entry_cost_near5_full@0.3": "C6",
+          "single_entry_cost_near5_after@0.3": "C8", "single_entry_cost_near5_full_after@0.3": "C7"}
+for _n, _shade in zip((100, 250, 500), ((0.1, 0.4, 0.9), (0.3, 0.6, 1.0), (0.6, 0.8, 1.0))):
+    LABELS[f"single_entry_cost{_n}_then_a@0.3"] = f"cost-guided first {_n}, then A"
+    LABELS[f"single_entry_a{_n}_then_cost@0.3"] = f"A first {_n}, then cost-guided"
+    COLORS[f"single_entry_cost{_n}_then_a@0.3"] = _shade
+    COLORS[f"single_entry_a{_n}_then_cost@0.3"] = (_shade[2], _shade[1] * 0.6, _shade[0])
 
 
 def run_task(task):

@@ -131,6 +131,10 @@ class PolyhedralCell:
 
     Not part of the certificate: they tell which part of the guard boundary faces a known obstacle and keep
     seeds placed just beyond the cell out of known restricted regions."""
+    turn_plus: np.ndarray | None = None
+    turn_minus: np.ndarray | None = None
+    """Per-row coefficients ``k_+, k_- <= 1`` of rows ``n^T dc - k_+ [dpsi]_+ - k_- [-dpsi]_+ + e >= 0`` with
+    ``dpsi = rho dtheta`` (``NormalTurnCellModel``); ``None`` means ``k_+ = k_- = 1``."""
     new_ratio: float = math.nan
     overlap_ratio: float = math.nan
     mode: str = ""
@@ -471,7 +475,11 @@ class PolyhedralCellModel:
         slack = np.minimum(cell.guard - np.hypot(dx, dy) - turn, cell.rho * cell.yaw_limit - turn)
         if len(cell.offsets):
             rows = cell.normals[:, 0:1] * dx[None, :] + cell.normals[:, 1:2] * dy[None, :] + cell.offsets[:, None]
-            slack = np.minimum(slack, rows.min(axis=0) - turn)
+            if cell.turn_plus is None:
+                slack = np.minimum(slack, rows.min(axis=0) - turn)
+            else:
+                k = np.where(dphi[None, :] > 0.0, cell.turn_plus[:, None], cell.turn_minus[:, None])
+                slack = np.minimum(slack, (rows - k * turn[None, :]).min(axis=0))
         return slack
 
     def slack_many(self, cell: PolyhedralCell, points: np.ndarray) -> np.ndarray:
@@ -779,3 +787,73 @@ class PolyhedralCellModel:
             return None
         self.stats["socp_accept"] += 1
         return self._certificate(first, second, portal, slack)
+
+
+def _cos_min(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """``min cos`` over ``[a, b]`` elementwise (``b - a < 2 pi``)."""
+    inside = math.pi + 2.0 * math.pi * np.ceil((a - math.pi) / (2.0 * math.pi)) <= b
+    return np.where(inside, -1.0, np.minimum(np.cos(a), np.cos(b)))
+
+
+def _cos_max(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    inside = 2.0 * math.pi * np.ceil(a / (2.0 * math.pi)) <= b
+    return np.where(inside, 1.0, np.maximum(np.cos(a), np.cos(b)))
+
+
+class NormalTurnCellModel(PolyhedralCellModel):
+    """Lazy cells whose rows bound the normal component of each robot's rotation displacement.
+
+    For row ``k`` (robot ``r``, normal ``n``) ``f(t) = n^T (R(theta_0 + t) - R(theta_0)) s_r`` has
+    ``f'(t) = ||s_r|| cos(t + phi)``, ``phi = angle(R(theta_0) J s_r) - angle(n)``.  With
+    ``alpha_+ = max(0, -min_{[0, L]} f')`` and ``alpha_- = max(0, max_{[-L, 0]} f')``, ``f(t) >= -alpha_+ t`` on
+    ``[0, L]`` and ``f(t) >= alpha_- t`` on ``[-L, 0]``, so ``n^T dc - alpha_+ [dth]_+ - alpha_- [-dth]_+ + e >= 0``
+    keeps the pair clear; ``alpha <= ||s_r|| <= rho`` makes the cell contain the plain cell of the same seed.  Guard
+    and yaw range are unchanged.  Rows are stored with ``k = alpha / rho`` on ``dpsi = rho dtheta``."""
+
+    name = "polyhedral_normal_turn"
+
+    def _make_lazy_cell(self, pose: Pose2D) -> PolyhedralCell:
+        stats = self.stats
+        stats["cells_built"] += 1
+        stats["pose_queries"] += 1
+        count = len(self.slots)
+        stats["pair_queries"] += count * self.component_count
+        clearance, normals = self.proximity(self.robot_positions(pose))
+        flat = clearance.ravel()
+        broadphase = flat < self.active_range
+        broadphase_count = int(broadphase.sum())
+        guard = self.max_extent
+        if broadphase_count < len(flat):
+            guard = min(float(flat[~broadphase].min()) - self.safety_distance, guard)
+        offsets = flat - self.safety_distance
+        index = np.flatnonzero(broadphase & (offsets < guard))
+        offsets = offsets[index]
+        rows = normals.reshape((-1, 2))[index]
+        components = clearance.shape[1]
+        radius = min(float(offsets.min()), guard) if len(index) else guard
+        limit = min(self.yaw_chart, 0.5 * (radius + guard) / self.rho) if radius > 0.0 else 0.0
+        slots = self.slots[index // components]
+        c, s = math.cos(pose.yaw), math.sin(pose.yaw)
+        wx, wy = -c * slots[:, 1] - s * slots[:, 0], -s * slots[:, 1] + c * slots[:, 0]
+        phi = np.arctan2(wy, wx) - np.arctan2(rows[:, 1], rows[:, 0])
+        size = np.hypot(slots[:, 0], slots[:, 1]) / self.rho
+        plus = size * np.maximum(0.0, -_cos_min(phi, phi + limit))
+        minus = size * np.maximum(0.0, _cos_max(phi - limit, phi))
+        if len(index) > 1:
+            # row j is implied by a tighter row i inside the guard if
+            # e_j >= e_i + max(||n_j - n_i||, k+_j - k+_i, k-_j - k-_i, 0) r_g
+            spread = np.maximum.reduce((
+                np.sqrt(((rows[:, None, :] - rows[None, :, :]) ** 2).sum(axis=2)),
+                plus[:, None] - plus[None, :], minus[:, None] - minus[None, :], np.zeros((len(index),) * 2)))
+            order = np.argsort(offsets, kind="stable")
+            rank = order.argsort()
+            implied = (offsets[:, None] >= offsets[None, :] + spread * guard) & (rank[None, :] < rank[:, None])
+            keep = ~implied.any(axis=1)
+            if not keep.all():
+                index, offsets, rows, plus, minus = index[keep], offsets[keep], rows[keep], plus[keep], minus[keep]
+        stats["broadphase_pairs"] += broadphase_count
+        stats["active_pairs"] += len(index)
+        return PolyhedralCell(pose=pose, clearance=float(flat.min()), normals=rows, offsets=offsets,
+                              pairs=tuple(zip((index // components).tolist(), (index % components).tolist())),
+                              guard=guard, yaw_limit=limit, rho=self.rho, broadphase_pairs=broadphase_count,
+                              turn_plus=plus, turn_minus=minus, _model=self)

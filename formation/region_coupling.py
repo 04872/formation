@@ -29,7 +29,7 @@ import clarabel
 import numpy as np
 import scipy.sparse as sp
 from formation import region_qp
-from formation.polyhedral_cell import PolyhedralCell, PolyhedralCellModel, _csc
+from formation.polyhedral_cell import NormalTurnCellModel, PolyhedralCell, PolyhedralCellModel, _csc
 from formation.tube_rrt_region import _row_separates
 from formation.types import MapData, Pose2D, wrap_to_pi
 
@@ -69,6 +69,38 @@ def _rows(cell: PolyhedralCell) -> tuple[tuple[float, float, float], ...]:
     return rows
 
 
+def _turns(cell: PolyhedralCell) -> tuple[tuple[float, float], ...] | None:
+    """Per-row ``(k_+, k_-)`` as Python floats, or ``None`` for plain cells (``k_+ = k_- = 1``)."""
+    if cell.turn_plus is None:
+        return None
+    turns = getattr(cell, "_py_turns", None)
+    if turns is None:
+        turns = cell._py_turns = tuple(zip(cell.turn_plus.tolist(), cell.turn_minus.tolist()))
+    return turns
+
+
+def _turn_coefficients(cell: PolyhedralCell) -> tuple[np.ndarray, np.ndarray]:
+    k = len(cell.offsets)
+    if cell.turn_plus is None:
+        return np.ones(k), np.ones(k)
+    return cell.turn_plus, cell.turn_minus
+
+
+def _turned_row_separates(cell: PolyhedralCell, other: PolyhedralCell, vx: float, vy: float, turn: float) -> bool:
+    """``_row_separates`` for rows with turn coefficients ``k <= 1``: on ``other`` a row of ``cell`` is at most
+    ``n^T v - k_min turn + e + h`` with ``h = min(r_g', min_j f_j + max(1 - k'_min,j, ||n + m_j||) r_g')``."""
+    turns = _turns(cell) or ((1.0, 1.0),) * len(cell.offsets)
+    other_turns = _turns(other) or ((1.0, 1.0),) * len(other.offsets)
+    g = other.guard
+    for (nx, ny, e), (kp, km) in zip(_rows(cell), turns):
+        reach = g
+        for (mx, my, f), (lp, lm) in zip(_rows(other), other_turns):
+            reach = min(reach, f + max(1.0 - min(lp, lm), math.hypot(nx + mx, ny + my)) * g)
+        if nx * vx + ny * vy - min(kp, km) * turn + e + reach < 0.0:
+            return True
+    return False
+
+
 class _Program:
     """Clarabel program ``min q^T x`` s.t. ``b - A x`` in a product of nonnegative and second-order cones."""
 
@@ -100,12 +132,12 @@ class _Program:
         k = len(e)
         a = np.zeros((2 * k + 2, self.nvar))
         b = np.empty(2 * k + 2)
-        for s, sign in enumerate((1.0, -1.0)):
+        for s, (sign, coef) in enumerate(zip((1.0, -1.0), _turn_coefficients(cell))):
             rows = slice(s * k, (s + 1) * k)
             a[rows, col] = -n[:, 0]
             a[rows, col + 1] = -n[:, 1]
-            a[rows, col + 2] = sign
-            b[rows] = e - margin - n @ seed[:2] + sign * seed[2]
+            a[rows, col + 2] = sign * coef
+            b[rows] = e - margin - n @ seed[:2] + sign * coef * seed[2]
             a[2 * k + s, col + 2] = sign
             b[2 * k + s] = cell.rho * cell.yaw_limit - margin + sign * seed[2]
         if margin_col is not None:
@@ -181,24 +213,36 @@ class RegionGeometry:
     def slack(self, cell: PolyhedralCell, pose: Pose2D) -> float:
         """``PolyhedralCellModel.slack`` for one pose, in scalar arithmetic."""
         dx, dy = pose.x - cell.pose.x, pose.y - cell.pose.y
-        turn = cell.rho * abs(wrap_to_pi(pose.yaw - cell.pose.yaw))
+        dpsi = cell.rho * wrap_to_pi(pose.yaw - cell.pose.yaw)
+        turn = abs(dpsi)
         value = min(cell.guard - math.hypot(dx, dy), cell.rho * cell.yaw_limit) - turn
-        for nx, ny, e in _rows(cell):
-            value = min(value, nx * dx + ny * dy + e - turn)
+        turns = _turns(cell)
+        if turns is None:
+            for nx, ny, e in _rows(cell):
+                value = min(value, nx * dx + ny * dy + e - turn)
+        else:
+            for (nx, ny, e), (kp, km) in zip(_rows(cell), turns):
+                value = min(value, nx * dx + ny * dy + e - (kp if dpsi > 0.0 else km) * turn)
         return value
 
     def goal_yaw(self, cell: PolyhedralCell, goal_xy, toward_yaw: float, margin: float) -> float | None:
         """Yaw closest to ``toward_yaw`` with ``(goal_xy, yaw)`` in ``cell`` at slack ``>= margin``, or ``None``.
         At fixed ``dc`` the cell is ``rho |dtheta| <= min(n^T dc + e, r_g - ||dc||, rho L) - margin``."""
         dx, dy = goal_xy[0] - cell.pose.x, goal_xy[1] - cell.pose.y
-        half = min(cell.guard - math.hypot(dx, dy), cell.rho * cell.yaw_limit)
-        if len(cell.offsets):
-            half = min(half, float(np.min(cell.normals @ (dx, dy) + cell.offsets)))
-        half -= margin
+        half = min(cell.guard - math.hypot(dx, dy), cell.rho * cell.yaw_limit) - margin
         if half < 0.0:
             return None
+        up = down = half
+        if len(cell.offsets):
+            room = cell.normals @ (dx, dy) + cell.offsets - margin
+            if float(room.min()) < 0.0:
+                return None
+            plus, minus = _turn_coefficients(cell)
+            with np.errstate(divide="ignore"):
+                up = min(half, float(np.min(np.where(plus > 0.0, room / plus, np.inf))))
+                down = min(half, float(np.min(np.where(minus > 0.0, room / minus, np.inf))))
         offset = wrap_to_pi(toward_yaw - cell.pose.yaw)
-        return wrap_to_pi(cell.pose.yaw + max(-half / cell.rho, min(half / cell.rho, offset)))
+        return wrap_to_pi(cell.pose.yaw + max(-down / cell.rho, min(up / cell.rho, offset)))
 
     def _constraints(self, cells, anchor: float, margin: float):
         """``A z <= b`` and guard cones ``||z_xy - c_xy|| <= g - sigma (z_theta - c_theta)`` of shrunk cells."""
@@ -207,7 +251,8 @@ class RegionGeometry:
             cached = getattr(cell, "_py_halfspaces", None)
             if cached is None:
                 n, e = cell.normals.reshape((-1, 2)), cell.offsets
-                signs = np.concatenate((np.ones(len(e)), -np.ones(len(e)), (1.0, -1.0)))
+                plus, minus = _turn_coefficients(cell)
+                signs = np.concatenate((plus, -minus, (1.0, -1.0)))
                 matrix = np.zeros((len(signs), 3))
                 matrix[:2 * len(e), :2] = np.vstack((-n, -n))
                 matrix[:, 2] = signs
@@ -441,14 +486,16 @@ class _CorePlanner:
     """Shared region expansion; subclasses add the coupling-specific bookkeeping in ``_connect``."""
 
     variant = "core"
+    cell_model = PolyhedralCellModel
 
     def __init__(self, map_data: MapData, slots: np.ndarray, start: Pose2D, config: CouplingConfig) -> None:
         self.map_data, self.start, self.config = map_data, start, config
         self.goal_xy = tuple(map_data.goal_xy)
         self.slots = np.asarray(slots, dtype=float)
         margin = float(map_data.robot_radius) + float(map_data.safety_margin)
-        self.model = PolyhedralCellModel(self.slots, map_data, margin, config.safety_distance, config.active_range,
-                                         max_extent=config.max_extent, lazy_geometry=True)
+        self.model = self.cell_model(self.slots, map_data, margin, config.safety_distance, config.active_range,
+                                     max_extent=config.max_extent, lazy_geometry=True)
+        self._turned = self.cell_model is not PolyhedralCellModel
         self.geo = RegionGeometry(self.model)
         self.rho = self.model.rho
         self.rng = np.random.default_rng(config.seed)
@@ -460,6 +507,7 @@ class _CorePlanner:
         self._g, self._lim, self._a = np.zeros(cap), np.zeros(cap), np.zeros(cap)
         self._n = np.zeros((cap, rows, 2))
         self._e = np.full((cap, rows), np.inf)
+        self._kp, self._km = np.ones((cap, rows)), np.ones((cap, rows))
         self.stats = {"iterations": 0, "covered_samples": 0, "steer_failed": 0, "steer_first_try": 0,
                       "steer_cells": 0, "backoffs": 0, "select_time_s": 0.0, "steer_time_s": 0.0,
                       "connect_time_s": 0.0, "connect_solves": 0, "core_solves": 0, "neighbor_candidates": 0,
@@ -474,11 +522,17 @@ class _CorePlanner:
                 setattr(self, name, np.concatenate((getattr(self, name), np.zeros(grow))))
             self._n = np.concatenate((self._n, np.zeros((grow,) + self._n.shape[1:])))
             self._e = np.concatenate((self._e, np.full((grow, self._e.shape[1]), np.inf)))
+            self._kp = np.concatenate((self._kp, np.ones((grow, self._kp.shape[1]))))
+            self._km = np.concatenate((self._km, np.ones((grow, self._km.shape[1]))))
         k = len(cell.offsets)
         if k > self._e.shape[1]:
             extra = k - self._e.shape[1]
             self._n = np.concatenate((self._n, np.zeros((len(self._n), extra, 2))), axis=1)
             self._e = np.concatenate((self._e, np.full((len(self._e), extra), np.inf)), axis=1)
+            self._kp = np.concatenate((self._kp, np.ones((len(self._kp), extra))), axis=1)
+            self._km = np.concatenate((self._km, np.ones((len(self._km), extra))), axis=1)
+        if cell.turn_plus is not None:
+            self._kp[i, :k], self._km[i, :k] = cell.turn_plus, cell.turn_minus
         self._x[i], self._y[i], self._t[i] = cell.pose.x, cell.pose.y, cell.pose.yaw
         self._g[i], self._lim[i] = cell.guard, cell.rho * cell.yaw_limit
         self._a[i] = max(0.0, self.geo.slack(cell, cell.pose)) / math.sqrt(2.0)
@@ -499,22 +553,33 @@ class _CorePlanner:
     def _select(self, sample: Pose2D) -> int:
         """Region-gap rule ``argmin_i D_i - l_i(u_i)``: ``l_i`` is the reach of ``C_i`` from its seed along the
         seed-to-sample ray, so the gap is the d_W distance left after leaving ``C_i`` along that ray."""
+        idx, gap = self._gap_candidates(sample, 1)
+        return int(idx[np.argmin(gap)])
+
+    def _gap_candidates(self, sample: Pose2D, k: int) -> tuple[np.ndarray, np.ndarray]:
+        """Regions that can be among the ``k`` smallest gaps ``D_i - l_i(u_i)``, and their gaps."""
         count = len(self.cells)
         v = np.column_stack((sample.x - self._x[:count], sample.y - self._y[:count],
                              self.rho * (np.remainder(sample.yaw - self._t[:count] + math.pi, 2 * math.pi) - math.pi)))
         length = np.sqrt(np.einsum("ij,ij->i", v, v))
-        # a_i <= l_i <= r_g,i: only regions whose lower bound reaches the best upper bound can be the argmin.
-        idx = np.flatnonzero(length - self._g[:count] <= np.min(length - self._a[:count]))
+        # a_i <= l_i <= r_g,i: only regions whose lower bound reaches the k-th best upper bound can be in the top k.
+        upper = length - self._a[:count]
+        bound = np.min(upper) if k == 1 or k >= count else np.partition(upper, k - 1)[k - 1]
+        idx = np.flatnonzero(length - self._g[:count] <= bound)
         v, length = v[idx], length[idx]
         u = v / np.maximum(length, 1e-300)[:, None]
         turn = np.abs(u[:, 2])
         with np.errstate(divide="ignore", invalid="ignore"):
             reach = np.minimum(self._g[idx] / (np.hypot(u[:, 0], u[:, 1]) + turn),
                                np.where(turn > 0.0, self._lim[idx] / turn, np.inf))
-            rate = turn[:, None] - np.einsum("ikj,ij->ik", self._n[idx], u[:, :2])
+            if self._turned:
+                k = np.where(u[:, 2:3] > 0.0, self._kp[idx], self._km[idx])
+                rate = k * turn[:, None] - np.einsum("ikj,ij->ik", self._n[idx], u[:, :2])
+            else:
+                rate = turn[:, None] - np.einsum("ikj,ij->ik", self._n[idx], u[:, :2])
             rows = np.where(rate > 1e-15, self._e[idx] / rate, np.inf)
         reach = np.minimum(reach, rows.min(axis=1))
-        return int(idx[np.argmin(length - reach)])
+        return idx, length - reach
 
     def _steer(self, parent: int, sample: Pose2D) -> tuple[PolyhedralCell | None, Pose2D | None, int]:
         """``x* = Pi_{C_i}(q_rand)``, then ``eta, eta/2, ...`` until ``C_new`` overlaps ``C_i`` by the margin."""
@@ -617,6 +682,9 @@ class _CorePlanner:
             return True
         vx, vy = second.pose.x - first.pose.x, second.pose.y - first.pose.y
         turn = self.rho * abs(wrap_to_pi(second.pose.yaw - first.pose.yaw))
+        if self._turned:
+            return (_turned_row_separates(first, second, vx, vy, turn)
+                    or _turned_row_separates(second, first, -vx, -vy, turn))
         return (_row_separates(_rows(first), _rows(second), vx, vy, turn, second.guard)
                 or _row_separates(_rows(second), _rows(first), -vx, -vy, turn, first.guard))
 
@@ -1524,8 +1592,122 @@ class AnchorRRTStar(_CorePlanner):
         return sequence[::-1], float(costs[k])
 
 
+class CostNearRRTStar(SingleEntryRRTStar):
+    """A with cost-guided region selection: with probability ``p_cost`` the ``k`` smallest region gaps are
+    candidates, each is projected, ``x_i = Pi_{C_i}(q_rand)``, and the one minimising
+    ``S_i = J_i + d_W(e_i, x_i) + d_W(x_i, q_rand)`` is expanded from ``x_i``; otherwise A's gap rule.  The choice
+    uses its own random stream, so the samples are those of A."""
+
+    variant = "single_entry_cost_near"
+    k = 3
+    p_cost = 0.8
+    after_first = False
+    """Use A's gap rule until the first goal region exists."""
+    guided_iterations: tuple[int, float] = (0, math.inf)
+    """Cost-guided selection only for iterations ``lo < it <= hi`` (switch at a fixed sample count)."""
+
+    def _init_root(self) -> None:
+        super()._init_root()
+        self.choice_rng = np.random.default_rng((self.config.seed, 7))
+        self._launch_cache: tuple[int, Pose2D, Pose2D] | None = None
+        self._iteration = 0
+        self.stats.update(cost_selects=0, cost_changed=0, cost_projections=0, cost_pruned=0)
+
+    def _guided(self) -> bool:
+        lo, hi = self.guided_iterations
+        return lo < self._iteration <= hi and not (self.after_first and not self.goal_cells)
+
+    def _select(self, sample: Pose2D) -> int:
+        self._launch_cache = None
+        self._iteration += 1
+        if self.choice_rng.random() >= self.p_cost or not self._guided():
+            return super()._select(sample)
+        idx, gap = self._gap_candidates(sample, self.k)
+        order = idx[np.argsort(gap, kind="stable")[:self.k]].tolist()
+        # S_i >= J_i + d_W(e_i, q_rand): candidates whose bound exceeds the best score need no projection.
+        bounds = []
+        for rank, i in enumerate(order):
+            self._refresh(i)
+            bounds.append((self.cost[i] + self.geo.distance(self.entry[i], sample), rank, i))
+        best, best_key, best_x = None, (math.inf, math.inf), None
+        for bound, rank, i in sorted(bounds):
+            if bound > best_key[0] + 1e-12:
+                self.stats["cost_pruned"] += 1
+                continue
+            x = self.geo.project(self.cells[i], sample)
+            key = (self.cost[i] + self.geo.distance(self.entry[i], x) + self.geo.distance(x, sample), rank)
+            self.stats["cost_projections"] += 1
+            if key < best_key:
+                best, best_key, best_x = i, key, x
+        self.stats["cost_selects"] += 1
+        self.stats["cost_changed"] += int(best != order[0])
+        self._launch_cache = (best, sample, best_x)
+        return best
+
+    def _launch(self, cell: PolyhedralCell, sample: Pose2D) -> Pose2D:
+        cache = self._launch_cache
+        if cache is not None and cache[1] is sample and self.cells[cache[0]] is cell:
+            return cache[2]
+        return super()._launch(cell, sample)
+
+
+class CostNear5RRTStar(CostNearRRTStar):
+    variant = "single_entry_cost_near5"
+    k = 5
+
+
+class CostNearMixRRTStar(CostNearRRTStar):
+    variant = "single_entry_cost_near_mix"
+    p_cost = 0.5
+
+
+class CostNearFullRRTStar(CostNearRRTStar):
+    variant = "single_entry_cost_near_full"
+    p_cost = 1.0
+
+
+class CostNear5FullRRTStar(CostNearRRTStar):
+    variant = "single_entry_cost_near5_full"
+    k = 5
+    p_cost = 1.0
+
+
+class CostNear5AfterRRTStar(CostNearRRTStar):
+    variant = "single_entry_cost_near5_after"
+    k = 5
+    after_first = True
+
+
+class CostNear5FullAfterRRTStar(CostNearRRTStar):
+    variant = "single_entry_cost_near5_full_after"
+    k = 5
+    p_cost = 1.0
+    after_first = True
+
+
+def _switch_variant(n: int, guided_first: bool) -> type:
+    """Cost-Near-5 (p 0.8) for the first ``n`` iterations then A's rule, or A first and cost-guided after."""
+    name = f"single_entry_cost{n}_then_a" if guided_first else f"single_entry_a{n}_then_cost"
+    window = (0, n) if guided_first else (n, math.inf)
+    return type(f"Switch{n}{'CostA' if guided_first else 'ACost'}RRTStar", (CostNearRRTStar,),
+                dict(variant=name, k=5, guided_iterations=window))
+
+
+SWITCH_VARIANTS = tuple(_switch_variant(n, first) for n in (100, 250, 500) for first in (True, False))
+
+
+class NormalTurnRRTStar(SingleEntryRRTStar):
+    """A on ``NormalTurnCellModel`` cells: each obstacle row bounds only the normal component of its robot's
+    rotation displacement (``C_old ⊆ C_new`` for the same seed); everything else as in A."""
+
+    variant = "single_entry_normal_turn"
+    cell_model = NormalTurnCellModel
+
+
 PLANNERS = {cls.variant: cls for cls in (SingleEntryRRTStar, SeedLaunchRRTStar, SeedLaunchCoveredRRTStar,
                                          RayLaunchRRTStar, HeadingHoldRRTStar, AncestorRRTStar, EntryRayRRTStar, AncestorEntryRayRRTStar, ConsistentRRTStar,
                                     ConsistentRewireRRTStar, ReferenceParentRRTStar, AdaptiveStepRRTStar,
                                     AdaptiveStep05RRTStar, AdaptiveStep15RRTStar, LexTurnRRTStar, LexTurn5RRTStar, NoRewireRRTStar, ProxyRRTStar, PortalRRTStar,
-                                         AnchorRRTStar)}
+                                         AnchorRRTStar, NormalTurnRRTStar, CostNearRRTStar, CostNear5RRTStar,
+                                         CostNearMixRRTStar, CostNearFullRRTStar, CostNear5FullRRTStar,
+                                         CostNear5AfterRRTStar, CostNear5FullAfterRRTStar) + SWITCH_VARIANTS}
