@@ -28,6 +28,9 @@ class SimulationResult:
     acceleration_controls: np.ndarray
     velocity_history: np.ndarray
     sfc_error: str
+    initialization_q: list
+    sequence_diagnostics: list
+    mppi_diagnostics: np.ndarray
 
 def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: int=CONFIG.sequences, steps: int=CONFIG.steps, candidates: int=CONFIG.candidates, samples: int=CONFIG.samples, obstacle_count: int=50, map_seed: int=0, horizon: int=CONFIG.horizon, progress: bool=False) -> SimulationResult:
     """Run perception, shared SFC generation, guidance, and rolling distributed MPPI."""
@@ -37,6 +40,7 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
     leader_goal = world.goal + CENTERED_REF[0]
     previous_a = np.eye(2)
     commands = []
+    mppi_diagnostics = []
     velocity_history = [np.zeros(len(REF))]
     assignment = np.arange(len(REF))
     history = [states.copy()]
@@ -49,6 +53,8 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
     planning_seconds = []
     failures = []
     all_regions = []
+    initialization_q = []
+    sequence_diagnostics = []
     q_ref_history = [qs[0].copy()]
     assignment_history = [assignment.copy()]
     frontend = FormationGuidance(mode, rng, sequences, steps, candidates)
@@ -68,12 +74,11 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
                 termination = 'sfc_failed'
                 sfc_error = str(exc)
                 break
-            path = frontend.plan(q, world, regions, states[:,:2], assignment, leader_goal)
-            reason = 'no_safe_candidate' if len(path)==1 else 'ok'
-            new_assignment = frontend.assign(states, path, regions, assignment)
-            assignment = new_assignment
-            if len(path)>1:
-                previous_a = path[1,2:].reshape(2,2).copy()
+            path,seq_diag = frontend.plan(q, world, regions, states[:,:2], assignment, leader_goal)
+            reason = 'no_safe_candidate' if len(path)==0 else 'ok'
+            assignment = frontend.assign(states, path, regions, assignment)
+            initialization_q.append(q.tolist())
+            sequence_diagnostics.append(seq_diag)
             failures.append(reason)
             all_regions.append(regions)
             join_start = states[:, :2].copy()
@@ -82,19 +87,21 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
             assignments.append(assignment.tolist())
             known_history.append(world.known.copy())
             planning_seconds.append(time.perf_counter() - started)
-            stuck = stuck + 1 if len(path) == 1 else 0
+            stuck = stuck + 1 if len(path) == 0 else 0
             if progress:
                 print(f'plan tick={tick} center={states[:,:2].mean(axis=0).tolist()} path={len(path)} status={reason} seconds={planning_seconds[-1]:.2f}', flush=True)
-        if len(path) > 1:
-            target_path=np.array([positions(qi)[assignment] for qi in path[1:]])
+        if len(path) > 0:
+            target_path=np.array([positions(qi)[assignment] for qi in path])
             offset=tick % CONFIG.replan_steps
             indices=np.minimum(np.arange(horizon)+offset,len(target_path)-1)
             guidance=target_path[indices]
-            guidance_q=path[1:][indices]
+            guidance_q=path[indices]
+            previous_a=guidance_q[0,2:].reshape(2,2).copy()
         else:
             guidance=np.repeat(states[None,:,:2],horizon,axis=0)
-            guidance_q=np.repeat(path[:1],horizon,axis=0)
+            guidance_q=np.repeat(q[None,:],horizon,axis=0)
         u,command = controller.step(states,guidance,world)
+        mppi_diagnostics.append(controller.last_diagnostics.copy())
         states=integrate(states,u)
         commands.append(command)
         velocity_history.append(controller.velocities.copy())
@@ -113,4 +120,4 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
     states = np.array(history)
     controls = np.asarray(controls).reshape(-1, len(REF), 2)
     qs = np.array(qs)
-    return SimulationResult(world, states, controls, np.array(q_ref_history), qs, paths, planning_ticks, assignments, np.array(assignment_history), np.array(known_history), planning_seconds, failures, all_regions, termination, np.asarray(commands).reshape(-1, len(REF), 2), np.array(velocity_history), sfc_error)
+    return SimulationResult(world, states, controls, np.array(q_ref_history), qs, paths, planning_ticks, assignments, np.array(assignment_history), np.array(known_history), planning_seconds, failures, all_regions, termination, np.asarray(commands).reshape(-1, len(REF), 2), np.array(velocity_history), sfc_error, initialization_q, sequence_diagnostics, np.asarray(mppi_diagnostics).reshape(-1,len(REF),6))

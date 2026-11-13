@@ -134,6 +134,7 @@ def audit_regions(path: Path) -> dict:
         coefficients, offsets = data["coefficients"], data["offsets"]
         count = int(data["regions_per_plan"])
     planning = json.loads(path.with_name("planning.json").read_text())
+    paths_include_initial = planning.get("paths_include_initial", True)
     region_lower = float("inf")
     invalid_anchors = uncertified_edges = uncertified_joins = 0
     pair_min = float("inf")
@@ -177,7 +178,7 @@ def audit_regions(path: Path) -> dict:
             distance[inside] = 0.0
             region_lower = min(region_lower, float(distance.min()) - radius - res / np.sqrt(2))
         route = np.asarray(planning["paths"][k])
-        if len(route) < 2:
+        if len(route) < (2 if paths_include_initial else 1):
             continue
         position = route[:, None, :2] + np.einsum("tij,nj->tni", route[:, 2:].reshape(-1, 2, 2), reference)
         for p0, p1 in zip(position[:-1], position[1:]):
@@ -185,7 +186,7 @@ def audit_regions(path: Path) -> dict:
             uncertified_edges += int(not connected(p0, p1, regions))
             pair_min = min(pair_min, pair_distance(p0, p1))
         assignment = planning["assignments"][k]
-        target = position[1, assignment]
+        target = position[1 if paths_include_initial else 0, assignment]
         uncertified_joins += int(not connected(states[tick, :, :2], target, regions))
         pair_min = min(pair_min, pair_distance(states[tick, :, :2], target))
 

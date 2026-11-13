@@ -25,16 +25,18 @@ def integrate_acceleration(state, velocity, control):
 
 
 def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng,
-         samples=CONFIG.samples, horizon=CONFIG.horizon, temperature=1000., amax=1.):
+         samples=CONFIG.samples, horizon=CONFIG.horizon, temperature=CONFIG.mppi_temperature, amax=1., noise_std=CONFIG.mppi_noise_std):
     """Use one nominal U, additive Gaussian noise, costs (13)-(17), and weighted noise."""
     n=len(states)
     result=np.zeros_like(nominal)
     predictions=np.zeros((n,horizon,3))
+    diagnostics=np.zeros((n,6))
     for i in range(n):
-        noise=rng.normal(0.,[.22,.45],(samples,horizon,2))
+        noise=rng.normal(0.,noise_std,(samples,horizon,2))
         controls=nominal[i][None,:,:]+noise
         x=np.repeat(states[i][None,:],samples,axis=0)
         v=np.full(samples,velocities[i]);cost=np.zeros(samples)
+        closest=np.full(samples,np.inf)
         for t in range(horizon):
             command=controls[:,t]
             x,v=integrate_acceleration(x,v,command)
@@ -46,6 +48,7 @@ def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng
             for j in range(n):
                 if j!=i:
                     distance=np.linalg.norm(x[:,:2]-previous_predictions[j,t,:2],axis=1)
+                    closest=np.minimum(closest,distance)
                     cost+=distance_penalty(distance,.5,1.2,1600.,1.5)
         weights=np.exp(-DT*(cost-cost.min())/temperature)
         weights/=weights.sum()
@@ -54,12 +57,18 @@ def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng
         result[i,:,0]=np.clip(result[i,:,0],-amax,amax)
         result[i,:,1]=np.clip(result[i,:,1],-CONFIG.max_angular_speed,CONFIG.max_angular_speed)
         x=states[i].copy(); v=velocities[i]
+        weighted_closest=np.inf
         for t in range(horizon):
             control=result[i,t].copy()
             control[0]=np.clip(control[0],(-CONFIG.max_speed-v)/DT,(CONFIG.max_speed-v)/DT)
             x,v=integrate_acceleration(x,v,control)
             predictions[i,t]=x
-    return result,predictions
+            for j in range(n):
+                if j!=i:
+                    weighted_closest=min(weighted_closest,np.linalg.norm(x[:2]-previous_predictions[j,t,:2]))
+        diagnostics[i]=[1./np.sum(weights**2),np.mean(closest>=.32),np.mean(closest>=.5),
+                        closest[np.argmin(cost)],weighted_closest,np.min(cost)*DT]
+    return result,predictions,diagnostics
 
 
 class DistributedMPPI:
@@ -72,7 +81,7 @@ class DistributedMPPI:
         self.u_init=np.zeros((len(states),2))
 
     def step(self,states,guidance,world):
-        opt,pred=mppi(states,self.velocities,guidance,self.nominal,self.previous_predictions,
+        opt,pred,self.last_diagnostics=mppi(states,self.velocities,guidance,self.nominal,self.previous_predictions,
                       world,self.rng,self.samples,self.horizon)
         command=opt[:,0].copy()
         command[:,0]=np.clip(command[:,0],(-CONFIG.max_speed-self.velocities)/DT,

@@ -14,11 +14,11 @@ def write_outputs(args, result):
         name += f'_mapseed{args.map_seed}_n{args.obstacle_count}'
     out = Path(args.output) / name
     out.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out / 'trajectory.npz', states=states, controls=controls, acceleration_controls=result.acceleration_controls, velocity_history=result.velocity_history, q_history=qs, actual_fit_q=actual_q, assignment_history=assignment_history, known_history=known_history, dt=DT, occupancy=world.truth, origin=np.zeros(2), resolution=world.res, robot_radius=RADIUS, reference=REF, goal=world.goal+CENTERED_REF[0], planning_ticks=ticks, v_max=CONFIG.max_speed, omega_max=CONFIG.max_angular_speed, circles=world.circles, map_seed=world.map_seed, obstacle_count=len(world.circles))
+    np.savez_compressed(out / 'trajectory.npz', states=states, controls=controls, acceleration_controls=result.acceleration_controls, velocity_history=result.velocity_history, mppi_diagnostics=result.mppi_diagnostics, q_history=qs, actual_fit_q=actual_q, assignment_history=assignment_history, known_history=known_history, dt=DT, occupancy=world.truth, origin=np.zeros(2), resolution=world.res, robot_radius=RADIUS, reference=REF, goal=world.goal+CENTERED_REF[0], planning_ticks=ticks, v_max=CONFIG.max_speed, omega_max=CONFIG.max_angular_speed, circles=world.circles, map_seed=world.map_seed, obstacle_count=len(world.circles))
     regions = [np.c_[h, b] for group in result.regions for (h, b) in group]
     offsets = np.r_[0, np.cumsum([len(region) for region in regions])]
     np.savez_compressed(out / 'regions.npz', coefficients=np.concatenate(regions) if regions else np.empty((0,3)), offsets=offsets, regions_per_plan=len(REF))
-    (out / 'planning.json').write_text(json.dumps({'ticks': ticks, 'paths': paths, 'assignments': assignments, 'planning_seconds': planning_seconds, 'status': result.failures}))
+    (out / 'planning.json').write_text(json.dumps({'ticks': ticks, 'paths': paths, 'assignments': assignments, 'planning_seconds': planning_seconds, 'status': result.failures, 'paths_include_initial': False, 'initialization_q': result.initialization_q, 'sequence_diagnostics': result.sequence_diagnostics}))
     from scipy.ndimage import distance_transform_edt
     dist = distance_transform_edt(~world.truth) * world.res - world.res * np.sqrt(2) / 2
     idx = np.floor(states[:, :, :2] / world.res).astype(int)
@@ -29,6 +29,11 @@ def write_outputs(args, result):
     errors = np.linalg.norm(states[-1, :, :2] - (world.goal + CENTERED_REF[0] + REF[assignment_history[-1]]), axis=1)
     terminal_speed = float(np.max(np.abs(result.velocity_history[-1])))
     metrics = {'scene': args.scene, 'mode': args.mode, 'seed': args.seed, 'map_seed': world.map_seed, 'obstacle_count': len(world.circles), 'success': bool(errors.max() < 0.4 and terminal_speed < 0.1), 'goal_distance': float(progress), 'robot_goal_errors': errors.tolist(), 'terminal_max_speed': terminal_speed, 'planning_seconds': planning_seconds, 'steps': len(controls), 'min_obstacle_clearance': float(clear.min()), 'min_robot_distance': float(pair.min()), 'obstacle_collision': bool(clear.min() < RADIUS), 'robot_collision': bool(pair.min() < 2 * RADIUS), 'budget': {'sequences': args.sequences, 'steps': args.steps, 'candidates': args.candidates, 'samples': args.samples, 'horizon': args.horizon, 'replan_steps': CONFIG.replan_steps, 'min_radius': 0.1}, 'dt': DT, 'termination': result.termination, 'planning_status_counts': {status: result.failures.count(status) for status in set(result.failures)}}
+    metrics['mppi_diagnostic_fields'] = ['ess', 'fraction_peer_clearance_ge_0.32', 'fraction_peer_clearance_ge_0.5', 'best_sample_min_peer_distance', 'weighted_prediction_min_peer_distance', 'best_sample_cost_dt']
+    metrics['mppi_temperature'] = CONFIG.mppi_temperature
+    metrics['mppi_noise_std'] = list(CONFIG.mppi_noise_std)
+    metrics['frontend_goal_weight'] = CONFIG.goal_weight
+    metrics['suspension_penalty_per_remaining_step'] = CONFIG.goal_weight * float(np.linalg.norm(np.asarray(world.size)*world.res)) + CONFIG.suspension_margin
     metrics['sfc_error'] = result.sfc_error
     metrics['simulation_wall_seconds'] = args.wall_seconds
     (out / 'metrics.json').write_text(json.dumps(metrics, indent=2))

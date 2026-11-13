@@ -14,6 +14,10 @@ class SimulationConfig:
     steps: int = 35
     samples: int = 1120
     horizon: int = 35
+    goal_weight: float = 2.0
+    suspension_margin: float = 30.0
+    mppi_temperature: float = 1000.0
+    mppi_noise_std: tuple = (0.22, 0.9)
 CONFIG = SimulationConfig()
 DT = CONFIG.dt
 RADIUS = CONFIG.robot_radius
