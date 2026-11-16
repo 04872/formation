@@ -17,7 +17,7 @@ from formation import (
     TubeRRTConfig,
     make_tube_rrt_planner,
 )
-from formation.tube_rrt_frontier import FRONTIER_GUARD, FRONTIER_OBSTACLE
+from formation.rrt.tube_rrt_frontier import FRONTIER_GUARD, FRONTIER_OBSTACLE
 
 # Square formation with 1 m between neighbouring robots (slots at (+-0.5, +-0.5)).
 SLOTS = FormationLibrary.build_default(0.113).get("square").slots * 2.0

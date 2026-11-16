@@ -16,7 +16,7 @@ from formation import (
     TubeRRTPlanner,
     make_tube_rrt_planner,
 )
-from formation.tube_cell_first_order import interpolate_pose
+from formation.geometry.tube_cell_first_order import interpolate_pose
 from formation.types import wrap_to_pi
 
 SLOTS = FormationLibrary.build_default(0.113).get("square").slots
@@ -128,7 +128,7 @@ class PlannerTest(unittest.TestCase):
                            config=TubeRRTConfig(cell_model="first_order"))
 
     def test_orientation_cell_reproduces_original_run(self) -> None:
-        # scripts/visualize_tube_rrt.py --map random_circles --seed 7 --slot-scale 2 --anytime
+        # scripts/visualization/visualize_tube_rrt.py --map random_circles --seed 7 --slot-scale 2 --anytime
         map_data = MapBuilder().build("random_circles", RandomCirclesConfig(seed=7, robot_radius=0.113, safety_margin=0.06))
         config = TubeRRTConfig(seed=7, max_iterations=2500, stop_on_first_goal=False, yaw_slices=16, cell_eta=0.98)
         result = make_tube_rrt_planner(map_data, SLOTS * 2.0, Pose2D(*map_data.start_xy, 0.0), config=config).plan()

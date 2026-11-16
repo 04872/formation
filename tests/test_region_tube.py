@@ -16,8 +16,8 @@ from formation import (
     TubeRRTConfig,
     make_tube_rrt_planner,
 )
-from formation import polyhedral_cell
-from formation.polyhedral_cell import wrap_array
+from formation.geometry import polyhedral_cell
+from formation.geometry.polyhedral_cell import wrap_array
 from formation.types import wrap_to_pi
 
 SLOTS = FormationLibrary.build_default(0.113).get("square").slots * 2.0

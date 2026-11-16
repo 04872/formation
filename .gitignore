@@ -12,4 +12,4 @@ __pycache__/
 **/.agents/**
 **/openspec/**
 **/.pytest_cache/**
-formation/_region_qp.so
+formation/rrt/_region_qp.so

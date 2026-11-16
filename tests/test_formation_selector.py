@@ -12,7 +12,7 @@ from formation import (
     PreviewCurvePlanner,
     RightAngleCorridorConfig,
 )
-from formation.formation_selector import SelectorConfig, SelectorWeights
+from formation.geometry.formation_selector import SelectorConfig, SelectorWeights
 
 
 class FormationSelectorTest(unittest.TestCase):

@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from formation import FormationLibrary
-from formation.guide_generator import GuideGenerator
+from formation.planning.guide_generator import GuideGenerator
 from formation.types import AssignmentResult, FormationCandidateEvaluation, FormationScoreBreakdown
 
 

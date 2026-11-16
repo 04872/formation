@@ -1,10 +1,11 @@
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from .config import LEADER_REF as REF, RADIUS, CONFIG
+from .config import DEFAULT_GEOMETRY, RADIUS, CONFIG
 from .formation import positions, edge_safe, valid_shape
 
-def score_candidates(samples, angles, q, goal, current, assignment, obstacle_distance, previous_direction, mode, regions):
+def score_candidates(samples, angles, q, goal, current, assignment, obstacle_distance, previous_direction, mode, regions, geometry=DEFAULT_GEOMETRY):
     """Vectorized evaluation of exactly the five paper costs before SafeCheck."""
+    REF=geometry.leader_reference
     centers=samples[:,:2]
     matrices=samples[:,2:].reshape(-1,2,2)
     targets=centers[:,None,:]+np.einsum('nij,kj->nki',matrices,REF)
@@ -27,8 +28,9 @@ def score_candidates(samples, angles, q, goal, current, assignment, obstacle_dis
     return CONFIG.goal_weight*np.linalg.norm(centers-goal,axis=1)+.6*shape+safe_cost+risk+.25*continuity
 
 
-def guide(q0, world, rng, mode, regions, current, assignment, goal, sequences=CONFIG.sequences, steps=CONFIG.steps, candidates=CONFIG.candidates):
+def guide(q0, world, rng, mode, regions, current, assignment, goal, sequences=CONFIG.sequences, steps=CONFIG.steps, candidates=CONFIG.candidates, geometry=DEFAULT_GEOMETRY):
     """Algorithm 1: initialization is not a sampled reference configuration."""
+    REF=geometry.leader_reference
     best,bestcost=[],np.inf
     obstacle_distance=np.maximum(world.clearance(current),0.)
     suspension=CONFIG.goal_weight*np.linalg.norm(np.asarray(world.size)*world.res)+CONFIG.suspension_margin
@@ -50,21 +52,21 @@ def guide(q0, world, rng, mode, regions, current, assignment, goal, sequences=CO
                     else:
                         a=q[2:].reshape(2,2)+rng.normal(0,.12,(2,2))
                     sample=np.r_[center,a.ravel()]; attempts+=1
-                    if mode=='uniform' or valid_shape(sample): break
+                    if mode=='uniform' or valid_shape(sample,geometry): break
                 choices.append((sample,angle))
             samples=np.array([item[0] for item in choices]);angles=np.array([item[1] for item in choices])
-            scores=score_candidates(samples,angles,q,goal,current,assignment,obstacle_distance,previous_direction,mode,regions)
+            scores=score_candidates(samples,angles,q,goal,current,assignment,obstacle_distance,previous_direction,mode,regions,geometry)
             winner=np.argmin(scores);score,selected,angle=scores[winner],samples[winner],angles[winner]
             # First selected formation joins the actual robot positions; q0 contains
             # initialization parameters and is not itself a sampled path waypoint.
-            p0=current if not path else positions(q)[assignment]
-            p1=positions(selected)[assignment]
+            p0=current if not path else positions(q,geometry)[assignment]
+            p1=positions(selected,geometry)[assignment]
             connected=all(any(np.all(h@p0[i]<=b+1e-9) and np.all(h@p1[i]<=b+1e-9)
                               for h,b in regions) for i in range(len(REF)))
             if not connected:
                 reason='first_actual_sfc_join' if not path else 'subsequent_sfc_join'
                 break
-            if path and mode=='affine' and not edge_safe(q,selected,regions):
+            if path and mode=='affine' and not edge_safe(q,selected,regions,geometry):
                 reason='affine_edge_shape_or_spacing'
                 break
             path.append(selected);cost+=float(score);previous_direction=angle
@@ -74,11 +76,11 @@ def guide(q0, world, rng, mode, regions, current, assignment, goal, sequences=CO
             best,bestcost=path,total
     return np.asarray(best,dtype=float).reshape(-1,6),diagnostics
 
-def assign(states, path, regions, current_assignment):
+def assign(states, path, regions, current_assignment, geometry=DEFAULT_GEOMETRY):
     """Minimize the paper's sum of distances using Hungarian assignment."""
     if len(path)<1:
         return current_assignment
-    targets=positions(path[0])
+    targets=positions(path[0],geometry)
     matrix=np.linalg.norm(states[:,:2,None]-targets.T[None,:,:],axis=1)
     rows,cols=linear_sum_assignment(matrix)
     return cols[np.argsort(rows)]
@@ -86,13 +88,14 @@ def assign(states, path, regions, current_assignment):
 class FormationGuidance:
     """Sample independent configuration sequences and assign safe target slots."""
 
-    def __init__(self, mode, rng, sequences, steps, candidates):
+    def __init__(self, mode, rng, sequences, steps, candidates, geometry=DEFAULT_GEOMETRY):
+        self.geometry = geometry
         (self.mode, self.rng) = (mode, rng)
         (self.sequences, self.steps, self.candidates) = (sequences, steps, candidates)
 
     def plan(self, q, world, regions, current, assignment, goal):
-        return guide(q, world, self.rng, self.mode, regions, current, assignment, goal, self.sequences, self.steps, self.candidates)
+        return guide(q, world, self.rng, self.mode, regions, current, assignment, goal, self.sequences, self.steps, self.candidates, self.geometry)
 
     def assign(self, states, path, regions, assignment):
         """Solve the linear distance-minimizing assignment."""
-        return assign(states, path, regions, assignment)
+        return assign(states, path, regions, assignment, self.geometry)

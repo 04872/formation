@@ -1,6 +1,6 @@
 import math
 
-from formation.exit_compensated_rrtstar import ExitCompensatedConfig, ExitCompensatedRRTStar
+from formation.rrt.exit_compensated_rrtstar import ExitCompensatedConfig, ExitCompensatedRRTStar
 from formation.types import Pose2D
 from test_region_coupling import SLOTS, _map
 

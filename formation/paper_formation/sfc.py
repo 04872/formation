@@ -1,4 +1,4 @@
-"""User-approved legacy GCOPTER FIRI with a conservative 2-D slice."""
+"""GCOPTER-derived old FIRI with a retained planar disk seed and 2-D slice."""
 import ctypes
 from functools import lru_cache
 from pathlib import Path
@@ -16,13 +16,13 @@ def _function():
     function = library.gcopter_firi
     pointer = ctypes.POINTER(ctypes.c_double)
     function.argtypes = [pointer, ctypes.c_int, pointer, ctypes.c_double,
-                         ctypes.c_double, ctypes.c_int, pointer, ctypes.c_int]
+                         ctypes.c_double, ctypes.c_int, ctypes.c_double, pointer, ctypes.c_int]
     function.restype = ctypes.c_int
     return function
 
 
 def generate_sfc(blocked_points: np.ndarray, resolution: float, anchor: np.ndarray, inflate: bool = True):
-    """Inflate around the point seed, intersect z=0, then shrink for the car disk."""
+    """Retain a planar disk seed, intersect z=0, then shrink for the car disk."""
     halfwidth, halfheight = 2.0, 0.5
     margin = RADIUS + resolution*np.sqrt(2)/2
     # Include all cells whose inflated disk can intersect the bounded xy slice.
@@ -35,7 +35,7 @@ def generate_sfc(blocked_points: np.ndarray, resolution: float, anchor: np.ndarr
     output = np.empty((len(points)+6,4),dtype=np.float64)
     ptr = ctypes.POINTER(ctypes.c_double)
     count = _function()(points.ctypes.data_as(ptr),len(points),anchor.ctypes.data_as(ptr),
-                        halfwidth,halfheight,4,output.ctypes.data_as(ptr),len(output))
+                        halfwidth,halfheight,4,margin+1e-5,output.ctypes.data_as(ptr),len(output))
     if count < 0:
         raise SFCConstructionError(f'GCOPTER FIRI returned {count}')
     planes=output[:count]

@@ -1,13 +1,12 @@
 from itertools import combinations
 import numpy as np
-from .config import LEADER_REF as REF, RADIUS
+from .config import DEFAULT_GEOMETRY, RADIUS
 
-REF_PAIR_MIN = min(np.linalg.norm(REF[i]-REF[j]) for i,j in combinations(range(len(REF)),2))
 
-def positions(q):
-    return q[:2] + REF @ q[2:].reshape(2, 2).T
+def positions(q, geometry=DEFAULT_GEOMETRY):
+    return q[:2] + geometry.leader_reference @ q[2:].reshape(2, 2).T
 
-def valid_shape(q):
+def valid_shape(q, geometry=DEFAULT_GEOMETRY):
     """Evaluate 2x2 singular values analytically and exact reference pair spacings."""
     a=q[2:].reshape(2,2)
     trace=np.sum(a*a); det=a[0,0]*a[1,1]-a[0,1]*a[1,0]
@@ -17,7 +16,8 @@ def valid_shape(q):
             abs(a[0,1])+abs(a[1,0])<=1.5):
         return False
     # This lower bound is sufficient for every reference pair.
-    if min_sv2*REF_PAIR_MIN**2 >= (2*RADIUS+.08)**2:
+    REF=geometry.leader_reference
+    if min_sv2*geometry.pair_min**2 >= (2*RADIUS+.08)**2:
         return True
     return all(np.linalg.norm(a@(REF[i]-REF[j]))>=2*RADIUS+.08 for i,j in combinations(range(len(REF)),2))
 
@@ -47,10 +47,11 @@ def affine_shape_path_safe(q0, q1):
             max(abs(a0[0,1])+abs(a0[1,0]),abs(a0[0,1]+delta[0,1])+abs(a0[1,0]+delta[1,0]))<=1.5)
 
 
-def edge_safe(q0, q1, regions):
+def edge_safe(q0, q1, regions, geometry=DEFAULT_GEOMETRY):
     """Certify environment, spacing and shape over the entire affine edge."""
-    p0,p1=positions(q0),positions(q1)
-    if not valid_shape(q1):
+    REF=geometry.leader_reference
+    p0,p1=positions(q0,geometry),positions(q1,geometry)
+    if not valid_shape(q1,geometry):
         return False
     for i,j in combinations(range(len(REF)),2):
         d0=p0[i]-p0[j];v=p1[i]-p1[j]-d0
@@ -61,8 +62,9 @@ def edge_safe(q0, q1, regions):
         return False
     return all(any(np.all(h@p0[i]<=b+1e-9) and np.all(h@p1[i]<=b+1e-9) for h,b in regions) for i in range(len(REF)))
 
-def fit_q(states, assignment=None):
+def fit_q(states, assignment=None, geometry=DEFAULT_GEOMETRY):
     """Least squares affine fit in leader-anchored reference coordinates."""
+    REF=geometry.leader_reference
     r=REF if assignment is None else REF[assignment]
     design=np.column_stack((np.ones(len(REF)),r))
     parameters=np.linalg.lstsq(design,states[:,:2],rcond=None)[0]

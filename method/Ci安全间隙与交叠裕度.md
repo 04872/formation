@@ -4,7 +4,7 @@
 
 ## $C_i$ 的安全来源
 
-`formation/region_coupling.py` 中 `_CorePlanner.__init__`（约 495 行）设置
+`formation/rrt/region_coupling.py` 中 `_CorePlanner.__init__`（约 495 行）设置
 
 $$margin=robot\_radius+map.safety\_margin.$$
 

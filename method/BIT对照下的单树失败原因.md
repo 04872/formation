@@ -34,13 +34,13 @@ BIT 的 raw 树路径本身也在首解后明显改善：forest 首解到末次 
 
 ## 算法将预算花在哪里
 
-项目 BIT 实现在 `formation/baselines.py`。获得 incumbent 后，它从受 $\hat g(x)+\hat h(x)<c_{best}$ 限制的 informed set 生成新 batch；每批保留有效但尚未接入树的 samples。`q_v` 按 $g(v)+\hat h(v)$ 排序展开顶点，`q_e` 按 $g(u)+\hat c(u,v)+\hat h(v)$ 排序候选边，并在需要时才执行边有效性检查。新 batch 重建队列时复用已有树及仍存活的未连接样本。
+项目 BIT 实现在 `formation/rrt/baselines.py`。获得 incumbent 后，它从受 $\hat g(x)+\hat h(x)<c_{best}$ 限制的 informed set 生成新 batch；每批保留有效但尚未接入树的 samples。`q_v` 按 $g(v)+\hat h(v)$ 排序展开顶点，`q_e` 按 $g(u)+\hat c(u,v)+\hat h(v)$ 排序候选边，并在需要时才执行边有效性检查。新 batch 重建队列时复用已有树及仍存活的未连接样本。
 
 因此 BIT 的优势机制不只是某个样本的父节点选得更好：启发式同时影响 incumbent 后的采样区域、先展开哪些顶点、先尝试哪些边，以及失败或尚未尝试的状态是否跨轮保留。它是对隐式图的启发式搜索，不是 GCS 求解，也不是每一步运行全图 Dijkstra。
 
 BIT 的 informed 剪枝使用可采纳下界 $\hat g(x)+\hat h(x)$：当它不小于 incumbent $c_{best}$ 时，才可将未接入样本排除在当前改进集合外。当前树上的 $g(x)$ 是一条已知可行父链的代价上界，不能替代全局下界并据此永久删除仍可能改进的样本。
 
-当前讨论版本是 `CertificateRadiusTree`，见 `formation/certificate_radius_tree.py`。它持续做全域 uniform/goal-bias 采样，不按 incumbent 收缩到 informed set，也没有全局的 $g+\hat h$ 顶点/边优先队列。对一个固定新目标点 $q$，不同父节点候选的 $\hat h(q)$ 相同；在父节点之间比较 $g(u)+d(u,q)+\hat h(q)$ 与比较 $g(u)+d(u,q)$ 完全同序，所以单独把 $\hat h(q)$ 加到 ChooseParent 排序并不会改变选择。启发式只有用于不同目标状态或边的跨候选排序、采样限制和搜索调度时，才会改变计算优先级。
+当前讨论版本是 `CertificateRadiusTree`，见 `formation/rrt/certificate_radius_tree.py`。它持续做全域 uniform/goal-bias 采样，不按 incumbent 收缩到 informed set，也没有全局的 $g+\hat h$ 顶点/边优先队列。对一个固定新目标点 $q$，不同父节点候选的 $\hat h(q)$ 相同；在父节点之间比较 $g(u)+d(u,q)+\hat h(q)$ 与比较 $g(u)+d(u,q)$ 完全同序，所以单独把 $\hat h(q)$ 加到 ChooseParent 排序并不会改变选择。启发式只有用于不同目标状态或边的跨候选排序、采样限制和搜索调度时，才会改变计算优先级。
 
 `CertificateRadiusTree.step` 先尝试把覆盖样本或近邻 uniform 样本直接以 $q$ 为 anchor 插入；若直接插入失败且该分支没有因无效证书提前返回，会再以同一个 $q$ 驱动区域扩展和 witness 插入。直接插入与后续扩展均失败时，或扩展 `_steer` 失败时，$q$ 不作为未连接树状态保留。它会保存尝试中产生的局部证书缓存，但这不等于保存未连接状态并在新 batch 中公平重考虑。相比之下，BIT 的有效未接入样本可继续留在隐式候选图中，之后随树和队列变化重新产生连接机会。
 

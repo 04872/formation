@@ -104,15 +104,15 @@ Planner 另记录 attachment 查询数/时间、descendant repairs、最终全�
 
 ```bash
 # 默认执行完整 continuous-cell 核心
-MPLCONFIGDIR=/tmp/formation-mpl ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py \
+MPLCONFIGDIR=/tmp/formation-mpl ../env-rebuilt/bin/python scripts/visualization/visualize_tube_rrt.py \
   --map single_post --cell polyhedral_tube --slot-scale 2 --iterations 200
 
 # 同一核心上增加受 projection 限制的 release correction
-MPLCONFIGDIR=/tmp/formation-mpl ../env-rebuilt/bin/python scripts/visualize_tube_rrt.py \
+MPLCONFIGDIR=/tmp/formation-mpl ../env-rebuilt/bin/python scripts/visualization/visualize_tube_rrt.py \
   --map single_post --cell polyhedral_tube --expansion opening \
   --launch-progress-epsilon 0.05 --launch-facet-epsilon 0.0001 --iterations 200
 
-MPLCONFIGDIR=/tmp/formation-mpl ../env-rebuilt/bin/python scripts/evaluate_cell_launch.py \
+MPLCONFIGDIR=/tmp/formation-mpl ../env-rebuilt/bin/python scripts/experiments/evaluate_cell_launch.py \
   --planner --seeds 3 --iterations 200 --anytime --out-dir results/cell_launch_continuous
 ```
 

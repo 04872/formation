@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 
-from formation.region_coupling import (AnchorRRTStar, CouplingConfig, PortalRRTStar, ProxyRRTStar,
+from formation.rrt.region_coupling import (AnchorRRTStar, CouplingConfig, PortalRRTStar, ProxyRRTStar,
                                        SingleEntryRRTStar)
 from formation.types import MapData, Pose2D
 

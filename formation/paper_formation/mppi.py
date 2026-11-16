@@ -24,8 +24,19 @@ def integrate_acceleration(state, velocity, control):
     return pose,new_velocity
 
 
+def apply_actuator_limits(control, velocity, amax=1.):
+    """Apply the same acceleration, yaw-rate and next-speed bounds for every rollout."""
+    bounded=np.array(control,copy=True)
+    bounded[...,0]=np.clip(bounded[...,0],-amax,amax)
+    bounded[...,1]=np.clip(bounded[...,1],-CONFIG.max_angular_speed,CONFIG.max_angular_speed)
+    bounded[...,0]=np.clip(bounded[...,0],(-CONFIG.max_speed-velocity)/DT,
+                           (CONFIG.max_speed-velocity)/DT)
+    return bounded
+
+
 def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng,
-         samples=CONFIG.samples, horizon=CONFIG.horizon, temperature=CONFIG.mppi_temperature, amax=1., noise_std=CONFIG.mppi_noise_std):
+         samples=CONFIG.samples, horizon=CONFIG.horizon, temperature=CONFIG.mppi_temperature, amax=1., noise_std=CONFIG.mppi_noise_std,
+         guidance_weight=CONFIG.guidance_weight, smoothness_weight=CONFIG.smoothness_weight):
     """Use one nominal U, additive Gaussian noise, costs (13)-(17), and weighted noise."""
     n=len(states)
     result=np.zeros_like(nominal)
@@ -38,12 +49,12 @@ def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng
         v=np.full(samples,velocities[i]);cost=np.zeros(samples)
         closest=np.full(samples,np.inf)
         for t in range(horizon):
-            command=controls[:,t]
+            command=apply_actuator_limits(controls[:,t],v,amax)
             x,v=integrate_acceleration(x,v,command)
             acceleration=np.sqrt(command[:,0]**2+(v*command[:,1])**2)
-            cost+=guidance_cost(x[:,:2],guidance[t,i])
+            cost+=guidance_cost(x[:,:2],guidance[t,i],guidance_weight)
             cost+=dynamic_cost(v,acceleration,CONFIG.max_speed,amax)
-            cost+=smoothness_cost(command)
+            cost+=smoothness_cost(command,smoothness_weight)
             cost+=distance_penalty(world.clearance(x[:,:2]),.4,.8,2600.,1.8)
             for j in range(n):
                 if j!=i:
@@ -59,8 +70,7 @@ def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng
         x=states[i].copy(); v=velocities[i]
         weighted_closest=np.inf
         for t in range(horizon):
-            control=result[i,t].copy()
-            control[0]=np.clip(control[0],(-CONFIG.max_speed-v)/DT,(CONFIG.max_speed-v)/DT)
+            control=apply_actuator_limits(result[i,t],v,amax)
             x,v=integrate_acceleration(x,v,control)
             predictions[i,t]=x
             for j in range(n):
@@ -73,8 +83,11 @@ def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng
 
 class DistributedMPPI:
     """Retain nominal control and peer predictions across execution cycles."""
-    def __init__(self,rng,states,samples,horizon=CONFIG.horizon):
+    def __init__(self,rng,states,samples,horizon=CONFIG.horizon,
+                 guidance_weight=CONFIG.guidance_weight,smoothness_weight=CONFIG.smoothness_weight):
         self.rng,self.samples,self.horizon=rng,samples,horizon
+        self.guidance_weight=guidance_weight
+        self.smoothness_weight=smoothness_weight
         self.nominal=np.zeros((len(states),horizon,2))
         self.previous_predictions=np.repeat(states[:,None,:],horizon,axis=1)
         self.velocities=np.zeros(len(states))
@@ -82,10 +95,9 @@ class DistributedMPPI:
 
     def step(self,states,guidance,world):
         opt,pred,self.last_diagnostics=mppi(states,self.velocities,guidance,self.nominal,self.previous_predictions,
-                      world,self.rng,self.samples,self.horizon)
-        command=opt[:,0].copy()
-        command[:,0]=np.clip(command[:,0],(-CONFIG.max_speed-self.velocities)/DT,
-                             (CONFIG.max_speed-self.velocities)/DT)
+                      world,self.rng,self.samples,self.horizon,
+                      guidance_weight=self.guidance_weight,smoothness_weight=self.smoothness_weight)
+        command=apply_actuator_limits(opt[:,0],self.velocities)
         new_velocity=self.velocities+command[:,0]*DT
         execution=np.column_stack(((self.velocities+new_velocity)/2,command[:,1]))
         self.velocities=new_velocity

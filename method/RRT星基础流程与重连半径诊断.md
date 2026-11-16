@@ -4,7 +4,7 @@
 
 ## 实现与已有结果
 
-`formation/baselines.py` 的状态距离为各边的 `sqrt(Δx²+Δy²+(rho·wrap(Δyaw))²)` 之和 J。`step` 同时是 steer 长度上限和选父/重连邻域的上限：`min(gamma*(log(n+1)/(n+1))^(1/3), step)`；最近节点即使不在半径内也强制加入。原实验 forest step=0.3，dense/slots step=1.0。BIT* 则用相同形式的渐缩半径，但不以 step 截断；其 alive 样本数而非记录的树节点数决定半径，因此无法仅从已有树节点数反推实际数值。两种方法的采样、队列、连接与目标处理也不同，不能把其性能差异全归因于半径。
+`formation/rrt/baselines.py` 的状态距离为各边的 `sqrt(Δx²+Δy²+(rho·wrap(Δyaw))²)` 之和 J。`step` 同时是 steer 长度上限和选父/重连邻域的上限：`min(gamma*(log(n+1)/(n+1))^(1/3), step)`；最近节点即使不在半径内也强制加入。原实验 forest step=0.3，dense/slots step=1.0。BIT* 则用相同形式的渐缩半径，但不以 step 截断；其 alive 样本数而非记录的树节点数决定半径，因此无法仅从已有树节点数反推实际数值。两种方法的采样、队列、连接与目标处理也不同，不能把其性能差异全归因于半径。
 
 以下是 `results/exit_baselines/paths/path_metrics.csv` 的原始路径 10 seeds 中位数，各列分别求中位数；`J-Lxy` 逐条先作差再取中位数，代表角度引入的距离增量，不是 `rho*总转角`。首末改善逐 seed 计算。这里结果只描述这批样本，不代表全局最优。
 
@@ -21,7 +21,7 @@
 
 ## 只改邻域上限的诊断回放
 
-`scripts/diagnose_rrt_radius.py` 继承原 RRT* 并从原 `step` 插入计数；替代版只取消邻域的 `step` 截断，steer 保持原值。这同时放宽 **ChooseParent 与 Rewire**，因此不能将效果归因于其中单一操作。相同 seed 的随机采样流相同，但树随选父变化，steered 状态、有效性和后续路径可以不同。每运行 6000 次 proposal，每 50 次提取一次路径；在线时间包含初始化、插桩、逐次 best_path 与 checkpoint 提取，不应与旧正式基准计时混用。输出见 `results/exit_baselines/diagnostics/rrt_radius.json`。
+`scripts/diagnostics/diagnose_rrt_radius.py` 继承原 RRT* 并从原 `step` 插入计数；替代版只取消邻域的 `step` 截断，steer 保持原值。这同时放宽 **ChooseParent 与 Rewire**，因此不能将效果归因于其中单一操作。相同 seed 的随机采样流相同，但树随选父变化，steered 状态、有效性和后续路径可以不同。每运行 6000 次 proposal，每 50 次提取一次路径；在线时间包含初始化、插桩、逐次 best_path 与 checkpoint 提取，不应与旧正式基准计时混用。输出见 `results/exit_baselines/diagnostics/rrt_radius.json`。
 
 | 场景及 seed | 邻域上限 | 最终半径 | 有效候选的邻居数中位 | 成功重连 | 节点数 | 首解 J（proposal） | 6000 次 J | 在线秒数 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|

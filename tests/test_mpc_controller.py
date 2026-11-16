@@ -27,7 +27,7 @@ class DistributedFormationMPCTest(unittest.TestCase):
             inter_robot_margin=0.10,
         )
         self.controller = DistributedFormationMPC(self.config)
-        from formation.controller_reference import ControllerReferenceBuilder
+        from formation.control.controller_reference import ControllerReferenceBuilder
         self.reference_builder = ControllerReferenceBuilder(self.config)
 
     def _build_reference(self):

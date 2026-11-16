@@ -6,13 +6,15 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, Rectangle
 
 
-def draw_obstacles(ax, occupancy, resolution, origin, circles):
+def draw_obstacles(ax, occupancy, resolution, origin, circles, rectangles=()):
     width, height = np.array(occupancy.shape) * resolution
     x, y = origin
-    if len(circles):
+    if len(circles) or len(rectangles):
         for cx, cy, radius in circles:
             ax.add_patch(Circle((cx, cy), radius, facecolor='#c8cdd3',
                                 edgecolor='#626d78', linewidth=0.8))
+        for xmin, ymin, xmax, ymax in rectangles:
+            ax.add_patch(Rectangle((xmin, ymin), xmax-xmin, ymax-ymin, facecolor='#c8cdd3', edgecolor='#626d78', linewidth=0.8))
         wall = 2 * resolution
         for rx, ry, rw, rh in [(x,y,width,wall), (x,y+height-wall,width,wall),
                               (x,y,wall,height), (x+width-wall,y,wall,height)]:
@@ -31,7 +33,8 @@ def redraw(directory):
         states = data['states']
         fig, ax = plt.subplots(figsize=(12, 8))
         draw_obstacles(ax, data['occupancy'], float(data['resolution']),
-                       data['origin'], data['circles'] if 'circles' in data else [])
+                       data['origin'], data['circles'] if 'circles' in data else [],
+                       data['rectangles'] if 'rectangles' in data else [])
         for i in range(states.shape[1]):
             line, = ax.plot(states[:,i,0],states[:,i,1],lw=1.6,label=f'robot {i}')
             ax.scatter(*states[0,i,:2],color=line.get_color(),s=25)

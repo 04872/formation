@@ -64,8 +64,8 @@
 绿色为在线路径，蓝色为固定链联合优化，橙色为 BIT*，紫色为保留绿色前缀的离线拼接见证。红叉是在任意朝向下都未被已有区域覆盖的检测位置。
 
 ```bash
-../env-rebuilt/bin/python scripts/diagnose_dense_seed02.py
-../env-rebuilt/bin/python scripts/plot_dense_seed02_diagnostic.py
+../env-rebuilt/bin/python scripts/diagnostics/diagnose_dense_seed02.py
+../env-rebuilt/bin/python scripts/visualization/plot_dense_seed02_diagnostic.py
 ```
 
 数据：`results/exit_baselines/diagnostics/dense_seed02.json`。没有修改规划器或原基准实验数据；诊断计算不计入已有在线成绩。

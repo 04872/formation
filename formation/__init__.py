@@ -1,12 +1,12 @@
-from formation.astar import AStarPlanner
-from formation.controller_reference import ControllerReferenceBuilder
-from formation.formation_feasibility import FeasibilityConfig, FormationFeasibility, FormationFeasibilityResult
-from formation.formation_library import FormationLibrary
-from formation.formation_selector import FormationSelector, SelectedFormationResult, SelectorConfig, SelectorWeights, select_target_formation
-from formation.global_planner import GlobalPlanner
-from formation.guide_generator import GuideGenerator
-from formation.map_builder import MapBuilder
-from formation.map_config import (
+from formation.planning.astar import AStarPlanner
+from formation.control.controller_reference import ControllerReferenceBuilder
+from formation.geometry.formation_feasibility import FeasibilityConfig, FormationFeasibility, FormationFeasibilityResult
+from formation.geometry.formation_library import FormationLibrary
+from formation.geometry.formation_selector import FormationSelector, SelectedFormationResult, SelectorConfig, SelectorWeights, select_target_formation
+from formation.planning.global_planner import GlobalPlanner
+from formation.planning.guide_generator import GuideGenerator
+from formation.maps.map_builder import MapBuilder
+from formation.maps.map_config import (
     BaseMapConfig,
     NarrowEntranceConfig,
     NarrowingCorridorConfig,
@@ -19,20 +19,20 @@ from formation.map_config import (
     SCurveCorridorConfig,
     ScenarioConfig,
 )
-from formation.mpc_controller import DistributedFormationMPC
-from formation.mpc_consensus import ConsensusFormationMPC
-from formation.path_manager import PathManager
-from formation.preview_curve import PreviewCurvePlanner
-from formation.simulator import MultiRobotSimulator, trace_summary
-from formation.swept_band import SweptBand, SweptBandBuilder
-from formation.tube_cell_first_order import FirstOrderCellModel, PortalCertificate, TubeCell
-from formation.tube_cell_second_order import SecondOrderCellModel
-from formation.polyhedral_cell import PolyhedralCell, PolyhedralCellModel
-from formation.cell_launch import LaunchConfig, CellLaunchSearch
-from formation.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
-from formation.tube_rrt_region import RegionTubeConfig, RegionTubeRRTPlanner
-from formation.tube_rrt_chart import CELL_MODELS, ChartCellTubeRRTPlanner, make_tube_rrt_planner
-from formation.tube_rrt import (
+from formation.control.mpc_controller import DistributedFormationMPC
+from formation.control.mpc_consensus import ConsensusFormationMPC
+from formation.planning.path_manager import PathManager
+from formation.planning.preview_curve import PreviewCurvePlanner
+from formation.control.simulator import MultiRobotSimulator, trace_summary
+from formation.geometry.swept_band import SweptBand, SweptBandBuilder
+from formation.geometry.tube_cell_first_order import FirstOrderCellModel, PortalCertificate, TubeCell
+from formation.geometry.tube_cell_second_order import SecondOrderCellModel
+from formation.geometry.polyhedral_cell import PolyhedralCell, PolyhedralCellModel
+from formation.rrt.cell_launch import LaunchConfig, CellLaunchSearch
+from formation.rrt.tube_rrt_frontier import FrontierConfig, PolyhedralFrontierPlanner
+from formation.rrt.tube_rrt_region import RegionTubeConfig, RegionTubeRRTPlanner
+from formation.rrt.tube_rrt_chart import CELL_MODELS, ChartCellTubeRRTPlanner, make_tube_rrt_planner
+from formation.rrt.tube_rrt import (
     EdgeCertificate,
     OrientationSafeCell,
     TubeRRTConfig,

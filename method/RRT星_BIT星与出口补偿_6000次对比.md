@@ -4,7 +4,7 @@
 
 ## 比较口径
 
-- 使用仓库 `formation/baselines.py` 的 RRTStar、BITStar，不是 OMPL 实现；未修改其核心搜索、重连逻辑。
+- 使用仓库 `formation/rrt/baselines.py` 的 RRTStar、BITStar，不是 OMPL 实现；未修改其核心搜索、重连逻辑。
 - 每次预算为 6000 次原始采样提议，包括碰撞拒绝、知情采样拒绝和越界提议。BIT* 最后一个已采样批次继续处理完毕，尾部耗时计入在线时间，不再产生第 6001 次提议。批次大小 200。
 - RRT* 步长 forest 为 0.3，dense/slots 为 1.0；goal_bias=0.1，rewire_factor=1.1。参数沿用独立历史 pilot（种子 100–109），没有用本次结果调参；pilot 的 clearance 为 0.04，本次统一为 0.02，未重新调参。
 - 主指标是未做后处理的在线路径代价 J=d_W，包含位置和按编队半径缩放的角度代价，不等于平面折线长度 Lxy。离线捷径结果不混入主表。
@@ -95,14 +95,14 @@
 正式实验命令（已完成，无需再次执行）：
 
 ```bash
-../env-rebuilt/bin/python scripts/compare_exit_baselines.py
+../env-rebuilt/bin/python scripts/experiments/compare_exit_baselines.py
 ```
 
 只重新汇总已有数据和绘图：
 
 ```bash
-../env-rebuilt/bin/python scripts/compare_exit_baselines.py --analyze-only
-../env-rebuilt/bin/python scripts/plot_exit_baseline_paths.py
+../env-rebuilt/bin/python scripts/experiments/compare_exit_baselines.py --analyze-only
+../env-rebuilt/bin/python scripts/visualization/plot_exit_baseline_paths.py
 ```
 
 [实验参数](../results/exit_baselines/experiment.json)、[统计表](../results/exit_baselines/summary.csv)、[配对统计](../results/exit_baselines/paired.csv)、[等时间统计](../results/exit_baselines/matched_online.csv)、[审计](../results/exit_baselines/audit.csv)、[计时细分](../results/exit_baselines/timing_breakdown.csv)。新基线原始记录为 `results/exit_baselines/runs.jsonl`；旧 A 系列原始记录仍在 `results/exit_compensation/runs.jsonl`。

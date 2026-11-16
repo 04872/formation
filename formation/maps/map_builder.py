@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from formation.maps.distance_field import compute_distance_field, compute_inflated_occupancy
+from formation.maps.map_config import (
+    BaseMapConfig,
+    NarrowEntranceConfig,
+    NarrowingCorridorConfig,
+    ObstacleClusterConfig,
+    PostFenceConfig,
+    RandomCirclesConfig,
+    SinglePostConfig,
+    RightAngleCorridorConfig,
+    SCurveCorridorConfig,
+)
+from formation.types import MapData
+
+
+class MapBuilder:
+    def build(self, map_type: str, config: BaseMapConfig) -> MapData:
+        builders = {
+            "right_angle_corridor": self._build_right_angle_corridor,
+            "s_curve_corridor": self._build_s_curve_corridor,
+            "obstacle_cluster": self._build_obstacle_cluster,
+            "narrow_entrance": self._build_narrow_entrance,
+            "narrowing_corridor": self._build_narrowing_corridor,
+            "random_circles": self._build_random_circles,
+            "post_fence": self._build_post_fence,
+            "single_post": self._build_single_post,
+        }
+        if map_type not in builders:
+            raise ValueError(f"Unsupported map type: {map_type}")
+        return builders[map_type](config)
+
+    def _origin_xy(self, config: BaseMapConfig) -> tuple[float, float]:
+        return (-config.width_m / 2.0, -config.height_m / 2.0)
+
+    def _grid_shape(self, config: BaseMapConfig) -> tuple[int, int]:
+        rows = int(round(config.height_m / config.resolution))
+        cols = int(round(config.width_m / config.resolution))
+        return rows, cols
+
+    def _make_full_occupancy(self, config: BaseMapConfig) -> np.ndarray:
+        return np.ones(self._grid_shape(config), dtype=bool)
+
+    def _make_free_map(self, config: BaseMapConfig) -> np.ndarray:
+        grid = np.zeros(self._grid_shape(config), dtype=bool)
+        grid[[0, -1], :] = True
+        grid[:, [0, -1]] = True
+        return grid
+
+    def _cell_centers(self, config: BaseMapConfig) -> tuple[np.ndarray, np.ndarray]:
+        rows, cols = self._grid_shape(config)
+        origin_x, origin_y = self._origin_xy(config)
+        xs = origin_x + (np.arange(cols) + 0.5) * config.resolution
+        ys = origin_y + (np.arange(rows) + 0.5) * config.resolution
+        return np.meshgrid(xs, ys)
+
+    def _finalize_map(
+        self,
+        name: str,
+        config: BaseMapConfig,
+        occupancy: np.ndarray,
+        obstacle_primitives: list[dict[str, object]],
+    ) -> MapData:
+        distance_field = compute_distance_field(occupancy, config.resolution)
+        inflation_radius = (
+            config.robot_radius + config.safety_margin + config.global_planner_margin
+        )
+        inflated = compute_inflated_occupancy(
+            occupancy,
+            inflation_radius,
+            config.resolution,
+            distance_field=distance_field,
+        )
+        map_data = MapData(
+            name=name,
+            resolution=config.resolution,
+            width_m=config.width_m,
+            height_m=config.height_m,
+            origin_xy=self._origin_xy(config),
+            occupancy=occupancy,
+            inflated_occupancy=inflated,
+            distance_field=distance_field,
+            start_xy=config.start_xy,
+            goal_xy=config.goal_xy,
+            obstacle_primitives=obstacle_primitives,
+            inflation_radius=inflation_radius,
+            robot_radius=config.robot_radius,
+            safety_margin=config.safety_margin,
+        )
+        self._validate_start_goal(map_data)
+        return map_data
+
+    def _validate_start_goal(self, map_data: MapData) -> None:
+        for point_name, xy in (("start", map_data.start_xy), ("goal", map_data.goal_xy)):
+            rc = map_data.world_to_grid(xy)
+            if map_data.is_occupied(rc):
+                raise ValueError(f"{point_name} {xy} lies inside obstacle on map {map_data.name}.")
+            if map_data.is_occupied(rc, inflated=True):
+                raise ValueError(
+                    f"{point_name} {xy} lies inside inflated obstacle on map {map_data.name}."
+                )
+
+    def _rasterize_rectangle(
+        self,
+        occupancy: np.ndarray,
+        config: BaseMapConfig,
+        center_xy: tuple[float, float],
+        width: float,
+        height: float,
+    ) -> None:
+        x_grid, y_grid = self._cell_centers(config)
+        cx, cy = center_xy
+        inside = (np.abs(x_grid - cx) <= width / 2.0) & (np.abs(y_grid - cy) <= height / 2.0)
+        occupancy[inside] = True
+
+    def _rasterize_circle(
+        self,
+        occupancy: np.ndarray,
+        config: BaseMapConfig,
+        center_xy: tuple[float, float],
+        radius: float,
+    ) -> None:
+        x_grid, y_grid = self._cell_centers(config)
+        cx, cy = center_xy
+        inside = (x_grid - cx) ** 2 + (y_grid - cy) ** 2 <= radius**2
+        occupancy[inside] = True
+
+    def _build_right_angle_corridor(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, RightAngleCorridorConfig):
+            config = RightAngleCorridorConfig(**config.__dict__)
+        occupancy = self._make_full_occupancy(config)
+        x_grid, y_grid = self._cell_centers(config)
+
+        horizontal_leg = (
+            (x_grid <= config.corner_x)
+            & (np.abs(y_grid - config.horizontal_center_y) <= config.corridor_width / 2.0)
+        )
+        vertical_leg = (
+            (y_grid >= config.corner_y)
+            & (np.abs(x_grid - config.vertical_center_x) <= config.corridor_width / 2.0)
+        )
+        occupancy[horizontal_leg | vertical_leg] = False
+        occupancy[[0, -1], :] = True
+        occupancy[:, [0, -1]] = True
+        obstacle_primitives = [
+            {
+                "type": "right_angle_corridor",
+                "corridor_width": config.corridor_width,
+                "corner_xy": (config.corner_x, config.corner_y),
+                "horizontal_center_y": config.horizontal_center_y,
+                "vertical_center_x": config.vertical_center_x,
+            }
+        ]
+        return self._finalize_map("right_angle_corridor", config, occupancy, obstacle_primitives)
+
+    def _build_s_curve_corridor(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, SCurveCorridorConfig):
+            config = SCurveCorridorConfig(**config.__dict__)
+        occupancy = self._make_full_occupancy(config)
+        x_grid, y_grid = self._cell_centers(config)
+        path_span = config.goal_xy[0] - config.start_xy[0]
+        if path_span <= 0.0:
+            raise ValueError("S-curve corridor requires goal x to be greater than start x.")
+        phase = 2.0 * math.pi * (x_grid - config.start_xy[0]) / path_span
+        centerline_y = config.amplitude * np.sin(phase)
+        free_mask = np.abs(y_grid - centerline_y) <= config.corridor_width / 2.0
+        occupancy[free_mask] = False
+        occupancy[[0, -1], :] = True
+        occupancy[:, [0, -1]] = True
+        obstacle_primitives = [
+            {
+                "type": "s_curve_corridor",
+                "amplitude": config.amplitude,
+                "corridor_width": config.corridor_width,
+                "period_m": config.period_m,
+            }
+        ]
+        return self._finalize_map("s_curve_corridor", config, occupancy, obstacle_primitives)
+
+    def _build_obstacle_cluster(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, ObstacleClusterConfig):
+            config = ObstacleClusterConfig(**config.__dict__)
+        occupancy = self._make_free_map(config)
+        obstacle_primitives: list[dict[str, object]] = []
+        for center_xy, width, height in config.rectangular_obstacles:
+            self._rasterize_rectangle(occupancy, config, center_xy, width, height)
+            obstacle_primitives.append(
+                {
+                    "type": "rectangle",
+                    "center_xy": center_xy,
+                    "width": width,
+                    "height": height,
+                }
+            )
+        for center_xy, radius in config.circular_obstacles:
+            self._rasterize_circle(occupancy, config, center_xy, radius)
+            obstacle_primitives.append(
+                {"type": "circle", "center_xy": center_xy, "radius": radius}
+            )
+        return self._finalize_map("obstacle_cluster", config, occupancy, obstacle_primitives)
+
+    def _build_narrow_entrance(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, NarrowEntranceConfig):
+            config = NarrowEntranceConfig(**config.__dict__)
+        occupancy = self._make_full_occupancy(config)
+        x_grid, y_grid = self._cell_centers(config)
+
+        half_passage = config.passage_width / 2.0
+        gap_bottom = config.passage_center_y + half_passage
+        gap_top = config.passage_center_y - half_passage
+
+        # narrow passage between two obstacle rectangles
+        passage = (
+            (x_grid >= config.passage_start_x)
+            & (x_grid <= config.passage_end_x)
+            & (y_grid >= gap_top)
+            & (y_grid <= gap_bottom)
+        )
+        # open area on both sides of the passage
+        free_left = x_grid < config.passage_start_x
+        free_right = x_grid > config.passage_end_x
+        free_area = (free_left | free_right) & (
+            (y_grid > gap_top - config.height_m / 2.0 + config.resolution)
+            & (y_grid < gap_bottom + config.height_m / 2.0 - config.resolution)
+        )
+        occupancy[passage | free_area] = False
+        occupancy[[0, -1], :] = True
+        occupancy[:, [0, -1]] = True
+
+        obstacle_primitives = [
+            {"type": "rect", "cx": 0.0, "cy": (gap_bottom + config.height_m / 2.0) / 2.0,
+             "w": config.width_m, "h": config.height_m / 2.0 - gap_bottom},
+            {"type": "rect", "cx": 0.0, "cy": (gap_top - config.height_m / 2.0) / 2.0,
+             "w": config.width_m, "h": gap_top + config.height_m / 2.0},
+        ]
+        return self._finalize_map("narrow_entrance", config, occupancy, obstacle_primitives)
+
+    def _build_random_circles(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, RandomCirclesConfig):
+            config = RandomCirclesConfig(**config.__dict__)
+        if config.radius_min <= 0.0 or config.radius_max < config.radius_min:
+            raise ValueError("Random circle radii must be positive and ordered.")
+        if config.obstacle_count < 0:
+            raise ValueError("Random circle obstacle_count must be non-negative.")
+        occupancy = self._make_free_map(config)
+        rng = np.random.default_rng(config.seed)
+        origin_x, origin_y = self._origin_xy(config)
+        circles: list[tuple[tuple[float, float], float]] = []
+        attempts = 0
+        max_attempts = max(100, 100 * config.obstacle_count)
+        while len(circles) < config.obstacle_count and attempts < max_attempts:
+            attempts += 1
+            radius = float(rng.uniform(config.radius_min, config.radius_max))
+            center = (
+                float(rng.uniform(origin_x + radius, origin_x + config.width_m - radius)),
+                float(rng.uniform(origin_y + radius, origin_y + config.height_m - radius)),
+            )
+            if np.linalg.norm(np.asarray(center) - config.start_xy) < config.start_clearance_radius + radius:
+                continue
+            if np.linalg.norm(np.asarray(center) - config.goal_xy) < config.goal_clearance_radius + radius:
+                continue
+            if any(np.linalg.norm(np.asarray(center) - old_center) < radius + old_radius + config.obstacle_clearance
+                   for old_center, old_radius in circles):
+                continue
+            circles.append((center, radius))
+        if len(circles) != config.obstacle_count:
+            raise ValueError("Could not place requested random circles with the configured clearances.")
+        primitives: list[dict[str, object]] = []
+        for center, radius in circles:
+            self._rasterize_circle(occupancy, config, center, radius)
+            primitives.append({"type": "circle", "center_xy": center, "radius": radius})
+        return self._finalize_map("random_circles", config, occupancy, primitives)
+
+    def _build_circles(self, name: str, config: BaseMapConfig,
+                       circles: list[tuple[tuple[float, float], float]]) -> MapData:
+        occupancy = self._make_free_map(config)
+        primitives: list[dict[str, object]] = []
+        for center, radius in circles:
+            self._rasterize_circle(occupancy, config, center, radius)
+            primitives.append({"type": "circle", "center_xy": center, "radius": radius})
+        return self._finalize_map(name, config, occupancy, primitives)
+
+    def _build_post_fence(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, PostFenceConfig):
+            config = PostFenceConfig(**config.__dict__)
+        if config.post_spacing <= 2.0 * config.post_radius or config.post_radius <= 0.0:
+            raise ValueError("Post fence requires positive radius and spacing larger than the post diameter.")
+        half_height = config.height_m / 2.0
+        count = int(math.floor(half_height / config.post_spacing)) + 1
+        circles = []
+        for k in range(-count, count + 1):
+            y = config.post_offset_y + k * config.post_spacing
+            if abs(y) <= half_height - config.post_radius:
+                circles.append(((config.fence_x, float(y)), config.post_radius))
+        return self._build_circles("post_fence", config, circles)
+
+    def _build_single_post(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, SinglePostConfig):
+            config = SinglePostConfig(**config.__dict__)
+        if config.post_radius <= 0.0:
+            raise ValueError("Single post radius must be positive.")
+        return self._build_circles("single_post", config, [(tuple(config.post_xy), config.post_radius)])
+
+    def _build_narrowing_corridor(self, config: BaseMapConfig) -> MapData:
+        if not isinstance(config, NarrowingCorridorConfig):
+            config = NarrowingCorridorConfig(**config.__dict__)
+        occupancy = self._make_full_occupancy(config)
+        x_grid, y_grid = self._cell_centers(config)
+
+        transition_span = config.transition_end_x - config.transition_start_x
+        if transition_span <= 0.0:
+            raise ValueError("Narrowing corridor requires transition_end_x > transition_start_x.")
+
+        alpha = np.clip(
+            (x_grid - config.transition_start_x) / transition_span,
+            0.0,
+            1.0,
+        )
+        centerline_y = config.centerline_slope * x_grid + config.centerline_intercept
+        transition_width = config.wide_width + alpha * (config.narrow_width - config.wide_width)
+
+        local_width = np.full_like(x_grid, config.wide_width, dtype=float)
+        transition_mask = (
+            (x_grid >= config.transition_start_x)
+            & (x_grid <= config.transition_end_x)
+        )
+        tail_mask = x_grid > config.tail_start_x
+        local_width[transition_mask] = transition_width[transition_mask]
+        local_width[tail_mask] = config.tail_width
+
+        inside_corridor = (
+            (x_grid >= config.corridor_x_min)
+            & (x_grid <= config.tail_end_x)
+            & (np.abs(y_grid - centerline_y) <= local_width / 2.0)
+        )
+        inside_corridor |= (
+            (x_grid >= config.corridor_x_min - config.throat_padding_x)
+            & (x_grid < config.corridor_x_min)
+            & (np.abs(y_grid - centerline_y) <= config.wide_width / 2.0)
+        )
+        occupancy[inside_corridor] = False
+        occupancy[[0, -1], :] = True
+        occupancy[:, [0, -1]] = True
+        obstacle_primitives = [
+            {
+                "type": "narrowing_corridor",
+                "corridor_x_min": config.corridor_x_min,
+                "corridor_x_max": config.corridor_x_max,
+                "wide_width": config.wide_width,
+                "narrow_width": config.narrow_width,
+                "tail_width": config.tail_width,
+                "transition_start_x": config.transition_start_x,
+                "transition_end_x": config.transition_end_x,
+                "tail_start_x": config.tail_start_x,
+                "tail_end_x": config.tail_end_x,
+                "centerline_slope": config.centerline_slope,
+                "centerline_intercept": config.centerline_intercept,
+            }
+        ]
+        return self._finalize_map("narrowing_corridor", config, occupancy, obstacle_primitives)

@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from formation.distance_field import compute_distance_field
+from formation.maps.distance_field import compute_distance_field
 
 
 class DistanceFieldTest(unittest.TestCase):

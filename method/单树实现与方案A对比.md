@@ -4,10 +4,10 @@
 
 ## 实现与对照身份
 
-- 新实现：`formation/single_tree_rrtstar.py` 的 `SingleTreeRRTStar` / `SingleTreeConfig`。
-- 对照入口：`scripts/compare_single_tree.py`，结果目录 `results/single_tree_reference/`。
-- 方案 A：当前 `formation/region_coupling.py` 的 `SingleEntryRRTStar`，variant `single_entry_rrtstar`，原始 `PolyhedralCellModel`，步长 **0.3**。不是旧 `RegionTubeRRTPlanner` 的 continuous 模式，也不是 Cost-Near/normal-turn 变体。
-- 基线识别依据：`results/cost_near_all/experiment.json`、`scripts/cost_near_summary.py` 的 `BASE=single_entry_rrtstar@0.3`，以及 Cursor 记录中最近一次 Cost-Guided 实验的明确设置。该历史实验为 50 seeds、6000 迭代，每 50 次作 checkpoint，再按在线时间对齐；在线时间排除链优化。本次改为下面明确列出的真实 wall-clock 协议，因此不能把历史表格耗时直接混入本表。
+- 新实现：`formation/rrt/single_tree_rrtstar.py` 的 `SingleTreeRRTStar` / `SingleTreeConfig`。
+- 对照入口：`scripts/experiments/compare_single_tree.py`，结果目录 `results/single_tree_reference/`。
+- 方案 A：当前 `formation/rrt/region_coupling.py` 的 `SingleEntryRRTStar`，variant `single_entry_rrtstar`，原始 `PolyhedralCellModel`，步长 **0.3**。不是旧 `RegionTubeRRTPlanner` 的 continuous 模式，也不是 Cost-Near/normal-turn 变体。
+- 基线识别依据：`results/cost_near_all/experiment.json`、`scripts/experiments/cost_near_summary.py` 的 `BASE=single_entry_rrtstar@0.3`，以及 Cursor 记录中最近一次 Cost-Guided 实验的明确设置。该历史实验为 50 seeds、6000 迭代，每 50 次作 checkpoint，再按在线时间对齐；在线时间排除链优化。本次改为下面明确列出的真实 wall-clock 协议，因此不能把历史表格耗时直接混入本表。
 - 运行前仓库 HEAD：`81c3ea4075b818b09a1f2a973bc402c25b40282a`；未改动 A 的实现或默认行为。原有四份未跟踪理论文档保持原样。
 
 新树的每个节点保存固定 pose、固定 owner、parent、children、固定父边 portal 及边长。全部覆盖证书查询后，覆盖样本在 owner 中均匀随机选取并插入；只按完全相同 pose + owner 去重，重复节点会重考虑，不使用效用拒绝或 h 合并。未覆盖样本从同一状态树找 Nearest，复用该节点 owner 作投影与 Steer；成功生成证书后，以严格交叠 witness 为新锚点。源 owner 的可达节点作为回退父，即使超出近邻半径也保留。
@@ -46,11 +46,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ../env-rebuilt/bin/python -m pytest \
 ## 可复现命令与产物
 
 ```bash
-../env-rebuilt/bin/python scripts/compare_single_tree.py \
+../env-rebuilt/bin/python scripts/experiments/compare_single_tree.py \
   --scenarios forest slots --seeds 10 --budgets 2 8 \
   --out-dir results/single_tree_reference
 
-../env-rebuilt/bin/python scripts/compare_single_tree.py \
+../env-rebuilt/bin/python scripts/experiments/compare_single_tree.py \
   --scenarios forest slots --seeds 10 --budgets 2 8 \
   --out-dir results/single_tree_reference --analyze-only
 ```

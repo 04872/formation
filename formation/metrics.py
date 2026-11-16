@@ -245,7 +245,7 @@ class ScenarioMetricsLogger:
         if self._map_data is None:
             return False
         # Avoid circular import – import lazily
-        from formation.mpc_controller import query_distance_field
+        from formation.control.mpc_controller import query_distance_field
         for s in states:
             if query_distance_field(self._map_data, (s.x, s.y)) < self.robot_radius:
                 return True

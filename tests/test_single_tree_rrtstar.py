@@ -1,6 +1,6 @@
 import math
 
-from formation.single_tree_rrtstar import SingleTreeConfig, SingleTreeRRTStar
+from formation.rrt.single_tree_rrtstar import SingleTreeConfig, SingleTreeRRTStar
 from formation.types import Pose2D
 from test_region_coupling import SLOTS, _map
 
@@ -102,7 +102,7 @@ def test_fixed_anchors_certificates_costs_cycles_and_monotone_tree_goal():
             assert p._portal_valid(p.portal[v], p.owner[parent], p.owner[v])
         else:
             assert p.portal[v] is None
-    from scripts.compare_coupling import route_clearance
+    from scripts.experiments.compare_coupling import route_clearance
     route = [(q.x, q.y, q.yaw) for q in p.current_path()[1]]
     assert route_clearance(p.map_data, p.slots, route) >= p.config.safety_distance - 1e-6
 
