@@ -4,33 +4,33 @@ from .config import DT, CONFIG
 from .paper_costs import guidance_cost, dynamic_cost, smoothness_cost, distance_penalty
 
 
-def integrate(state, controls):
+def integrate(state, controls, dt=DT):
     """Integrate constant linear and angular velocity exactly for one step."""
     x=state.copy()
     v,w=controls[...,0],controls[...,1]
-    mid=x[...,2]+w*DT/2
-    factor=np.sinc(w*DT/(2*np.pi))*DT
+    mid=x[...,2]+w*dt/2
+    factor=np.sinc(w*dt/(2*np.pi))*dt
     x[...,0]+=v*factor*np.cos(mid)
     x[...,1]+=v*factor*np.sin(mid)
-    x[...,2]+=w*DT
+    x[...,2]+=w*dt
     return x
 
 
-def integrate_acceleration(state, velocity, control):
+def integrate_acceleration(state, velocity, control, dt=DT):
     """Advance pose with midpoint speed for constant acceleration, and return final speed."""
     acceleration,omega=control[...,0],control[...,1]
-    new_velocity=velocity+acceleration*DT
-    pose=integrate(state,np.stack(((velocity+new_velocity)/2,omega),axis=-1))
+    new_velocity=velocity+acceleration*dt
+    pose=integrate(state,np.stack(((velocity+new_velocity)/2,omega),axis=-1),dt)
     return pose,new_velocity
 
 
-def apply_actuator_limits(control, velocity, amax=1.):
+def apply_actuator_limits(control, velocity, amax=1., dt=DT):
     """Apply the same acceleration, yaw-rate and next-speed bounds for every rollout."""
     bounded=np.array(control,copy=True)
     bounded[...,0]=np.clip(bounded[...,0],-amax,amax)
     bounded[...,1]=np.clip(bounded[...,1],-CONFIG.max_angular_speed,CONFIG.max_angular_speed)
-    bounded[...,0]=np.clip(bounded[...,0],(-CONFIG.max_speed-velocity)/DT,
-                           (CONFIG.max_speed-velocity)/DT)
+    bounded[...,0]=np.clip(bounded[...,0],(-CONFIG.max_speed-velocity)/dt,
+                           (CONFIG.max_speed-velocity)/dt)
     return bounded
 
 
@@ -48,19 +48,29 @@ def mppi(states, velocities, guidance, nominal, previous_predictions, world, rng
         x=np.repeat(states[i][None,:],samples,axis=0)
         v=np.full(samples,velocities[i]);cost=np.zeros(samples)
         closest=np.full(samples,np.inf)
+        rollout=np.empty((horizon,samples,3))
+        rollout_velocity=np.empty((horizon,samples))
+        rollout_command=np.empty((horizon,samples,2))
         for t in range(horizon):
             command=apply_actuator_limits(controls[:,t],v,amax)
             x,v=integrate_acceleration(x,v,command)
+            rollout[t]=x;rollout_velocity[t]=v;rollout_command[t]=command
+        # A single KD-tree call is equivalent to the prior per-step queries.
+        # Keep the per-step and per-robot cost accumulation order unchanged.
+        clearances=world.clearance(rollout[:,:,:2])
+        peers=previous_predictions[np.arange(n)!=i,:,:2]
+        for t in range(horizon):
+            x=rollout[t];v=rollout_velocity[t];command=rollout_command[t]
             acceleration=np.sqrt(command[:,0]**2+(v*command[:,1])**2)
             cost+=guidance_cost(x[:,:2],guidance[t,i],guidance_weight)
             cost+=dynamic_cost(v,acceleration,CONFIG.max_speed,amax)
             cost+=smoothness_cost(command,smoothness_weight)
-            cost+=distance_penalty(world.clearance(x[:,:2]),.4,.8,2600.,1.8)
-            for j in range(n):
-                if j!=i:
-                    distance=np.linalg.norm(x[:,:2]-previous_predictions[j,t,:2],axis=1)
-                    closest=np.minimum(closest,distance)
-                    cost+=distance_penalty(distance,.5,1.2,1600.,1.5)
+            cost+=distance_penalty(clearances[t],.4,.8,2600.,1.8)
+            peer_distances=np.linalg.norm(x[:,None,:2]-peers[None,:,t,:],axis=2)
+            for j in range(n-1):
+                distance=peer_distances[:,j]
+                closest=np.minimum(closest,distance)
+                cost+=distance_penalty(distance,.5,1.2,1600.,1.5)
         weights=np.exp(-DT*(cost-cost.min())/temperature)
         weights/=weights.sum()
         result[i]=nominal[i]+np.einsum('k,ktd->td',weights,noise)
@@ -93,10 +103,14 @@ class DistributedMPPI:
         self.velocities=np.zeros(len(states))
         self.u_init=np.zeros((len(states),2))
 
-    def step(self,states,guidance,world):
-        opt,pred,self.last_diagnostics=mppi(states,self.velocities,guidance,self.nominal,self.previous_predictions,
-                      world,self.rng,self.samples,self.horizon,
-                      guidance_weight=self.guidance_weight,smoothness_weight=self.smoothness_weight)
+    def step(self,states,guidance,world,optimize_now=True):
+        if optimize_now:
+            opt,pred,self.last_diagnostics=mppi(states,self.velocities,guidance,self.nominal,self.previous_predictions,
+                          world,self.rng,self.samples,self.horizon,
+                          guidance_weight=self.guidance_weight,smoothness_weight=self.smoothness_weight)
+        else:
+            opt=self.nominal
+            pred=self.previous_predictions
         command=apply_actuator_limits(opt[:,0],self.velocities)
         new_velocity=self.velocities+command[:,0]*DT
         execution=np.column_stack(((self.velocities+new_velocity)/2,command[:,1]))

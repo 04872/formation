@@ -40,9 +40,34 @@ class SimulationResult:
     uav_states: np.ndarray | None = None
     uav_controls: np.ndarray | None = None
     uav_altitude: float | None = None
+    timings: dict | None = None
+    stage_times: list | None = None
+    elapsed_seconds: float = 0.
+    replan_period: float = CONFIG.replan_steps * DT
+    stagnation_timeout: float | None = None
+    execution_dt: float = DT
+    backend_period: float = DT
+    backend_ticks: list | None = None
 
-def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: int=CONFIG.sequences, steps: int=CONFIG.steps, candidates: int=CONFIG.candidates, samples: int=CONFIG.samples, obstacle_count: int=50, map_seed: int=0, horizon: int=CONFIG.horizon, progress: bool=False, guidance_weight: float=CONFIG.guidance_weight, smoothness_weight: float=CONFIG.smoothness_weight, formation: str="square4", formation_spacing: float=1.3, pillar_width: float=1.0, start_center: list[float] | None=None, goal_center: list[float] | None=None, dynamics: str='differential_drive', uav_altitude: float=1.0) -> SimulationResult:
+def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: int=CONFIG.sequences, steps: int=CONFIG.steps, candidates: int=CONFIG.candidates, samples: int=CONFIG.samples, obstacle_count: int=50, map_seed: int=0, horizon: int=CONFIG.horizon, progress: bool=False, guidance_weight: float=CONFIG.guidance_weight, smoothness_weight: float=CONFIG.smoothness_weight, formation: str="square4", formation_spacing: float=1.3, pillar_width: float=1.0, start_center: list[float] | None=None, goal_center: list[float] | None=None, dynamics: str='differential_drive', uav_altitude: float=1.0, replan_period: float | None=None, max_time: float | None=None, stagnation_timeout: float | None=None, execution_dt: float=DT, backend_period: float | None=None) -> SimulationResult:
     """Run perception, shared SFC generation, guidance, and rolling distributed MPPI."""
+    simulation_started=time.perf_counter()
+    replan_period=CONFIG.replan_steps*DT if replan_period is None else replan_period
+    replan_steps=int(round(replan_period/DT))
+    backend_period=DT if backend_period is None else backend_period
+    backend_steps=int(round(backend_period/DT))
+    substeps=int(round(DT/execution_dt))
+    if backend_steps<1 or abs(backend_steps*DT-backend_period)>1e-9:
+        raise ValueError('backend period must be a positive multiple of the MPPI prediction step')
+    if substeps<1 or abs(substeps*execution_dt-DT)>1e-9:
+        raise ValueError('execution dt must divide the MPPI prediction step')
+    if dynamics=='uav' and (substeps!=1 or backend_steps!=1):
+        raise ValueError('Frequency-controlled comparison currently supports differential drive')
+    if replan_steps<1 or abs(replan_steps*DT-replan_period)>1e-9:
+        raise ValueError('replan period must be a positive multiple of the MPPI update step')
+    if max_time is not None:max_steps=int(np.floor(max_time/DT+1e-10))
+    stage_totals={k:0. for k in ('perception','sfc','frontend','backend','execution')}
+    stage_times=[];stalled_since=None;backend_ticks=[]
     rng = np.random.default_rng(seed)
     geometry = FormationGeometry(formation, formation_spacing)
     REF = geometry.leader_reference
@@ -98,19 +123,25 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
     termination = 'timeout'
     sfc_error = ''
     for tick in range(max_steps):
+        stamp=time.perf_counter()
         world.observe(states[:, :2])
-        if tick % CONFIG.replan_steps == 0:
+        stage_totals['perception']+=time.perf_counter()-stamp
+        if tick % replan_steps == 0:
             started = time.perf_counter()
             # q uses fixed reference-slot coordinates. After reassignment the
             # physical leader need not occupy the zero-offset slot.
             center = states[0, :2] - previous_a @ REF[assignment[0]]
             q = np.r_[center, previous_a.ravel()]
             try:
+                stamp=time.perf_counter()
                 regions = [world.sfc(x, inflate=True) for x in states[:,:2]]
             except SFCConstructionError as exc:
                 termination = 'sfc_failed'
                 sfc_error = str(exc)
                 break
+            sfc_seconds=time.perf_counter()-stamp
+            stage_totals['sfc']+=sfc_seconds
+            stamp=time.perf_counter()
             path,seq_diag = frontend.plan(q, world, regions, states[:,:2], assignment, leader_goal)
             if len(path):
                 # Section IV-D initializes the next plan with the previous
@@ -118,22 +149,27 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
                 previous_a = path[0, 2:].reshape(2, 2).copy()
             reason = 'no_safe_candidate' if len(path)==0 else 'ok'
             assignment = frontend.assign(states, path, regions, assignment)
+            if len(path):target_path=np.array([positions(qi,geometry)[assignment] for qi in path])
+            frontend_seconds=time.perf_counter()-stamp
+            stage_totals['frontend']+=frontend_seconds
+            stage_times.append({'sfc':sfc_seconds,'frontend':frontend_seconds})
             initialization_q.append(q.tolist())
             sequence_diagnostics.append(seq_diag)
             failures.append(reason)
             all_regions.append(regions)
             join_start = states[:, :2].copy()
             paths.append(path.tolist())
-            planning_ticks.append(tick)
+            planning_ticks.append(tick*substeps)
             assignments.append(assignment.tolist())
             known_history.append(world.known.copy())
             planning_seconds.append(time.perf_counter() - started)
             stuck = stuck + 1 if len(path) == 0 else 0
+            if len(path):stalled_since=None
+            elif stalled_since is None:stalled_since=tick*DT
             if progress:
                 print(f'plan tick={tick} center={states[:,:2].mean(axis=0).tolist()} path={len(path)} status={reason} seconds={planning_seconds[-1]:.2f}', flush=True)
         if len(path) > 0:
-            target_path=np.array([positions(qi,geometry)[assignment] for qi in path])
-            offset=tick % CONFIG.replan_steps
+            offset=tick % replan_steps
             indices=np.minimum(np.arange(horizon)+offset,len(target_path)-1)
             guidance=target_path[indices]
             guidance_q=path[indices]
@@ -142,7 +178,11 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
             guidance_q=np.repeat(q[None,:],horizon,axis=0)
         if dynamics == 'uav':
             guidance3 = np.concatenate((guidance, np.full((*guidance.shape[:2], 1), uav_altitude)), axis=-1)
+            stamp=time.perf_counter()
             command = controller.step(uav_state, guidance3, lambda xyz: world.clearance(xyz[..., :2]))
+            backend_ticks.append(tick)
+            stage_totals['backend']+=time.perf_counter()-stamp
+            stamp=time.perf_counter()
             uav_state = integrate_uav(uav_state, command, DT)
             states = uav_state[:, [0, 1, 9]]
             uav_history.append(uav_state.copy())
@@ -151,21 +191,41 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
             commands.append(uav_state[:, 6:9].copy())
             velocity_history.append(np.linalg.norm(uav_state[:, 3:6], axis=1))
         else:
-            u,command = controller.step(states,guidance,world)
-            states=integrate(states,u)
-            commands.append(command)
-            velocity_history.append(controller.velocities.copy())
-        mppi_diagnostics.append(controller.last_diagnostics.copy())
-        history.append(states.copy())
-        controls.append(u)
-        qs.append(fit_q(states, assignment, geometry))
-        q_ref_history.append(guidance_q[0].copy())
-        assignment_history.append(assignment.copy())
+            stamp=time.perf_counter()
+            velocity=controller.velocities.copy()
+            optimize_now=tick % backend_steps==0
+            u,command = controller.step(states,guidance,world,optimize_now=optimize_now)
+            if optimize_now:backend_ticks.append(tick*substeps)
+            stage_totals['backend']+=time.perf_counter()-stamp
+            stamp=time.perf_counter()
+            # Execute the selected acceleration/yaw-rate for its .2 s interval
+            # at the shared actuator step, without running MPPI again.
+            for _ in range(substeps):
+                next_velocity=velocity+command[:,0]*execution_dt
+                execution=np.column_stack(((velocity+next_velocity)/2,command[:,1]))
+                states=integrate(states,execution,dt=execution_dt)
+                velocity=next_velocity
+                commands.append(command.copy());velocity_history.append(velocity.copy())
+                controls.append(execution);history.append(states.copy())
+                qs.append(fit_q(states,assignment,geometry))
+                q_ref_history.append(guidance_q[0].copy())
+                assignment_history.append(assignment.copy())
+                mppi_diagnostics.append(controller.last_diagnostics.copy())
+            controller.velocities=velocity
+        stage_totals['execution']+=time.perf_counter()-stamp
+        if dynamics=='uav':
+            mppi_diagnostics.append(controller.last_diagnostics.copy())
+            history.append(states.copy());controls.append(u)
+            qs.append(fit_q(states,assignment,geometry))
+            q_ref_history.append(guidance_q[0].copy())
+            assignment_history.append(assignment.copy())
         goal_targets = leader_goal + REF[assignment]
         if np.max(np.linalg.norm(states[:, :2] - goal_targets, axis=1)) < 0.4 and np.max(np.abs(velocity_history[-1])) < 0.1:
             termination = 'goal_reached'
             break
-        if stuck >= 8:
+        if ((stagnation_timeout is None and stuck>=8) or
+                (stagnation_timeout is not None and stalled_since is not None and
+                 (tick+1)*DT-stalled_since>=stagnation_timeout)):
             termination = 'stagnation'
             break
     states = np.array(history)
@@ -173,6 +233,10 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
     qs = np.array(qs)
     result = SimulationResult(world, states, controls, np.array(q_ref_history), qs, paths, planning_ticks, assignments, np.array(assignment_history), np.array(known_history), planning_seconds, failures, all_regions, termination, np.asarray(commands).reshape(-1, len(REF), 3 if dynamics == 'uav' else 2), np.array(velocity_history), sfc_error, initialization_q, sequence_diagnostics, np.asarray(mppi_diagnostics).reshape(-1,len(REF),2 if dynamics == 'uav' else 6), guidance_weight, smoothness_weight, geometry)
     result.dynamics = dynamics
+    result.timings=stage_totals;result.stage_times=stage_times
+    result.elapsed_seconds=time.perf_counter()-simulation_started
+    result.replan_period=replan_period;result.stagnation_timeout=stagnation_timeout
+    result.execution_dt=execution_dt;result.backend_period=backend_period;result.backend_ticks=backend_ticks
     if dynamics == 'uav':
         result.uav_states = np.asarray(uav_history)
         result.uav_controls = np.asarray(uav_commands).reshape(-1, len(REF), 4)

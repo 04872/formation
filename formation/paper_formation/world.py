@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, binary_dilation
 from scipy.spatial import cKDTree
 from .config import RADIUS
 
@@ -57,29 +57,65 @@ class World:
         else:
             self.start = np.array([2.0, 4.0])
             self.goal = np.array([10.0, 4.0])
+        self._dirty = True
         self.known = np.zeros(self.size, dtype=bool)
         self.occupied = np.zeros(self.size, dtype=bool)
         (self.xx, self.yy) = np.meshgrid(np.arange(self.size[0]), np.arange(self.size[1]), indexing='ij')
 
     def observe(self, positions):
+        radius = 3.0
         for p in positions:
-            d2 = (self.xx * self.res + self.res / 2 - p[0]) ** 2 + (self.yy * self.res + self.res / 2 - p[1]) ** 2
-            visible = d2 <= 3.0 ** 2
-            self.known |= visible
-            self.occupied[visible] = self.truth[visible]
-        blocked = ~self.known | self.occupied
-        self.dist = distance_transform_edt(~blocked) * self.res
-        self.blocked_points = (np.argwhere(blocked) + 0.5) * self.res
-        self._blocked_tree = cKDTree(self.blocked_points)
+            lower = np.maximum(np.floor((p-radius)/self.res).astype(int)-1, 0)
+            upper = np.minimum(np.ceil((p+radius)/self.res).astype(int)+2, self.size)
+            if np.any(lower >= upper):
+                continue
+            x = np.arange(lower[0],upper[0]) * self.res + self.res / 2
+            y = np.arange(lower[1],upper[1]) * self.res + self.res / 2
+            visible = (x[:,None]-p[0])**2 + (y[None,:]-p[1])**2 <= radius**2
+            window = np.s_[lower[0]:upper[0],lower[1]:upper[1]]
+            known = self.known[window]
+            if np.any(visible & ~known):
+                self._dirty = True
+            known |= visible
+            occupied = self.occupied[window]
+            occupied[visible] = self.truth[window][visible]
+
+    def _refresh(self):
+        if self._dirty:
+            blocked = ~self.known | self.occupied
+            self._blocked_mask = blocked
+            self._dist = distance_transform_edt(~blocked) * self.res
+            self._blocked_points = (np.argwhere(blocked) + 0.5) * self.res
+            # For a query in a free cell a nearest blocked center exists on
+            # the four-neighbor free/blocked boundary. Queries in blocked
+            # cells use their own center, which is nearest on the full lattice.
+            boundary = blocked & binary_dilation(~blocked)
+            self._blocked_tree = cKDTree((np.argwhere(boundary)+.5)*self.res)
+            self._dirty = False
+
+    @property
+    def dist(self):
+        self._refresh()
+        return self._dist
+
+    @property
+    def blocked_points(self):
+        self._refresh()
+        return self._blocked_points
 
     def clearance(self, points):
         """Conservative continuous distance to disks covering blocked grid cells."""
+        self._refresh()
         points = np.asarray(points, dtype=float)
         flat = points.reshape(-1, 2)
         radius = self.res * np.sqrt(2) / 2
-        clearance = self._blocked_tree.query(flat, workers=1)[0] - radius
         outside = np.any((flat < 0) | (flat >= np.asarray(self.size) * self.res), axis=1)
-        clearance[outside] = np.minimum(clearance[outside], -radius)
+        cells = np.floor(flat/self.res).astype(int)
+        cells = np.clip(cells, 0, np.asarray(self.size)-1)
+        free = ~self._blocked_mask[cells[:,0],cells[:,1]] & ~outside
+        clearance = np.linalg.norm(flat-(cells+.5)*self.res,axis=1)-radius
+        clearance[free] = self._blocked_tree.query(flat[free],workers=1)[0]-radius
+        clearance[outside] = -radius
         return clearance.reshape(points.shape[:-1])
 
     def sfc(self, anchor, inflate=True):

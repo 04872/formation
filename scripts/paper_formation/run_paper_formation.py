@@ -22,6 +22,11 @@ def main():
     parser.add_argument('--map-seed', type=int, default=0)
     parser.add_argument('--obstacle-count', type=int, default=50)
     parser.add_argument('--max-steps', type=int, default=350)
+    parser.add_argument('--max-time', type=float)
+    parser.add_argument('--execution-dt', type=float, default=.2)
+    parser.add_argument('--replan-period', type=float)
+    parser.add_argument('--backend-period', type=float)
+    parser.add_argument('--stagnation-timeout', type=float)
     parser.add_argument('--sequences', type=int, default=CONFIG.sequences)
     parser.add_argument('--steps', type=int, default=CONFIG.steps)
     parser.add_argument('--candidates', type=int, default=CONFIG.candidates)
@@ -33,7 +38,7 @@ def main():
     parser.add_argument('--output', default='results/paper_formation')
     args = parser.parse_args()
     start_time = time.perf_counter()
-    result = simulate(args.scene, args.mode, args.seed, args.max_steps, args.sequences, args.steps, args.candidates, args.samples, args.obstacle_count, args.map_seed, args.horizon, args.progress, args.guidance_weight, args.smoothness_weight, args.formation, args.formation_spacing, args.pillar_width, args.start_center, args.goal_center, args.dynamics, args.uav_altitude)
+    result = simulate(args.scene, args.mode, args.seed, args.max_steps, args.sequences, args.steps, args.candidates, args.samples, args.obstacle_count, args.map_seed, args.horizon, args.progress, args.guidance_weight, args.smoothness_weight, args.formation, args.formation_spacing, args.pillar_width, args.start_center, args.goal_center, args.dynamics, args.uav_altitude, replan_period=args.replan_period,max_time=args.max_time,stagnation_timeout=args.stagnation_timeout,execution_dt=args.execution_dt,backend_period=args.backend_period)
     args.wall_seconds = time.perf_counter() - start_time
     write_outputs(args, result)
 if __name__ == '__main__':

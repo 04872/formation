@@ -9,7 +9,8 @@ def positions(q, geometry=DEFAULT_GEOMETRY):
 def valid_shape(q, geometry=DEFAULT_GEOMETRY):
     """Evaluate 2x2 singular values analytically and exact reference pair spacings."""
     a=q[2:].reshape(2,2)
-    trace=np.sum(a*a); det=a[0,0]*a[1,1]-a[0,1]*a[1,0]
+    trace=((a[0,0]*a[0,0]+a[0,1]*a[0,1])+a[1,0]*a[1,0])+a[1,1]*a[1,1]
+    det=a[0,0]*a[1,1]-a[0,1]*a[1,0]
     disc=np.sqrt(max(0.,trace*trace-4*det*det))
     min_sv2=(trace-disc)/2;max_sv2=(trace+disc)/2
     if not (det>0 and min_sv2>=.42**2 and max_sv2<=1.35**2 and

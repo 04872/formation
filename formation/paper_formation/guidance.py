@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from .config import DEFAULT_GEOMETRY, RADIUS, CONFIG
-from .formation import positions, edge_safe, valid_shape
+from .formation import positions, edge_safe
+from .native_sampler import sample_affine
 
 def score_candidates(samples, angles, q, goal, current, assignment, obstacle_distance, previous_direction, mode, regions, geometry=DEFAULT_GEOMETRY):
     """Vectorized evaluation of exactly the five paper costs before SafeCheck."""
@@ -41,20 +42,26 @@ def guide(q0, world, rng, mode, regions, current, assignment, goal, sequences=CO
         for step in range(steps):
             q=q0 if not path else path[-1]
             direction=np.arctan2(*(goal-q[:2])[::-1])
-            choices=[]
-            for k in range(candidates):
-                # Restrict only affine shape space, not SFC validity or score.
-                while True:
-                    angle=direction+rng.uniform(-np.pi/2,np.pi/2)
-                    center=q[:2]+rng.uniform(.1,.2)*np.array([np.cos(angle),np.sin(angle)])
-                    if mode=='uniform':
-                        a=np.eye(2)*rng.uniform(.42,1.3)
-                    else:
-                        a=q[2:].reshape(2,2)+rng.normal(0,.12,(2,2))
-                    sample=np.r_[center,a.ravel()]; attempts+=1
-                    if mode=='uniform' or valid_shape(sample,geometry): break
-                choices.append((sample,angle))
-            samples=np.array([item[0] for item in choices]);angles=np.array([item[1] for item in choices])
+            samples=np.empty((candidates,6));angles=np.empty(candidates)
+            if mode=='uniform':
+                # The three columns preserve each candidate's original RNG draw
+                # order: angle, radius, scale, before moving to the next one.
+                draws=rng.random((candidates,3))
+                angles[:]=direction+(-np.pi/2+draws[:,0]*np.pi)
+                radii=.1+draws[:,1]*(.2-.1)
+                samples[:,0]=q[0]+radii*np.cos(angles)
+                samples[:,1]=q[1]+radii*np.sin(angles)
+                samples[:,2]=.42+draws[:,2]*(1.3-.42)
+                samples[:,3:5]=0.
+                samples[:,5]=samples[:,2]
+                attempts+=candidates
+            else:
+                draws,count=sample_affine(rng,direction,q[2:],geometry,candidates)
+                attempts+=count
+                angles[:]=draws[:,0]
+                samples[:,0]=q[0]+draws[:,1]*np.cos(angles)
+                samples[:,1]=q[1]+draws[:,1]*np.sin(angles)
+                samples[:,2:]=draws[:,2:]
             scores=score_candidates(samples,angles,q,goal,current,assignment,obstacle_distance,previous_direction,mode,regions,geometry)
             winner=np.argmin(scores);score,selected,angle=scores[winner],samples[winner],angles[winner]
             # First selected formation joins the actual robot positions; q0 contains
