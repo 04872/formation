@@ -75,7 +75,7 @@ def stable_drive_rates(control, reference, duration):
     return rates
 
 
-def audit_segment(control, duration, reference, H, b, limits, interval=(0., 1.)):
+def audit_segment(control, duration, reference, H, b, limits, interval=(0., 1.), uav=False):
     """Check a whole segment or the executed parameter interval."""
     q = power_polynomials(control)
     low, high = interval
@@ -91,12 +91,14 @@ def audit_segment(control, duration, reference, H, b, limits, interval=(0., 1.))
         cross = v[0]*a[1]-v[1]*a[0]
         max_speed = max(max_speed, np.sqrt(max(0., extrema(speed2, low, high)[1])))
         max_acceleration = max(max_acceleration, np.sqrt(max(0., extrema(acceleration2, low, high)[1])))
-        for sign in (-1, 1):
-            omega_margin = min(omega_margin, extrema(limits['omega_max']*speed2+sign*cross, low, high)[0])
-    for r in reference:
-        robot_control = np.asarray(control)[:, :2] + np.einsum(
-            'kij,j->ki', np.asarray(control)[:, 2:].reshape(-1, 2, 2), r)
-        max_omega = max(max_omega, angular_extremum(robot_control, duration, interval))
+        if not uav:
+            for sign in (-1, 1):
+                omega_margin = min(omega_margin, extrema(limits['omega_max']*speed2+sign*cross, low, high)[0])
+    if not uav:
+        for r in reference:
+            robot_control = np.asarray(control)[:, :2] + np.einsum(
+                'kij,j->ki', np.asarray(control)[:, 2:].reshape(-1, 2, 2), r)
+            max_omega = max(max_omega, angular_extremum(robot_control, duration, interval))
     pair_distance = float('inf')
     for i, j in combinations(range(len(positions)), 2):
         d = [positions[i][k]-positions[j][k] for k in range(2)]
@@ -122,8 +124,8 @@ def audit_segment(control, duration, reference, H, b, limits, interval=(0., 1.))
             'max_shear': max_shear,
             'passed': bool(max_speed <= limits['v_max']+1e-6 and
                            max_acceleration <= limits['a_max']+1e-6 and
-                           max_omega <= limits['omega_max']+1e-6 and
-                           omega_margin >= -1e-7 and pair_distance >= limits.get('pair_min', .4)-1e-6 and
+                           (uav or (max_omega <= limits['omega_max']+1e-6 and
+                           omega_margin >= -1e-7)) and pair_distance >= limits.get('pair_min', .4)-1e-6 and
                            violation <= 1e-6 and shape_margin >= -1e-6 and determinant_min > 0 and
                            max_shear <= 1.5+1e-6)}
 
@@ -175,6 +177,115 @@ def audit_tree(nodes):
             'nodes': len(nodes)}
 
 
+def audit_uav_central(directory, data, records):
+    """Audit the centralized affine trajectory with the paper's UAV flat model.
+
+    The backend samples a continuous quintic curve at ``dt`` and records the
+    instantaneous jerk at each sample.  It is therefore deliberately checked
+    against the analytic Bézier derivatives, rather than by applying a
+    zero-order-hold Euler step to the sampled jerk.
+    """
+    reference = data['reference']; resolution = float(data['resolution'])
+    radius = float(data['robot_radius']); limits = {'v_max': float(data['v_max']),
+                                                     'a_max': float(data['a_max'])}
+    dt = float(data['dt']); states = data['states']; x = data['uav_states']
+    commands = data['uav_controls']; configurations = data['configurations']
+    E = matrix_for_reference(reference)
+    checks=[]; trees=[]; clearance=float('inf'); joins=np.zeros(3)
+    for plan in records['plans']:
+        if 'tree' in plan: trees.append(audit_tree(plan['tree']))
+        segments=plan.get('segments', [])
+        if not segments: continue
+        blocked=data['occupancy'] | ~data['known_history'][plan['known_index']]
+        tree=cKDTree((np.argwhere(blocked)+.5)*resolution)
+        for k, seg in enumerate(segments):
+            check=audit_segment(np.asarray(seg['control_points']), float(seg['duration']),
+                                reference, seg['H'], seg['b'],
+                                {**limits, 'pair_min': 2*radius+.08}, uav=True)
+            check.update(plan=len(trees)-1, segment=k); checks.append(check)
+            clearance=min(clearance, obstacle_clearance_bound(seg['control_points'], reference, tree, resolution, radius))
+            if k:
+                prev=segments[k-1]
+                before=power_polynomials(prev['control_points']); after=power_polynomials(seg['control_points'])
+                for order in range(3):
+                    rr=[abs(a.deriv(order)(0)/float(seg['duration'])**order-
+                             b.deriv(order)(1)/float(prev['duration'])**order) for a,b in zip(after,before)]
+                    joins[order]=max(joins[order], max(rr))
+    execution_error=velocity_error=acceleration_error=jerk_error=0.; duration_error=0.; yaw_error=0.
+    projection_error=idle_error=auxiliary_error=0.; execution_c1=execution_c2=0.
+    altitude_error=float(np.max(abs(x[:,:,2]-x[0:1,:,2])))
+    previous_v=previous_a=None; polynomial_cache={}
+    for event in records['execution']:
+        if event['kind']!='curve':
+            tick=int(event['tick'])
+            if tick+1 < len(x): idle_error=max(idle_error,float(np.max(abs(x[tick+1]-x[tick]))))
+            if tick < len(commands): idle_error=max(idle_error,float(np.max(abs(commands[tick]))))
+            previous_v=previous_a=None
+            continue
+        seg=records['plans'][event['plan']]['segments'][event['segment']]
+        key=(event['plan'],event['segment'])
+        if key not in polynomial_cache:
+            c=np.asarray(seg['control_points']); T=float(seg['duration']); base=power_polynomials(c)
+            polynomial_cache[key]=(base,[[p.deriv(k) for p in base] for k in range(1,4)])
+        pp, derivatives=polynomial_cache[key]; T=float(seg['duration'])
+        for offset,u in ((0.,float(event['u0'])),(1.,float(event['u1']))):
+            tick=int(event['tick']+offset); q=np.array([p(u) for p in pp])
+            qv=np.array([p(u)/T for p in derivatives[0]]); qa=np.array([p(u)/T**2 for p in derivatives[1]])
+            # E maps the six configuration coordinates directly to each robot's xy.
+            pxy=np.einsum('nij,j->ni',E,q); vxy=np.einsum('nij,j->ni',E,qv); axy=np.einsum('nij,j->ni',E,qa)
+            actual=x[tick]
+            execution_error=max(execution_error,float(np.max(abs(actual[:,:2]-pxy))))
+            velocity_error=max(velocity_error,float(np.max(abs(actual[:,3:5]-vxy))))
+            acceleration_error=max(acceleration_error,float(np.max(abs(actual[:,6:8]-axy))))
+            projection_error=max(projection_error,float(np.max(abs(states[tick,:,:2]-actual[:,:2]))),
+                                 float(np.max(abs(states[tick,:,2]-actual[:,9]))))
+            yaw_error=max(yaw_error,float(np.max(abs(actual[:,5]))),float(np.max(abs(actual[:,8]))),
+                          float(np.max(abs(actual[:,9]-x[0,:,9]))))
+            if offset==0. and previous_v is not None:
+                execution_c1=max(execution_c1,float(np.max(abs(vxy-previous_v))))
+                execution_c2=max(execution_c2,float(np.max(abs(axy-previous_a))))
+            if offset==0.: previous_v=vxy; previous_a=axy
+            if offset==0.:
+                qjerk=np.array([p(u)/T**3 for p in derivatives[2]])
+                expected_jerk=np.einsum('nij,j->ni',E,qjerk)
+                jerk_error=max(jerk_error,float(np.max(abs(commands[int(event['tick']),:,:2]-expected_jerk))))
+                auxiliary_error=max(auxiliary_error,float(np.max(abs(commands[int(event['tick']),:,2:]))))
+            else:
+                previous_v=vxy; previous_a=axy
+        duration_error=max(duration_error,abs((float(event['u1'])-float(event['u0']))*T-dt))
+    max_speed=max((c['max_speed'] for c in checks),default=0.); max_acc=max((c['max_acceleration'] for c in checks),default=0.)
+    pair=min((c['minimum_pair_distance'] for c in checks),default=float('inf'))
+    result={'dynamics':'uav','segments':len(checks),'trees':len(trees),
+            'all_segment_checks_passed':bool(checks and all(c['passed'] for c in checks)),
+            'all_tree_checks_passed':bool(trees and all(c['passed'] for c in trees)),
+            'known_grid_clearance_lower_bound':clearance,'maximum_C0_C1_C2_residuals':joins.tolist(),
+            'execution_tick_duration_residual':duration_error,'execution_configuration_residual':execution_error,
+            'uav_position_residual':execution_error,'uav_velocity_residual':velocity_error,
+            'uav_acceleration_residual':acceleration_error,'uav_jerk_residual':jerk_error,
+            'uav_auxiliary_control_residual':auxiliary_error,'uav_yaw_residual':yaw_error,
+            'uav_fixed_altitude_residual':altitude_error,
+            'projection_residual':projection_error,'idle_state_residual':idle_error,
+            'execution_C1_C2_residuals':[execution_c1,execution_c2],
+            'max_speed':float(max_speed),'max_acceleration':float(max_acc),'max_angular_speed':0.,
+            'minimum_pair_distance':float(pair),'v_max_satisfied':bool(max_speed<=limits['v_max']+1e-6),
+            'a_max_satisfied':bool(max_acc<=limits['a_max']+1e-6),
+            'continuous_safety_certified_by_audit':bool(checks and clearance>0 and pair>0),
+            'note':'Independent polynomial extrema and SFC audit for analytic UAV flat-output execution; no differential-drive curvature constraint.'}
+    result['passed']=bool(result['all_segment_checks_passed'] and result['all_tree_checks_passed'] and
+                           result['continuous_safety_certified_by_audit'] and joins.max()<1e-6 and
+                           execution_error<1e-6 and velocity_error<1e-6 and acceleration_error<1e-6 and
+                           jerk_error<1e-6 and auxiliary_error<1e-6 and yaw_error<1e-6 and
+                           projection_error<1e-6 and altitude_error<1e-6 and idle_error<1e-6 and execution_c1<1e-6 and
+                           execution_c2<1e-6 and duration_error<1e-6)
+    return result
+
+
+def matrix_for_reference(reference):
+    """Local copy of p_i=E_i q to keep this audit independent of planner code."""
+    reference=np.asarray(reference,float)
+    return np.array([[[1,0,r[0],r[1],0,0],[0,1,0,0,r[0],r[1]]] for r in reference])
+
+
 def audit(directory):
     directory = Path(directory)
     # NpzFile decompresses an array on every __getitem__. Load audit inputs once
@@ -182,12 +293,19 @@ def audit(directory):
     with np.load(directory/'trajectory.npz', allow_pickle=False) as archive:
         data = {key: archive[key] for key in ('reference','resolution','robot_radius',
                 'v_max','a_max','omega_max','occupancy','known_history','dt',
-                'states','controls','configurations')}
+                'states','controls','configurations') if key in archive}
+        if 'dynamics' in archive:
+            data['dynamics'] = str(archive['dynamics'])
+        if data.get('dynamics') == 'uav':
+            data['uav_states'] = archive['uav_states']
+            data['uav_controls'] = archive['uav_controls']
+            return audit_uav_central(directory, data,
+                                     json.loads((directory/'plans.json').read_text()))
     records = json.loads((directory/'plans.json').read_text())
     reference = data['reference']
     resolution = float(data['resolution'])
     radius = float(data['robot_radius'])
-    limits = {k: float(data[k]) for k in ('v_max', 'a_max', 'omega_max')}
+    limits = {k: float(data[k]) for k in ('v_max', 'a_max', 'omega_max') if k in data}
     checks, tree_checks = [], []
     clearance = float('inf')
     join_error = np.zeros(3)

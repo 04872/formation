@@ -6,7 +6,7 @@ from .trajectory import differential_failure
 from formation.paper_formation.config import RADIUS
 
 
-def goal_duration(q, goal, velocity, acceleration, regions, reference, E, dt, max_duration=30.):
+def goal_duration(q, goal, velocity, acceleration, regions, reference, E, dt, max_duration=30., vmax=.65, amax=1., dynamics="differential_drive"):
     """Find first grid time whose fixed six controls pass all hard checks.
 
     This is a bounded one-dimensional algebraic check, not repeated optimizer
@@ -27,8 +27,8 @@ def goal_duration(q, goal, velocity, acceleration, regions, reference, E, dt, ma
         H,b=regions[indices[i]]
         positions=np.einsum('ij,tkj->tki',e,controls)
         valid &= np.all(np.einsum('ij,tkj->tki',H,positions)<=b+1e-8,axis=(1,2))
-        valid &= np.all(np.linalg.norm(np.einsum('ij,tkj->tki',e,vel),axis=2)<=.65+1e-8,axis=1)
-        valid &= np.all(np.linalg.norm(np.einsum('ij,tkj->tki',e,acc),axis=2)<=1.+1e-8,axis=1)
+        valid &= np.all(np.linalg.norm(np.einsum('ij,tkj->tki',e,vel),axis=2)<=vmax+1e-8,axis=1)
+        valid &= np.all(np.linalg.norm(np.einsum('ij,tkj->tki',e,acc),axis=2)<=amax+1e-8,axis=1)
     for normal,(i,j) in zip(normals,combinations(range(len(E)),2)):
         difference=np.einsum('ij,tkj->tki',E[i]-E[j],controls)
         valid &= np.all(np.einsum('i,tki->tk',normal,difference)>=2*RADIUS+.08-1e-8,axis=1)
@@ -39,6 +39,6 @@ def goal_duration(q, goal, velocity, acceleration, regions, reference, E, dt, ma
     valid &= np.all(np.linalg.svd(A,compute_uv=False)[:,:,0]<=1.35+1e-8,axis=1)
     valid &= np.all(np.abs(A[:,:,0,1])+np.abs(A[:,:,1,0])<=1.5+1e-8,axis=1)
     for i in np.flatnonzero(valid):
-        if differential_failure(controls[i],times[i],reference,1.5) is None:
+        if dynamics=="uav" or differential_failure(controls[i],times[i],reference,1.5) is None:
             return float(times[i])
     return None

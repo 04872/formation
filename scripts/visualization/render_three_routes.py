@@ -73,6 +73,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',type=Path,default=ROOT);parser.add_argument('--fps',type=int,default=20);parser.add_argument('--speed',type=float,default=4.)
     args=parser.parse_args();cases={(route,seed):read_case(args.root,route,seed) for route,_ in ROUTES for seed in (0,1)}
+    config=json.loads((args.root/'rrt_affine/seed_0/configuration.json').read_text())
+    if config.get('backend')=='mppi':ROUTES[-1]=('rrt_affine','Local RRT* + MPPI')
     for seed in (0,1):
         maximum=max((len(cases[route,seed]['data']['states'])-1)*float(cases[route,seed]['data']['dt']) for route,_ in ROUTES)
         frames=math.floor(maximum*args.fps/args.speed)+1+2*args.fps;out=args.root/f'seed{seed}_comparison.mp4';proc=encode(out,1920,640,args.fps)

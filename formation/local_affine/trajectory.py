@@ -95,13 +95,13 @@ class TrajectoryOptimizer:
 
     def __init__(self, route, regions, reference, initial_velocity, initial_acceleration,
                  mode, vmax=.65, amax=1., omega_max=1.5, template_cache=None,
-                 terminal_goal=True, terminal_stop=False, reserve=False):
+                 terminal_goal=True, terminal_stop=False, reserve=False, dynamics="differential_drive"):
         started=time.perf_counter()
         self.route=route;self.regions=regions;self.reference=reference
         self.mode=mode;self.vmax=vmax;self.amax=amax
         self.initial_velocity=initial_velocity;self.initial_acceleration=initial_acceleration
         self.omega_max=omega_max;self.terminal_goal=terminal_goal
-        self.terminal_stop=terminal_stop;self.reserve=reserve
+        self.terminal_stop=terminal_stop;self.reserve=reserve;self.dynamics=dynamics
         self._angular_refinement=None
         certs=[certify_edge(a,b,regions,reference) for a,b in zip(route[:-1],route[1:])]
         if not certs or any(c is None for c in certs):
@@ -189,7 +189,7 @@ class TrajectoryOptimizer:
                 controls[-1,4]=controls[-1,5];controls[-1,3]=controls[-1,5]
             return controls
         controls=restore_equalities();scp_iterations=0
-        if not all(differential_certificate(c,durations[k],reference,omega_max) for k,c in enumerate(controls)):
+        if self.dynamics != "uav" and not all(differential_certificate(c,durations[k],reference,omega_max) for k,c in enumerate(controls)):
             scp_started=time.perf_counter();scp_solver_seconds=0.
             if self._angular_refinement is None:
                 self._angular_refinement=AngularRefinement(problem,x,E,m,

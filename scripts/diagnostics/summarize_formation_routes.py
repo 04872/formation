@@ -25,19 +25,24 @@ def summarize(root):
         if not all(np.array_equal(x,y) for x,y in zip(shared,reference_case)):
             raise ValueError(f'Map, endpoints or initial formation mismatch: {case}')
         states=d['states'];dt=float(d['dt']);n=states.shape[1]
-        is_paper=config['route'].startswith('paper_')
+        is_uav=config.get('dynamics')=='uav'
+        is_paper='backend_ticks' in d
         if is_paper:
             targets=d['goal']+d['reference'][d['assignment_history']]
             speed=np.abs(d['velocity_history'])
             safe=bool(audit['continuous_safety_certified_by_audit'])
             clearance=audit['continuous_obstacle_clearance_lower_bound_m']
             pair_distance=audit['continuous_pair_clearance_lower_bound_m']+2*float(d['robot_radius'])
-            w=np.abs(d['controls'][:,:,1]);ac=d['acceleration_controls'][:,:,0]
-            peak_v=np.maximum(speed[:-1],speed[1:])
-            max_a=float(np.sqrt(ac*ac+(peak_v*w)**2).max(initial=0))
-            dynamic_ok=(audit['v_max_satisfied'] and audit['omega_max_satisfied'] and max_a<=1.+1e-8 and
-                        audit['velocity_update_residual_max_m_s']<1e-8 and
-                        audit['exact_unicycle_position_residual_max_m']<1e-8)
+            if is_uav:
+                max_a=audit['max_acceleration_m_s2']
+                dynamic_ok=(audit['v_max_satisfied'] and audit['a_max_satisfied'] and audit['euler_model_satisfied'])
+            else:
+                w=np.abs(d['controls'][:,:,1]);ac=d['acceleration_controls'][:,:,0]
+                peak_v=np.maximum(speed[:-1],speed[1:])
+                max_a=float(np.sqrt(ac*ac+(peak_v*w)**2).max(initial=0))
+                dynamic_ok=(audit['v_max_satisfied'] and audit['omega_max_satisfied'] and max_a<=1.+1e-8 and
+                            audit['velocity_update_residual_max_m_s']<1e-8 and
+                            audit['exact_unicycle_position_residual_max_m']<1e-8)
             regions=audit.get('regions',{})
             region_ok=all(regions.get(k,0)==0 for k in ('invalid_region_anchors','uncertified_guidance_edges','uncertified_actual_state_joins'))
             backend_updates=len(d['backend_ticks'])
@@ -49,7 +54,7 @@ def summarize(root):
             backend_times_actual=d['backend_ticks']*dt
         else:
             targets=np.broadcast_to(d['goal_center']+d['reference'],states[:,:,:2].shape)
-            speed=np.r_[np.zeros((1,n)),np.abs(d['controls'][:,:,0])]
+            speed=np.linalg.norm(d['uav_states'][:,:,3:6],axis=-1) if is_uav else np.r_[np.zeros((1,n)),np.abs(d['controls'][:,:,0])]
             safe=bool(audit['passed']);region_ok=safe
             clearance=audit['known_grid_clearance_lower_bound']
             pair_distance=audit['minimum_pair_distance'];max_a=audit['max_acceleration']
@@ -68,7 +73,7 @@ def summarize(root):
         center_dist=np.linalg.norm(states[:,:,:2].mean(axis=1)-d['goal_center'],axis=1)
         nearby=np.flatnonzero(center_dist<5.)
         stage=metrics['timings_seconds']
-        row={'route':config['route'],'seed':config['seed'],'termination':metrics['termination'],
+        row={'route':config['route'],'backend':'mppi' if is_paper else 'bezier','dynamics':config.get('dynamics','differential_drive'),'seed':config['seed'],'termination':metrics['termination'],
              'common_goal_met_at_end':endpoint_hit,'success_with_safety_and_dynamics':bool(endpoint_hit and safe and dynamic_ok and region_ok),
              'common_first_arrival_s':float(hit[0]*dt) if len(hit) else None,
              'first_within_5m_s':float(nearby[0]*dt) if len(nearby) else None,
@@ -93,12 +98,20 @@ def summarize(root):
         (case/'common_evaluation.json').write_text(json.dumps(row,indent=2))
     report={'protocol':{'map':'same 50 square pillars, map seed1, 50x40m; triangle6 spacing3.5m',
                         'rates_hz':{'execution':50,'perception':5,'frontend':1,'backend':1},
-                        'max_time_s':500,'common_goal':'every assigned robot <0.4m, every speed <0.1m/s',
+                        'dynamics':rows[0]['dynamics'],'max_time_s':500,'common_goal':'every assigned robot <0.4m, every speed <0.1m/s',
                         'fairness_notes':['All routes use the same optimized static observed-grid/FIRI/distance-query implementation.',
-                            'Paper routes retain 20x35x256 frontend sampling and 1120x35 MPPI; RRT uses250 iterations. Search work budgets are deliberately reported, not equated.',
+                            'For UAV: same 1.5 m/s speed and assumed 1 m/s^2 acceleration limits; MPPI enforces them by paper soft costs, centralized optimization by hard constraints. Fixed altitude 1 m.',
+                            'Paper frontends retain 20x35x256 sampling; RRT uses250 iterations. Every MPPI backend uses1120x35 sampling. Search work budgets are deliberately reported, not equated.',
                             'MPPI prediction/control knots remain0.2s (7s prediction horizon); optimize every1s and execute five knots at0.02s substeps.',
-                            'Centralized execution is an analytic continuous flat-output trajectory; MPPI execution is midpoint unicycle integration. No common noisy tracking-controller claim.',
-                            'Periodic rates are nominal simulation-time schedules, with terminal commitment and tail-recovery events for RRT. Solver wall time does not advance simulated time.']},'runs':rows}
+                            'Centralized execution is an analytic continuous flat-output trajectory; MPPI execution uses the recorded dynamics integration (Euler for UAV, midpoint for differential drive). No common noisy tracking-controller claim.',
+                            'Periodic rates are nominal simulation-time schedules; optional Bezier backend has terminal commitment and tail-recovery events. Solver wall time does not advance simulated time.']},'runs':rows}
+    if all(row['backend']=='mppi' for row in rows):
+        report['protocol']['fairness_notes']=[
+            'All routes share the same MPPI implementation, parameters, Euler integration for UAV, and 50/5/1/1 Hz schedule.',
+            'Paper sequence frontends use20x35x256 candidates; RRT frontend uses250 iterations and 0.55 m/s polyline guidance resampling preserving vertices.',
+            'UAV speed1.5 m/s and assumed acceleration1 m/s^2 are soft MPPI costs, not clipped hard limits.',
+            'The RRT route keeps robot-slot identities fixed; paper frontends retain their assignment step.',
+            'Compute time does not advance simulation time.']
     (root/'summary.json').write_text(json.dumps(report,indent=2))
     with (root/'summary.csv').open('w') as f:
         writer=csv.DictWriter(f,fieldnames=rows[0].keys());writer.writeheader();writer.writerows(rows)

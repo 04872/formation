@@ -429,7 +429,7 @@ namespace firi
                 {
                     if (pcFlags(j))
                     {
-                        if (forwardH.block<1, 3>(nH, 0).dot(forwardPC.col(j)) + forwardH(nH, 3) > -epsilon)
+                        if (forwardH.block<1, 3>(nH, 0).dot(forwardPC.col(j)) + forwardH(nH, 3) > 0.0)
                         {
                             pcFlags(j) = 0;
                         }

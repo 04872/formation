@@ -11,6 +11,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--route',required=True,choices=['paper_uniform','paper_affine','rrt_affine'])
+    p.add_argument('--rrt-backend',choices=['mppi','bezier'],default='mppi')
+    p.add_argument('--dynamics',choices=['differential_drive','uav'],default='differential_drive')
     p.add_argument('--seed',type=int,default=0)
     p.add_argument('--max-time',type=float,default=500.)
     p.add_argument('--obstacle-count',type=int,default=50)
@@ -19,24 +21,32 @@ def main():
     p.add_argument('--progress',action='store_true')
     a=p.parse_args();out=a.output/a.route/f'seed_{a.seed}'
     out.mkdir(parents=True,exist_ok=True)
-    protocol={'route':a.route,'seed':a.seed,'map_seed':a.map_seed,
+    from formation.paper_formation.sfc import SFC_GEOMETRY_VERSION
+    protocol={'route':a.route,'backend':a.rrt_backend if a.route=='rrt_affine' else 'mppi','frontend':'rrt' if a.route=='rrt_affine' else 'paper','dynamics':a.dynamics,'seed':a.seed,'map_seed':a.map_seed,
               'scene':'random_pillars','obstacle_count':a.obstacle_count,'pillar_width':.3,
               'formation':'triangle6','spacing':3.5,'start_center':[5.,20.],'goal_center':[45.,20.],
               'execution_dt':.02,'perception_period':.2,'frontend_period':1.,'backend_period':1.,
-              'max_time':a.max_time,'stagnation_timeout':32.,'v_max':.65,'omega_max':1.5,
+              'sfc_geometry_version':SFC_GEOMETRY_VERSION,
+              'max_time':a.max_time,'stagnation_timeout':32.,'v_max':1.5 if a.dynamics=='uav' else .65,'a_max':1.,'omega_max':None if a.dynamics=='uav' else 1.5,
               'goal_max_robot_error':.4,'goal_max_robot_speed':.1,
               'execution_note':'Differential-drive kinematics. MPPI executes acceleration/yaw-rate in 0.02 s midpoint substeps; Bezier uses analytic flat-output execution. No actuator/tracking error model.',
               'timing_note':'Offline synchronous simulation; compute time does not advance simulation time.'}
+    if a.dynamics=='uav':
+        protocol['execution_note']='Paper Eq.4 jerk-driven integrator at fixed altitude. MPPI uses 0.02 s Euler execution and matching composed prediction steps; Bezier executes analytic p/v/a/jerk. Yaw is independent of translation.'
+        protocol['parameter_provenance']='v_max=1.5 from paper; a_max=1, altitude=1 and formation spacing are experiment assumptions.'
+    if protocol['backend']=='mppi':
+        protocol['execution_note']=('Paper Eq.4 jerk-driven UAV; 0.02 s Euler execution with matching composed prediction steps and independent yaw.' if a.dynamics=='uav' else 'Differential-drive midpoint execution at 0.02 s.')
     (out/'configuration.json').write_text(json.dumps(protocol,indent=2))
-    if a.route.startswith('paper_'):
+    if a.route.startswith('paper_') or a.rrt_backend=='mppi':
         from formation.paper_formation.config import CONFIG
         from formation.paper_formation.simulation import simulate
         from formation.paper_formation.outputs import write_outputs
-        mode=a.route.removeprefix('paper_')
+        mode='affine' if a.route=='rrt_affine' else a.route.removeprefix('paper_')
         result=simulate('random_pillars',mode,a.seed,obstacle_count=a.obstacle_count,map_seed=a.map_seed,
                         formation='triangle6',formation_spacing=3.5,pillar_width=.3,
                         start_center=[5.,20.],goal_center=[45.,20.],progress=a.progress,
-                        replan_period=1.,backend_period=1.,execution_dt=.02,
+                        frontend='rrt' if a.route=='rrt_affine' else 'paper',rrt_iterations=250,
+                        dynamics=a.dynamics,replan_period=1.,backend_period=1.,execution_dt=.02,
                         max_time=a.max_time,stagnation_timeout=32.)
         output_args=argparse.Namespace(scene='random_pillars',mode=mode,seed=a.seed,
             map_seed=a.map_seed,obstacle_count=a.obstacle_count,output=str(out),exact_output=True,
@@ -48,12 +58,18 @@ def main():
                             'candidates_per_step':CONFIG.candidates,'mppi_samples':CONFIG.samples,
                             'mppi_horizon':CONFIG.horizon,'mppi_prediction_dt':.2,
                             'executed_control_knots_per_optimization':5}
+        if a.route.startswith('paper_'):
+            protocol['budget']['min_radius'] = CONFIG.uniform_min_radius if mode == 'uniform' else 0.1
+            protocol['budget']['radius_sampling'] = 'r = min_radius * (1 + gamma), gamma uniform [0,1)'
+        if a.route=='rrt_affine':
+            protocol['budget']={k:v for k,v in protocol['budget'].items() if k not in ('sequences','sequence_steps','candidates_per_step')}
+            protocol['budget'].update(rrt_iterations=250,guidance_reference_speed_m_s=.55)
     else:
         from formation.local_affine.simulation import simulate
         from formation.local_affine.outputs import save
         result=simulate(scene='random_pillars',mode='affine',formation='triangle6',spacing=3.5,
                         obstacle_count=a.obstacle_count,map_seed=a.map_seed,seed=a.seed,
-                        dt=.02,perception_period=.2,replan_period=1.,max_time=a.max_time,progress=a.progress)
+                        dynamics=a.dynamics,dt=.02,perception_period=.2,replan_period=1.,max_time=a.max_time,progress=a.progress)
         save(result,str(out),'random_pillars','affine',a.seed,a.map_seed,a.obstacle_count,250,.02,exact_output=True)
         protocol['budget']={'rrt_iterations':250,'max_bezier_segments':3,
                             'max_backend_route_candidates':3,
@@ -68,6 +84,8 @@ def main():
                             'angular_refinement':'certificate violation locations; no relaxed retries; full post-solve constraint check',
                             'maximum_solver_calls_per_round':12,
                             'objective':'physical-time integrals of workspace position tracking, reference velocity tracking and acceleration'}
+    if a.dynamics=='uav' and a.route=='rrt_affine' and a.rrt_backend=='bezier':
+        protocol['budget'].update(angular_refinement_max_iterations=0,angular_refinement_target_rad_s=None,angular_refinement='not applicable: independent UAV yaw',maximum_solver_calls_per_round=3,time_allocation='per-edge max-robot displacement / 0.55 m/s (unchanged from DD); execution-step quantized with derivative feasibility checks',reference_speed_m_s=.55)
     (out/'configuration.json').write_text(json.dumps(protocol,indent=2))
 
 

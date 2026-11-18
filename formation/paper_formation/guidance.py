@@ -48,7 +48,7 @@ def guide(q0, world, rng, mode, regions, current, assignment, goal, sequences=CO
                 # order: angle, radius, scale, before moving to the next one.
                 draws=rng.random((candidates,3))
                 angles[:]=direction+(-np.pi/2+draws[:,0]*np.pi)
-                radii=.1+draws[:,1]*(.2-.1)
+                radii=CONFIG.uniform_min_radius*(1.+draws[:,1])
                 samples[:,0]=q[0]+radii*np.cos(angles)
                 samples[:,1]=q[1]+radii*np.sin(angles)
                 samples[:,2]=.42+draws[:,2]*(1.3-.42)

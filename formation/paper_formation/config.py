@@ -11,6 +11,7 @@ class SimulationConfig:
     max_angular_speed: float = 1.5
     sequences: int = 20
     candidates: int = 256
+    uniform_min_radius: float = 0.3
     steps: int = 35
     samples: int = 1120
     horizon: int = 35

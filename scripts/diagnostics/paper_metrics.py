@@ -47,9 +47,10 @@ def physical_obstacle_distance(states, rectangles, extent, wall_thickness):
     return output
 
 
-def read_case(path,route,seed):
+def read_case(path,route,seed,common=None):
     metrics=json.loads((path/'metrics.json').read_text())
-    common=json.loads((path/'common_evaluation.json').read_text())
+    if common is None:
+        common=json.loads((path/'common_evaluation.json').read_text())
     with np.load(path/'trajectory.npz') as z:
         states=z['states'][:,:,:2];dt=float(z['dt']);radius=float(z['robot_radius'])
         reference=z['centered_reference'] if 'centered_reference' in z.files else z['reference']
@@ -62,12 +63,12 @@ def read_case(path,route,seed):
     times=np.arange(len(states))*dt
     ef_mean=float(np.trapezoid(errors,times)/duration) if duration else float(errors[0])
     stages=metrics['timings_seconds']
-    if route=='rrt_affine':
+    if backend_updates is None:
         plans=json.loads((path/'plans.json').read_text())['plans']
         backend=[p['timings']['backend'] for p in plans if p.get('attempts')]
         tsol_ms=float(np.mean(backend)*1000) if backend else None
         backend_updates=len(backend)
-        tsol_note='mean per centralized backend invocation, including main trajectory, independent braking reserve and angular refinement'
+        tsol_note='mean per centralized backend invocation, including all candidate solves and any dynamics-specific refinement'
     else:
         # This total includes four cheap nominal-sequence advances per MPPI
         # update; it is an amortized per-optimization estimate, not isolated latency.
@@ -75,7 +76,7 @@ def read_case(path,route,seed):
         tsol_note='backend total / MPPI optimization count; includes control-sequence reuse overhead'
     front_updates=common['planning_rounds']
     success=bool(common['success_with_safety_and_dynamics'])
-    row={'route':route,'seed':seed,'termination':metrics['termination'],'success_with_safety_and_dynamics':success,
+    row={'route':route,'backend':common.get('backend','bezier' if route=='rrt_affine' else 'mppi'),'seed':seed,'termination':metrics['termination'],'success_with_safety_and_dynamics':success,
          'censored':not success,'observed_duration_s':duration,'t_fly_s':duration if success else None,
          'robot_radius_m':radius,
          'd_safe_center_to_obstacle_m':float(distances.min()),'d_safe_body_clearance_m':float(distances.min()-radius),
@@ -97,6 +98,8 @@ def main():
     traces=out/'metric_traces';traces.mkdir(exist_ok=True);rows=[]
     fig,axes=plt.subplots(2,2,figsize=(13,8),sharex='col',constrained_layout=True)
     labels={'paper_uniform':'Paper uniform + MPPI','paper_affine':'Paper affine + MPPI','rrt_affine':'Local RRT* + Bezier'}
+    rrt_config=json.loads((args.root/'rrt_affine/seed_0/configuration.json').read_text())
+    if rrt_config.get('backend')=='mppi':labels['rrt_affine']='Local RRT* + MPPI'
     colors={'paper_uniform':'#d95f02','paper_affine':'#7570b3','rrt_affine':'#1b9e77'}
     for route in ROUTES:
         for seed in (0,1):

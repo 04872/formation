@@ -28,6 +28,9 @@ class Result:
     timings: dict
     schedule: dict
     perception_ticks: list
+    dynamics: str = "differential_drive"
+    uav_states: object = None
+    uav_controls: object = None
 
 
 def _bezier(control, u):
@@ -87,7 +90,7 @@ def endpoint_directions(segment, E, start):
     return directions,found
 
 
-def allocate_duration(route, E, velocity, acceleration, dt, min_horizon=0., terminal_goal=False, reserve=False):
+def allocate_duration(route, E, velocity, acceleration, dt, min_horizon=0., terminal_goal=False, reserve=False, vmax=.65):
     """Select one physical time; initial-point failures remain explicit."""
     distances=[max(np.linalg.norm(e@(b-a)) for e in E) for a,b in zip(route[:-1],route[1:])]
     length=max(distances, default=0.)
@@ -98,10 +101,10 @@ def allocate_duration(route, E, velocity, acceleration, dt, min_horizon=0., term
         return np.ceil(durations/dt-1e-12)*dt
     speed=max(np.linalg.norm(e@velocity) for e in E)
     accel=max(np.linalg.norm(e@acceleration) for e in E)
-    estimate=max(length/.65, 2*np.sqrt(length), 2*speed, 2*accel,
+    estimate=max(length/vmax, 2*np.sqrt(length), 2*speed, 2*accel,
                  min_horizon/max(1,len(distances)),dt)
     if terminal_goal and speed<1e-10 and accel<1e-10 and len(distances)==1:
-        estimate=max(estimate,5*length/.65,np.sqrt(20*length))
+        estimate=max(estimate,5*length/vmax,np.sqrt(20*length))
     if reserve:
         estimate=max(estimate,3*speed)
     return np.ceil(estimate/dt-1e-12)*dt
@@ -127,7 +130,7 @@ def initial_controls_feasible(optimizer, duration):
     return all(np.linalg.norm(e@v)<=optimizer.vmax+1e-8 for e in optimizer.E for v in velocities) and all(np.linalg.norm(e@a)<=optimizer.amax+1e-8 for e in optimizer.E for a in accelerations)
 
 
-def precheck_route(route, regions, reference, E, velocity, acceleration, mode, duration):
+def precheck_route(route, regions, reference, E, velocity, acceleration, mode, duration, vmax=.65):
     """Check the initial control points without constructing a cone program."""
     cert=certify_edge(route[0],route[1],regions,reference)
     if cert is None:
@@ -135,14 +138,14 @@ def precheck_route(route, regions, reference, E, velocity, acceleration, mode, d
     u,_,vh=np.linalg.svd(((route[0][2:]+route[1][2:])/2).reshape(2,2))
     candidate=SimpleNamespace(route=route,initial_velocity=velocity,initial_acceleration=acceleration,
         certs=[cert],template=SimpleNamespace(rotations=[SimpleNamespace(value=u@vh)]),
-        mode=mode,regions=regions,E=E,pairs=list(combinations(range(len(E)),2)),vmax=.65,amax=1.)
+        mode=mode,regions=regions,E=E,pairs=list(combinations(range(len(E)),2)),vmax=vmax,amax=1.)
     return initial_controls_feasible(candidate,duration)
 
 
 def simulate(scene='random_pillars', mode='affine', formation='triangle6', spacing=3.5,
              obstacle_count=50, map_seed=1, seed=0, iterations=250, max_steps=None,
              dt=.02, replan_steps=None, progress=False, perception_period=.2,
-             replan_period=4., max_time=500.):
+             replan_period=4., max_time=500., dynamics="differential_drive", uav_altitude=1.):
     if replan_steps is not None:
         replan_period=replan_steps*dt
     if max_steps is not None:
@@ -150,6 +153,7 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
     if dt<=0 or perception_period<=0 or replan_period<=0 or max_time<=0:
         raise ValueError('Execution step, periods and maximum time must be positive')
     max_steps=int(np.floor(max_time/dt+1e-10))
+    vmax=1.5 if dynamics=="uav" else .65
     started=time.perf_counter();rng=np.random.default_rng(seed)
     geom=FormationGeometry(formation,spacing);ref=geom.centered_reference;E=matrix(ref);n=len(ref)
     world=World(scene,size=(500,400) if scene=='open' else (120,80),
@@ -158,6 +162,9 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
     q=np.r_[world.start,np.eye(2).ravel()];goal=np.r_[world.goal,np.eye(2).ravel()]
     qv=np.zeros(6);qa=np.zeros(6);yaw=np.zeros(n)
     states=[np.column_stack((robot_positions(q,ref),yaw))];qs=[q.copy()]
+    uav_states=[];uav_controls=[]
+    if dynamics=="uav":
+        initial=np.zeros((n,10));initial[:,:2]=states[0][:,:2];initial[:,2]=uav_altitude;uav_states.append(initial)
     controls=[];plans=[];known=[];execution=[]; active=[];active_index=0;active_time=0.;active_id=-1
     turn_target=None; stuck=0;stalled_since=None;termination='timeout'; evaluators=[]
     terminal_committed=False
@@ -206,20 +213,20 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
                     goal_candidate=np.array_equal(candidate[-1],goal)
                     min_horizon=0. if goal_candidate else replan_period+dt
                     if goal_candidate and len(candidate)==2:
-                        duration=goal_duration(q,goal,qv,qa,regions,ref,E,dt)
+                        duration=goal_duration(q,goal,qv,qa,regions,ref,E,dt,vmax=vmax,dynamics=dynamics)
                     else:
                         duration=allocate_duration(candidate,E,qv,qa,dt,min_horizon,
-                                                   terminal_goal=goal_candidate)
+                                                   terminal_goal=goal_candidate,vmax=vmax)
                     if duration is None:
                         precheck_rejected+=1
                         continue
                     first_duration=float(np.asarray(duration).reshape(-1)[0])
-                    if not precheck_route(candidate,regions,ref,E,qv,qa,mode,first_duration):
+                    if not precheck_route(candidate,regions,ref,E,qv,qa,mode,first_duration,vmax=vmax):
                         precheck_rejected+=1
                         continue
                     optimizer=TrajectoryOptimizer(candidate,regions,ref,qv,qa,mode,
                                                   template_cache=trajectory_templates,
-                                                  terminal_goal=goal_candidate)
+                                                  terminal_goal=goal_candidate,vmax=vmax,dynamics=dynamics)
                     if optimizer.problem is None:continue
                     route_q=candidate;is_goal=goal_candidate;selected_route=branch
                     found=optimizer.solve(duration)
@@ -252,7 +259,7 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
                     terminal_committed=record['terminal_committed']
                     evaluators=[_SegmentEvaluation(s,E) for s in found]
                     # At rest, rotate in place toward the initial nonzero direction.
-                    if np.max(np.abs(qv))<1e-8 and np.max(np.abs(qa))<1e-8:
+                    if dynamics!="uav" and np.max(np.abs(qv))<1e-8 and np.max(np.abs(qa))<1e-8:
                         vectors,moving_departure=endpoint_directions(found[0],E,True)
                         turn_target=yaw.copy()
                         turn_target[moving_departure]=np.arctan2(vectors[moving_departure,1],vectors[moving_departure,0])
@@ -268,7 +275,7 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
                 (np.max(np.abs(qv))>1e-12 or np.max(np.abs(qa))>1e-12)):
             termination='trajectory_exhausted';break
         stamp=time.perf_counter()
-        command=np.zeros((n,2));event={'tick':tick,'kind':'idle'}
+        command=np.zeros((n,4 if dynamics=="uav" else 2));event={'tick':tick,'kind':'idle'}
         if turn_target is not None:
             delta=np.arctan2(np.sin(turn_target-yaw),np.cos(turn_target-yaw))
             change=np.clip(delta,-1.5*dt,1.5*dt);yaw+=change;command[:,1]=change/dt
@@ -279,13 +286,17 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
             seg=active[active_index];start=active_time/seg['duration']
             active_time=min(active_time+dt,seg['duration']);end=active_time/seg['duration']
             evaluator=evaluators[active_index]
+            if dynamics=="uav":
+                jerk=60*np.diff(evaluator.control,n=3,axis=0)/seg['duration']**3
+                command[:,:2]=np.einsum('nij,j->ni',E,_bezier(jerk,start))
             q,qv,qa=evaluator.evaluate(end);vel=np.einsum('nij,j->ni',E,qv)
-            speed=np.linalg.norm(vel,axis=1);direction,moving,omega=evaluator.direction_and_omega(end)
-            yaw[moving]=np.arctan2(direction[moving,1],direction[moving,0]);command[:,0]=speed
-            command[moving,1]=omega[moving]
+            if dynamics!="uav":
+                speed=np.linalg.norm(vel,axis=1);direction,moving,omega=evaluator.direction_and_omega(end)
+                yaw[moving]=np.arctan2(direction[moving,1],direction[moving,0]);command[:,0]=speed
+                command[moving,1]=omega[moving]
             if start_curve_pending:
                 next_replan=now+replan_period;start_curve_pending=False
-            if end>=1.-1e-12:
+            if dynamics!="uav" and end>=1.-1e-12:
                 direction,has_direction=endpoint_directions(seg,E,False)
                 stopped=~moving & has_direction
                 yaw[stopped]=np.arctan2(direction[stopped,1],direction[stopped,0])
@@ -296,12 +307,16 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
                     if terminal_committed:
                         # The exact global-goal trajectory ends at rest.
                         qv=np.zeros(6);qa=np.zeros(6)
-                        command[:,0]=0.;command[:,1]=0.
+                        if dynamics!="uav":command[:,0]=0.;command[:,1]=0.
                 active_index+=1;active_time=0.
                 if active_index>=len(active):
                     active=[];active_index=0;terminal_committed=False
                     next_replan=min(next_replan,now+dt);next_trigger='tail_exhausted'
         controls.append(command);states.append(np.column_stack((robot_positions(q,ref),yaw)));qs.append(q.copy());execution.append(event)
+        if dynamics=="uav":
+            current=np.zeros((n,10));current[:,:2]=states[-1][:,:2];current[:,2]=uav_altitude
+            current[:,3:5]=np.einsum('nij,j->ni',E,qv);current[:,6:8]=np.einsum('nij,j->ni',E,qa);current[:,9]=yaw
+            uav_states.append(current);uav_controls.append(command.copy())
         timings['execution']+=time.perf_counter()-stamp
         if (not active and turn_target is None and
                 np.max(np.linalg.norm(robot_positions(q,ref)-robot_positions(goal,ref),axis=1))<.1 and
@@ -313,4 +328,4 @@ def simulate(scene='random_pillars', mode='affine', formation='triangle6', spaci
               'max_time':max_time,'effective_max_time':max_steps*dt,'max_steps':max_steps,
               'stagnation_timeout':32.,'consecutive_failures_at_end':stuck,
               'perception_updates':len(perception_ticks)}
-    return Result(world,ref,np.asarray(states),np.asarray(qs),np.asarray(controls),plans,known,execution,termination,time.perf_counter()-started,timings,schedule,perception_ticks)
+    return Result(world,ref,np.asarray(states),np.asarray(qs),np.asarray(controls),plans,known,execution,termination,time.perf_counter()-started,timings,schedule,perception_ticks,dynamics,np.asarray(uav_states) if dynamics=="uav" else None,np.asarray(uav_controls) if dynamics=="uav" else None)

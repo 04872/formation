@@ -16,7 +16,8 @@ def save(result, output, scene, mode, seed, map_seed, obstacle_count, iterations
     hparts=[np.asarray(s['H']) for _,s in segments]
     bparts=[np.asarray(s['b']) for _,s in segments]
     offsets=np.r_[0,np.cumsum([len(h) for h in hparts])]
-    np.savez_compressed(out/'trajectory.npz',states=result.states,controls=result.controls,
+    extra=({"uav_states":result.uav_states,"uav_controls":result.uav_controls,"uav_altitude":float(result.uav_states[0,0,2])} if result.dynamics=="uav" else {"omega_max":1.5})
+    np.savez_compressed(out/'trajectory.npz',dynamics=result.dynamics,**extra,states=result.states,controls=result.controls,
         configurations=result.configurations,reference=result.reference,occupancy=w.truth,
         known_history=np.asarray(result.known_history),resolution=w.res,origin=np.zeros(2),
         dt=dt,times=np.arange(len(result.states))*dt,
@@ -24,7 +25,7 @@ def save(result, output, scene, mode, seed, map_seed, obstacle_count, iterations
         perception_period=result.schedule['perception_period'],replan_period=result.schedule['replan_period'],
         robot_radius=.16,start_center=w.start,goal_center=w.goal,
         circles=w.circles,rectangles=w.rectangles,obstacle_centers=w.obstacle_centers,
-        v_max=.65,a_max=1.,omega_max=1.5,map_seed=map_seed,
+        v_max=1.5 if result.dynamics=="uav" else .65,a_max=1.,map_seed=map_seed,
         bezier_controls=np.asarray([s['control_points'] for _,s in segments]).reshape(-1,6,6),
         bezier_durations=np.asarray([s['duration'] for _,s in segments]),
         bezier_plan_indices=np.asarray([i for i,_ in segments],dtype=int),
@@ -40,7 +41,9 @@ def save(result, output, scene, mode, seed, map_seed, obstacle_count, iterations
              'timing_note':'sfc includes any lazy distance-field and obstacle-index refresh triggered by SFC queries',
              'plans':len(result.plans),'successful_plans':sum(p['status']=='ok' for p in result.plans),
              'tree_iterations':iterations,'seed':seed,'map_seed':map_seed,'obstacle_count':obstacle_count,
-             'note':'Numerical polynomial angular-speed checks; true occupancy used only by sensor and output.'}
+             'note':('Analytic Bézier UAV p/v/a with instantaneous jerk, fixed altitude and independent fixed yaw; true occupancy used only by sensor and output.' if result.dynamics=='uav' else 'Numerical polynomial angular-speed checks; true occupancy used only by sensor and output.'),
+             'dynamics':result.dynamics, 'v_max':1.5 if result.dynamics=='uav' else .65, 'a_max':1.,
+             'reference_speed_m_s':.55}
     metrics['schedule']=result.schedule
     metrics['phase_seconds']={kind:dt*sum(e['kind']==kind for e in result.execution)
                               for kind in ('idle','turn','curve')}

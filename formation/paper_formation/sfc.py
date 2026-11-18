@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 from .config import RADIUS
 
+SFC_GEOMETRY_VERSION = 'gcopter_old_firi_planar_disk_seed_strict_separation_v2'
+
 
 class SFCConstructionError(RuntimeError):
     """The FIRI region cannot safely contain the current robot anchor."""
