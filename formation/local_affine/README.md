@@ -19,3 +19,16 @@ MPLCONFIGDIR=/tmp/mpl-formation OPENBLAS_NUM_THREADS=1 /home/eai/projects/env-re
 三路线 UAV 对比入口：`scripts/experiments/compare_formation_routes.py --dynamics uav --route paper_uniform|paper_affine|rrt_affine --seed 0 --output results/three_routes/uav_comparison`。固定高度下采用论文位置/速度/加速度积分链与独立偏航，速度上限 1.5 m/s，加速度上限 1 m/s² 为实验假设；集中式解析输出 p/v/a/jerk，不施加差速曲率约束，局部参考速度仍为 0.55 m/s。MPPI 保留软动力学代价，集中式保留硬速度/加速度界。两者执行模型与数值步长详见结果配置。
 
 第三条路线现默认使用 `compare_formation_routes.py --route rrt_affine --rrt-backend mppi`，由 `mppi_frontend.py` 将 RRT* 折线转成引导点，复用论文 MPPI 仿真循环；`--rrt-backend bezier` 保留上述集中式后端。新对比结果位于 `results/three_routes/uav_rrt_mppi/`。
+
+历史可见性图选枝通过 `--history-decision` 开启，仅适用于 `--route rrt_affine --rrt-backend mppi`；默认关闭，保留原 RRT* 评分。以下分别运行非凸死胡同和随机柱场景；去掉 `--history-decision` 并使用另一个输出目录，可运行相同种子的原评分对照。
+
+```bash
+MPLCONFIGDIR=/tmp/mpl-formation OPENBLAS_NUM_THREADS=1 /home/eai/projects/env-rebuilt/bin/python scripts/experiments/compare_formation_routes.py --route rrt_affine --rrt-backend mppi --dynamics uav --scene history_deadend --seed 0 --history-decision --progress --output results/history_deadend
+MPLCONFIGDIR=/tmp/mpl-formation OPENBLAS_NUM_THREADS=1 /home/eai/projects/env-rebuilt/bin/python scripts/experiments/compare_formation_routes.py --route rrt_affine --rrt-backend mppi --dynamics uav --scene random_pillars --map-seed 1 --seed 0 --history-decision --progress --output results/history_random_pillars
+```
+
+`planning.json` 中记录每个合格候选末端的树代价、逐成员欧氏距离、图上距离和评分，并记录原评分与实际选中末端。当任一成员的图查询缺失时，本轮所有候选统一使用原欧氏距离评分；否则使用历史图距离的成员均方根，权重与原评分相同。图查询允许未被已知障碍阻断的未知连接作为尝试性估计，它不认证后续编队运动；实际引导始终来自当前逐成员 SFC 认证的树。目标直连和没有合格候选的情况沿用原前端处理。
+
+历史联合路径模式使用 `--history-joint-path`，与 `--history-decision` 互斥，仅适用于 RRT 仿射前端和 MPPI 后端。它保存合格引导上的已认证联合运动，以短连接接入当前工作图；将任一成员的感知圆盘覆盖到尚未观测栅格的配置作为观测边界，按图上到边界的运动代价加逐成员余程评价候选。目标配置的终端值为零；所有候选均无法到达边界或目标时整轮回退到原评分。只有实际运动获得的观测更新累计地图。`planning.json` 的 `history_decision` 记录边界数量、`round_fallback` 和每个候选的 `observation_boundary` 等诊断。
+
+闭环消融可同时传入 `--history-joint-path --history-current-motion-only`：累计地图、历史 SFC 和逐成员启发式不变，评价图只使用当轮运动。配置会记录 `history_current_motion_only`。

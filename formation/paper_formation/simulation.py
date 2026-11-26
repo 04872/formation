@@ -52,7 +52,7 @@ class SimulationResult:
     frontend_metadata: list | None = None
     rrt_iterations: int = 250
 
-def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: int=CONFIG.sequences, steps: int=CONFIG.steps, candidates: int=CONFIG.candidates, samples: int=CONFIG.samples, obstacle_count: int=50, map_seed: int=0, horizon: int=CONFIG.horizon, progress: bool=False, guidance_weight: float=CONFIG.guidance_weight, smoothness_weight: float=CONFIG.smoothness_weight, formation: str="square4", formation_spacing: float=1.3, pillar_width: float=1.0, start_center: list[float] | None=None, goal_center: list[float] | None=None, dynamics: str='differential_drive', uav_altitude: float=1.0, replan_period: float | None=None, max_time: float | None=None, stagnation_timeout: float | None=None, execution_dt: float=DT, backend_period: float | None=None, frontend: str='paper', rrt_iterations: int=250) -> SimulationResult:
+def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: int=CONFIG.sequences, steps: int=CONFIG.steps, candidates: int=CONFIG.candidates, samples: int=CONFIG.samples, obstacle_count: int=50, map_seed: int=0, horizon: int=CONFIG.horizon, progress: bool=False, guidance_weight: float=CONFIG.guidance_weight, smoothness_weight: float=CONFIG.smoothness_weight, formation: str="square4", formation_spacing: float=1.3, pillar_width: float=1.0, start_center: list[float] | None=None, goal_center: list[float] | None=None, dynamics: str='differential_drive', uav_altitude: float=1.0, replan_period: float | None=None, max_time: float | None=None, stagnation_timeout: float | None=None, execution_dt: float=DT, backend_period: float | None=None, frontend: str='paper', rrt_iterations: int=250, history_decision: bool=False, history_joint_path: bool=False, history_link_epsilon: float=.4, history_current_motion_only: bool=False) -> SimulationResult:
     """Run perception, shared SFC generation, guidance, and rolling distributed MPPI."""
     simulation_started=time.perf_counter()
     replan_period=CONFIG.replan_steps*DT if replan_period is None else replan_period
@@ -111,7 +111,8 @@ def simulate(scene: str, mode: str, seed: int, max_steps: int=350, sequences: in
         planner = FormationGuidance(mode, rng, sequences, steps, candidates, geometry)
     elif frontend=='rrt':
         from formation.local_affine.mppi_frontend import RRTMPPIFrontend
-        planner = RRTMPPIFrontend(mode, rng, geometry, rrt_iterations)
+        frontend_options = {'history_decision': history_decision, 'history_joint_path': history_joint_path, 'history_link_epsilon': history_link_epsilon, 'history_current_motion_only': history_current_motion_only}
+        planner = RRTMPPIFrontend(mode, rng, geometry, rrt_iterations, **frontend_options)
     else:
         raise ValueError('frontend must be paper or rrt')
     frontend_metadata=[]

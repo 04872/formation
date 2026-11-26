@@ -17,13 +17,28 @@ def main():
     p.add_argument('--max-time',type=float,default=500.)
     p.add_argument('--obstacle-count',type=int,default=50)
     p.add_argument('--map-seed',type=int,default=1)
+    p.add_argument('--scene',choices=['random_pillars','history_deadend'],default='random_pillars')
+    p.add_argument('--history-decision',action='store_true',help='use the history visibility graph to select RRT candidate branches')
+    p.add_argument('--history-joint-path',action='store_true',help='reuse certified joint paths for boundary-based branch selection')
+    p.add_argument('--history-current-motion-only',action='store_true',help='with joint history, use only current-round motion while retaining the map and SFC history')
+    p.add_argument('--history-link-epsilon',type=float,default=.4,help='maximum certified short-link cost (default: 0.4 m)')
     p.add_argument('--output',type=Path,default=Path('results/three_routes/matched_rates'))
     p.add_argument('--progress',action='store_true')
-    a=p.parse_args();out=a.output/a.route/f'seed_{a.seed}'
+    a=p.parse_args()
+    if (a.history_decision or a.history_joint_path) and (a.route!='rrt_affine' or a.rrt_backend!='mppi'):
+        p.error('history modes require --route rrt_affine --rrt-backend mppi')
+    if a.history_decision and a.history_joint_path:
+        p.error('history modes are mutually exclusive')
+    if a.history_current_motion_only and not a.history_joint_path:
+        p.error('--history-current-motion-only requires --history-joint-path')
+    if a.history_link_epsilon <= 0:
+        p.error('--history-link-epsilon must be positive')
+    out=a.output/a.route/f'seed_{a.seed}'
     out.mkdir(parents=True,exist_ok=True)
     from formation.paper_formation.sfc import SFC_GEOMETRY_VERSION
     protocol={'route':a.route,'backend':a.rrt_backend if a.route=='rrt_affine' else 'mppi','frontend':'rrt' if a.route=='rrt_affine' else 'paper','dynamics':a.dynamics,'seed':a.seed,'map_seed':a.map_seed,
-              'scene':'random_pillars','obstacle_count':a.obstacle_count,'pillar_width':.3,
+              'scene':a.scene,'obstacle_count':a.obstacle_count if a.scene=='random_pillars' else 3,'pillar_width':.3 if a.scene=='random_pillars' else None,
+              'history_decision':a.history_decision,'history_joint_path':a.history_joint_path,'history_current_motion_only':a.history_current_motion_only,'history_link_epsilon':a.history_link_epsilon,'per_robot_perception_radius_m':3.,
               'formation':'triangle6','spacing':3.5,'start_center':[5.,20.],'goal_center':[45.,20.],
               'execution_dt':.02,'perception_period':.2,'frontend_period':1.,'backend_period':1.,
               'sfc_geometry_version':SFC_GEOMETRY_VERSION,
@@ -42,13 +57,15 @@ def main():
         from formation.paper_formation.simulation import simulate
         from formation.paper_formation.outputs import write_outputs
         mode='affine' if a.route=='rrt_affine' else a.route.removeprefix('paper_')
-        result=simulate('random_pillars',mode,a.seed,obstacle_count=a.obstacle_count,map_seed=a.map_seed,
+        result=simulate(a.scene,mode,a.seed,obstacle_count=a.obstacle_count,map_seed=a.map_seed,
                         formation='triangle6',formation_spacing=3.5,pillar_width=.3,
                         start_center=[5.,20.],goal_center=[45.,20.],progress=a.progress,
                         frontend='rrt' if a.route=='rrt_affine' else 'paper',rrt_iterations=250,
                         dynamics=a.dynamics,replan_period=1.,backend_period=1.,execution_dt=.02,
-                        max_time=a.max_time,stagnation_timeout=32.)
-        output_args=argparse.Namespace(scene='random_pillars',mode=mode,seed=a.seed,
+                        max_time=a.max_time,stagnation_timeout=32.,history_decision=a.history_decision,
+                        history_joint_path=a.history_joint_path,history_link_epsilon=a.history_link_epsilon,
+                        history_current_motion_only=a.history_current_motion_only)
+        output_args=argparse.Namespace(scene=a.scene,mode=mode,seed=a.seed,
             map_seed=a.map_seed,obstacle_count=a.obstacle_count,output=str(out),exact_output=True,
             start_center=[5.,20.],goal_center=[45.,20.],sequences=CONFIG.sequences,
             steps=CONFIG.steps,candidates=CONFIG.candidates,samples=CONFIG.samples,horizon=CONFIG.horizon,
@@ -67,10 +84,10 @@ def main():
     else:
         from formation.local_affine.simulation import simulate
         from formation.local_affine.outputs import save
-        result=simulate(scene='random_pillars',mode='affine',formation='triangle6',spacing=3.5,
+        result=simulate(scene=a.scene,mode='affine',formation='triangle6',spacing=3.5,
                         obstacle_count=a.obstacle_count,map_seed=a.map_seed,seed=a.seed,
                         dynamics=a.dynamics,dt=.02,perception_period=.2,replan_period=1.,max_time=a.max_time,progress=a.progress)
-        save(result,str(out),'random_pillars','affine',a.seed,a.map_seed,a.obstacle_count,250,.02,exact_output=True)
+        save(result,str(out),a.scene,'affine',a.seed,a.map_seed,a.obstacle_count,250,.02,exact_output=True)
         protocol['budget']={'rrt_iterations':250,'max_bezier_segments':3,
                             'max_backend_route_candidates':3,
                             'translation_only_fraction_of_non_goal_samples':0.5,

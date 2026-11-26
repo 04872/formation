@@ -22,10 +22,20 @@ def actual_join_safe(actual, target, regions):
 
 class RRTMPPIFrontend:
     """Plan in centered coordinates; return leader-anchored configurations."""
-    def __init__(self, mode, rng, geometry, iterations=250, reference_speed=.55):
+    def __init__(self, mode, rng, geometry, iterations=250, reference_speed=.55, history_decision=False, history_joint_path=False, history_link_epsilon=.4, history_current_motion_only=False):
         self.mode=mode;self.rng=rng;self.geometry=geometry
         self.iterations=iterations;self.reference_speed=reference_speed
         self.previous_shape=np.eye(2)
+        self.history_decision = None
+        self.use_joint_history = bool(history_joint_path)
+        if history_decision:
+            from .history_decision import HistoryDecision
+            self.history_decision = HistoryDecision()
+        if history_joint_path:
+            if history_decision:
+                raise ValueError('history decision modes are mutually exclusive')
+            from .history_joint_path import HistoryJointPath
+            self.history_decision = HistoryJointPath(history_link_epsilon, current_motion_only=history_current_motion_only)
 
     def plan(self, states, assignment, goal_center, world, regions):
         geom=self.geometry;ref=geom.centered_reference
@@ -49,9 +59,26 @@ class RRTMPPIFrontend:
                 return np.empty((0,6)),{'status':'no_safe_nominal_root','root_source':source,'tree':[],'root_leader':leader_q.tolist(),'actual_fit_root':fit_leader.tolist()}
         if certify_edge(root,goal,regions,ref) is not None:
             nodes=[];route=[];stats={'direct_goal':True}
+            if self.history_decision is not None and self.use_joint_history:
+                stats['history_decision'] = self.history_decision.record_direct(root, goal, world, regions)
             vertices=[root.copy(),goal.copy()]
         else:
-            nodes,route,stats=plan(root,goal,ref,regions,world,self.rng,self.mode,self.iterations)
+            nodes, route, stats = plan(
+                root, goal, ref, regions, world, self.rng, self.mode, self.iterations,
+                collect_history_candidates=self.history_decision is not None,
+                collect_certified_edges=self.history_decision is not None and self.use_joint_history)
+            if self.history_decision is not None:
+                if self.use_joint_history:
+                    selected, evidence = self.history_decision.select(nodes, stats, ref, goal, world, regions)
+                    stats.pop('certified_edges', None)
+                else:
+                    selected, evidence = self.history_decision.select(nodes, stats, ref, goal, world)
+                # The tree and candidate evidence already contain endpoint
+                # IDs; avoid exporting duplicate complete branch lists.
+                stats.pop('candidate_full_routes')
+                stats.pop('baseline_route')
+                stats['history_decision'] = evidence
+                route = [int(index) for index in selected]
             vertices=[nodes[i].q.copy() for i in route]
             if len(vertices)>1 and certify_edge(vertices[-1],goal,regions,ref) is not None:
                 vertices.append(goal.copy())

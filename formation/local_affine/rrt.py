@@ -26,7 +26,8 @@ def edge_cost(a, b, reference, world):
     return float(length*(1+.3*shape+.3*risk)+.08*variation)
 
 
-def plan(root, goal, reference, regions, world, rng, mode='affine', iterations=250):
+def plan(root, goal, reference, regions, world, rng, mode='affine', iterations=250,
+         collect_history_candidates=False, collect_certified_edges=False):
     """Build and rewire a bounded tree; return its best goal-biased branch."""
     nodes = [Node(root.copy(), -1, 0., 0., None)]
     children = [set()]
@@ -37,6 +38,7 @@ def plan(root, goal, reference, regions, world, rng, mode='affine', iterations=2
     position_array=np.empty((iterations+1,len(reference),2))
     position_array[0]=positions_cache[0]
     accepted = rewires = 0
+    certified_edges = []
     for _ in range(iterations):
         if rng.random() < .18:
             sample = goal.copy()
@@ -95,6 +97,8 @@ def plan(root, goal, reference, regions, world, rng, mode='affine', iterations=2
         index = len(nodes); nodes.append(Node(q, parent, total, cost, cert)); children.append(set())
         positions_cache.append(qpos);membership_cache.append(qmembership);position_array[index]=qpos
         children[parent].add(index); accepted += 1
+        if collect_certified_edges:
+            certified_edges.extend((k, index) for _, k, _, _ in options)
         for k in near_ids:
             k = int(k)
             if k == 0 or k == parent:
@@ -105,6 +109,8 @@ def plan(root, goal, reference, regions, world, rng, mode='affine', iterations=2
             cert2 = certify_edge_cached(q,nodes[k].q,qpos,positions_cache[k],qmembership,membership_cache[k])
             if cert2 is None:
                 continue
+            if collect_certified_edges:
+                certified_edges.append((index, k))
             new_edge = edge_costs.get(k)
             if new_edge is None:
                 new_edge=edge_cost(q, nodes[k].q, reference, world)
@@ -129,19 +135,28 @@ def plan(root, goal, reference, regions, world, rng, mode='affine', iterations=2
         branch=[];k=i
         while k>=0:
             branch.append(k);k=nodes[k].parent
-        branch=branch[::-1][:4]
+        branch=branch[::-1]
+        prefix=branch[:4]
         length=sum(distance(nodes[a].q,nodes[b].q,reference)/np.sqrt(len(reference))
-                   for a,b in zip(branch[:-1],branch[1:]))
-        ranked.append((length<1.1,scores[i],branch))
+                   for a,b in zip(prefix[:-1],prefix[1:]))
+        ranked.append((length < 1.1, scores[i], branch if collect_history_candidates else prefix))
     ranked.sort(key=lambda item:(item[0],item[1]))
-    candidate_routes=[];first_edges=set()
-    for _,_,branch in ranked:
+    candidate_routes = []
+    first_edges = set()
+    for _, _, branch in ranked:
         if branch[1] not in first_edges:
-            candidate_routes.append(branch);first_edges.add(branch[1])
+            candidate_routes.append(branch[:4])
+            first_edges.add(branch[1])
     best = min(candidates,key=lambda i:scores[i]) if candidates else 0
     route=[]
     while best >= 0:
         route.append(best); best=nodes[best].parent
     route.reverse()
-    return nodes, route, {'iterations': iterations, 'accepted': accepted, 'rewires': rewires,
-                          'candidate_routes':candidate_routes}
+    stats = {'iterations': iterations, 'accepted': accepted, 'rewires': rewires,
+             'candidate_routes': candidate_routes}
+    if collect_history_candidates:
+        stats['candidate_full_routes'] = [branch for _, _, branch in ranked]
+        stats['baseline_route'] = route.copy()
+    if collect_certified_edges:
+        stats['certified_edges'] = certified_edges
+    return nodes, route, stats

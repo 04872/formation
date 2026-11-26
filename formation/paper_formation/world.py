@@ -4,6 +4,8 @@ from scipy.ndimage import distance_transform_edt, binary_dilation
 from scipy.spatial import cKDTree
 from .config import RADIUS
 
+PERCEPTION_RADIUS = 3.0
+
 @dataclass
 class World:
     """Maintain the observed grid and reveal local ground truth around actual robots."""
@@ -17,7 +19,7 @@ class World:
     def __post_init__(self):
         if self.name == 'random_pillars' and self.pillar_width <= 0:
             raise ValueError('Pillar width must be positive')
-        if self.name in ('random_circles', 'random_pillars'):
+        if self.name in ('random_circles', 'random_pillars', 'history_deadend'):
             self.size = (500, 400)
         self.truth = np.zeros(self.size, dtype=bool)
         self.truth[:2, :] = self.truth[-2:, :] = True
@@ -54,6 +56,21 @@ class World:
                     # A blocked cell covers every grid square intersecting the box.
                     self.truth |= ((x[:,None] + self.res/2 >= xmin) & (x[:,None] - self.res/2 <= xmax) &
                                    (y[None,:] + self.res/2 >= ymin) & (y[None,:] - self.res/2 <= ymax))
+        elif self.name == 'history_deadend':
+            # A forward-facing cul-de-sac, with open routes around both sides.
+            # Obstacles are physical rectangles as well as conservative grid cells.
+            self.start = np.array([5.0, 20.0])
+            self.goal = np.array([45.0, 20.0])
+            self.rectangles = np.array([[14., 14., 31., 14.5],
+                                        [14., 25.5, 31., 26.],
+                                        [30.5, 14., 31., 26.]])
+            x = (np.arange(self.size[0]) + 0.5) * self.res
+            y = (np.arange(self.size[1]) + 0.5) * self.res
+            for xmin, ymin, xmax, ymax in self.rectangles:
+                self.truth |= ((x[:, None] + self.res/2 >= xmin) &
+                               (x[:, None] - self.res/2 <= xmax) &
+                               (y[None, :] + self.res/2 >= ymin) &
+                               (y[None, :] - self.res/2 <= ymax))
         else:
             self.start = np.array([2.0, 4.0])
             self.goal = np.array([10.0, 4.0])
@@ -63,7 +80,7 @@ class World:
         (self.xx, self.yy) = np.meshgrid(np.arange(self.size[0]), np.arange(self.size[1]), indexing='ij')
 
     def observe(self, positions):
-        radius = 3.0
+        radius = PERCEPTION_RADIUS
         for p in positions:
             lower = np.maximum(np.floor((p-radius)/self.res).astype(int)-1, 0)
             upper = np.minimum(np.ceil((p+radius)/self.res).astype(int)+2, self.size)
