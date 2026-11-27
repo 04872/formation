@@ -22,18 +22,19 @@ def actual_join_safe(actual, target, regions):
 
 class RRTMPPIFrontend:
     """Plan in centered coordinates; return leader-anchored configurations."""
-    def __init__(self, mode, rng, geometry, iterations=250, reference_speed=.55, history_decision=False, history_joint_path=False, history_link_epsilon=.4, history_current_motion_only=False, history_local_depth=0, history_local_rho=.4):
+    def __init__(self, mode, rng, geometry, iterations=250, reference_speed=.55, history_decision=False, history_joint_path=False, history_link_epsilon=.4, history_current_motion_only=False, history_local_depth=0, history_local_rho=.4, history_persistent=False):
         self.mode=mode;self.rng=rng;self.geometry=geometry
         self.iterations=iterations;self.reference_speed=reference_speed
         self.previous_shape=np.eye(2)
         self.history_decision = None
         self.use_joint_history = bool(history_joint_path)
         self.use_local_backup = bool(history_local_depth)
+        self.use_persistent_history = bool(history_persistent)
+        if sum(bool(x) for x in (history_decision, history_joint_path, history_local_depth, history_persistent)) > 1:
+            raise ValueError('history decision modes are mutually exclusive')
         if history_local_depth not in (0, 1, 2):
             raise ValueError('history local depth must be 0, 1 or 2')
         if self.use_local_backup:
-            if history_decision or history_joint_path:
-                raise ValueError('history decision modes are mutually exclusive')
             from .history_local_decision import HistoryLocalDecision
             self.history_decision = HistoryLocalDecision(geometry.centered_reference, history_local_depth,
                                                          history_link_epsilon, history_local_rho)
@@ -41,10 +42,11 @@ class RRTMPPIFrontend:
             from .history_decision import HistoryDecision
             self.history_decision = HistoryDecision()
         if history_joint_path:
-            if history_decision:
-                raise ValueError('history decision modes are mutually exclusive')
             from .history_joint_path import HistoryJointPath
             self.history_decision = HistoryJointPath(history_link_epsilon, current_motion_only=history_current_motion_only)
+        if self.use_persistent_history:
+            from .history_persistent import PersistentHistoryDecision
+            self.history_decision = PersistentHistoryDecision(geometry.centered_reference, history_link_epsilon, history_local_rho)
 
     def plan(self, states, assignment, goal_center, world, regions):
         geom=self.geometry;ref=geom.centered_reference
@@ -66,24 +68,26 @@ class RRTMPPIFrontend:
             leader_q=root.copy();leader_q[:2]+=A@ref[geom.leader_slot]
             if not safe_join:
                 result={'status':'no_safe_nominal_root','root_source':source,'tree':[],'root_leader':leader_q.tolist(),'actual_fit_root':fit_leader.tolist()}
-                if self.use_local_backup:
+                if self.use_local_backup or self.use_persistent_history:
                     result['statistics']={'history_decision':self.history_decision.record_no_root(world, regions)}
                 return np.empty((0,6)),result
         if certify_edge(root,goal,regions,ref) is not None:
             nodes=[];route=[];stats={'direct_goal':True}
             if self.history_decision is not None and self.use_joint_history:
                 stats['history_decision'] = self.history_decision.record_direct(root, goal, world, regions)
-            if self.use_local_backup:
+            if self.use_local_backup or self.use_persistent_history:
                 stats['history_decision'] = self.history_decision.record_direct(root, goal, world, regions)
             vertices=[root.copy(),goal.copy()]
         else:
             nodes, route, stats = plan(
                 root, goal, ref, regions, world, self.rng, self.mode, self.iterations,
                 collect_history_candidates=self.history_decision is not None,
-                collect_certified_edges=self.history_decision is not None and self.use_joint_history)
+                collect_certified_edges=self.use_joint_history or self.use_persistent_history)
             if self.history_decision is not None:
-                if self.use_local_backup:
+                if self.use_local_backup or self.use_persistent_history:
                     selected, evidence = self.history_decision.select(nodes, stats, goal, world, regions)
+                    if self.use_persistent_history:
+                        stats.pop('certified_edges', None)
                 elif self.use_joint_history:
                     selected, evidence = self.history_decision.select(nodes, stats, ref, goal, world, regions)
                     stats.pop('certified_edges', None)
@@ -98,7 +102,7 @@ class RRTMPPIFrontend:
             vertices=[nodes[i].q.copy() for i in route]
             if len(vertices)>1 and certify_edge(vertices[-1],goal,regions,ref) is not None:
                 vertices.append(goal.copy())
-                if self.use_local_backup:
+                if self.use_local_backup or self.use_persistent_history:
                     self.history_decision.record_goal(nodes, route, goal)
         if len(vertices)<2:
             return np.empty((0,6)),{'status':'no_rrt_route','root_source':source,'tree':[],'statistics':stats,'root_leader':leader_q.tolist(),'actual_fit_root':fit_leader.tolist()}

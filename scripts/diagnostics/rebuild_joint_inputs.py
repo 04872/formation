@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Recover certified RRT edges from stored accepted-node insertion order."""
+import argparse
 import json
 import pickle
 import sys
@@ -12,26 +13,36 @@ from formation.local_affine.geometry import certify_edge_cached, distance, regio
 from formation.local_affine.rrt import Node, edge_cost
 from formation.paper_formation.world import World
 
-run = ROOT / 'results/three_routes/joint_path_h1_closed_loop/history_deadend/rrt_affine/seed_0'
-out = Path('/tmp/obs_boundary_rebuilt')
+parser = argparse.ArgumentParser()
+parser.add_argument('--run', type=Path, default=ROOT / 'results/three_routes/joint_path_h1_closed_loop/history_deadend/rrt_affine/seed_0')
+parser.add_argument('--output', type=Path, default=Path('/tmp/obs_boundary_rebuilt'))
+parser.add_argument('--start', type=int, default=0)
+parser.add_argument('--end', type=int, default=None)
+args = parser.parse_args()
+run, out = args.run, args.output
 out.mkdir(exist_ok=True)
 saved = json.loads((run / 'planning.json').read_text())
 traj = np.load(run / 'trajectory.npz')
 reg = np.load(run / 'regions.npz')
 ref = traj['centered_reference']
+known_history = traj['known_history']
+occupancy = traj['occupancy']
+coefficients, offsets = reg['coefficients'], reg['offsets']
 goal = np.r_[traj['goal_center'], np.eye(2).ravel()]
 
 for t, old in enumerate(saved['frontend_metadata']):
+    if t < args.start or (args.end is not None and t >= args.end):
+        continue
     records = old['tree']
     regions = []
     for r in range(6):
         i = t * 6 + r
-        v = reg['coefficients'][reg['offsets'][i]:reg['offsets'][i+1]]
+        v = coefficients[offsets[i]:offsets[i+1]]
         regions.append((v[:, :2], v[:, 2]))
     world = World('history_deadend', obstacle_count=3, map_seed=1, pillar_width=.3)
-    world.known = traj['known_history'][t].copy()
+    world.known = known_history[t].copy()
     world.occupied = world.known & world.truth
-    assert np.array_equal(world.truth, traj['occupancy'])
+    assert np.array_equal(world.truth, occupancy)
     q0 = np.array(records[0]['q'])
     nodes = [Node(q0, -1, 0., 0., None)]
     children = [set()]
