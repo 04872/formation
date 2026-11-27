@@ -22,23 +22,27 @@ def main():
     p.add_argument('--history-joint-path',action='store_true',help='reuse certified joint paths for boundary-based branch selection')
     p.add_argument('--history-current-motion-only',action='store_true',help='with joint history, use only current-round motion while retaining the map and SFC history')
     p.add_argument('--history-link-epsilon',type=float,default=.4,help='maximum certified short-link cost (default: 0.4 m)')
+    p.add_argument('--history-local-depth',type=int,choices=[1,2],default=0,help='use local backup history selection with one or two layers')
+    p.add_argument('--history-local-rho',type=float,default=.4,help='local backup threshold (default: 0.4 m)')
     p.add_argument('--output',type=Path,default=Path('results/three_routes/matched_rates'))
     p.add_argument('--progress',action='store_true')
     a=p.parse_args()
-    if (a.history_decision or a.history_joint_path) and (a.route!='rrt_affine' or a.rrt_backend!='mppi'):
+    if (a.history_decision or a.history_joint_path or a.history_local_depth) and (a.route!='rrt_affine' or a.rrt_backend!='mppi'):
         p.error('history modes require --route rrt_affine --rrt-backend mppi')
-    if a.history_decision and a.history_joint_path:
+    if sum(bool(x) for x in (a.history_decision,a.history_joint_path,a.history_local_depth)) > 1:
         p.error('history modes are mutually exclusive')
     if a.history_current_motion_only and not a.history_joint_path:
         p.error('--history-current-motion-only requires --history-joint-path')
     if a.history_link_epsilon <= 0:
         p.error('--history-link-epsilon must be positive')
+    if a.history_local_rho <= 0:
+        p.error('--history-local-rho must be positive')
     out=a.output/a.route/f'seed_{a.seed}'
     out.mkdir(parents=True,exist_ok=True)
     from formation.paper_formation.sfc import SFC_GEOMETRY_VERSION
     protocol={'route':a.route,'backend':a.rrt_backend if a.route=='rrt_affine' else 'mppi','frontend':'rrt' if a.route=='rrt_affine' else 'paper','dynamics':a.dynamics,'seed':a.seed,'map_seed':a.map_seed,
               'scene':a.scene,'obstacle_count':a.obstacle_count if a.scene=='random_pillars' else 3,'pillar_width':.3 if a.scene=='random_pillars' else None,
-              'history_decision':a.history_decision,'history_joint_path':a.history_joint_path,'history_current_motion_only':a.history_current_motion_only,'history_link_epsilon':a.history_link_epsilon,'per_robot_perception_radius_m':3.,
+              'history_decision':a.history_decision,'history_joint_path':a.history_joint_path,'history_current_motion_only':a.history_current_motion_only,'history_link_epsilon':a.history_link_epsilon,'history_local_depth':a.history_local_depth,'history_local_rho':a.history_local_rho,'per_robot_perception_radius_m':3.,
               'formation':'triangle6','spacing':3.5,'start_center':[5.,20.],'goal_center':[45.,20.],
               'execution_dt':.02,'perception_period':.2,'frontend_period':1.,'backend_period':1.,
               'sfc_geometry_version':SFC_GEOMETRY_VERSION,
@@ -64,7 +68,8 @@ def main():
                         dynamics=a.dynamics,replan_period=1.,backend_period=1.,execution_dt=.02,
                         max_time=a.max_time,stagnation_timeout=32.,history_decision=a.history_decision,
                         history_joint_path=a.history_joint_path,history_link_epsilon=a.history_link_epsilon,
-                        history_current_motion_only=a.history_current_motion_only)
+                        history_current_motion_only=a.history_current_motion_only,
+                        history_local_depth=a.history_local_depth,history_local_rho=a.history_local_rho)
         output_args=argparse.Namespace(scene=a.scene,mode=mode,seed=a.seed,
             map_seed=a.map_seed,obstacle_count=a.obstacle_count,output=str(out),exact_output=True,
             start_center=[5.,20.],goal_center=[45.,20.],sequences=CONFIG.sequences,
